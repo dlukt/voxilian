@@ -483,8 +483,18 @@ Tables (D4; M59 property names in parens where ported):
   killer_character_id NULLABLE FK, killer_mob_id INT NULLABLE FK →
   mob_protos, victim_kind SMALLINT, victim_character_id NULLABLE FK,
   victim_mob_id INT NULLABLE FK → mob_protos, pos_x/pos_y/pos_z BIGINT mm,
-  created_at)` for advancement audit + karma/justice phase 2.
-- `bans/mutes` minimal for admin MVP.
+  created_at)` for advancement audit + karma/justice phase 2. One-of
+  invariant enforced in SQL: kind 0 ⇒ character set + mob NULL, kind 1 ⇒
+  mob set + character NULL, for killer and victim independently; no other
+  kind values valid.
+- Sanctions are account-scoped current state (enforceable pre-selection,
+  surviving character switches; Keycloak identity maps to accounts; no
+  history table in MVP): `bans(account_id BIGINT PK FK → accounts(id),
+  reason TEXT NOT NULL, expires_at TIMESTAMPTZ NULL, created_at
+  TIMESTAMPTZ NOT NULL DEFAULT now())` and identical `mutes(...)`.
+  `expires_at NULL` = permanent until revoked; otherwise active while
+  `expires_at > now()`; revoke deletes the row. No IPs, no
+  character-scoped sanctions, no metadata.
 - Indexes: characters(account_id), item_locations(character_id, corpse_id),
   corpses(expires_at), ledger(actor_character_id, created_at),
   ledger(actor_account_id, created_at), kills(victim_character_id,
