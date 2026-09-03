@@ -58,7 +58,7 @@ Exit: all §8 tables (incl. prototype catalogs) exist via goose; `Store` covers 
 - [x] **M1-T2** Migration `0002`: prototype catalog tables — `spell_protos`, `skill_protos`, `item_protos`, `mob_protos`, `shop_listings` (stable INTEGER IDs `CHECK 1..65535`, symbolic keys, versions; spec §8.2). Catalogs BEFORE their dependents so FKs are created inline, never via later ALTERs.
 - [x] **M1-T3** Migration `0003`: `character_spells`, `character_skills` (+PKs, FKs → catalogs, ability CHECK 1–99, stat CHECKs 1–50 on characters). Spec: §8.
 - [x] **M1-T4** Migration `0004`: `item_instances` (+`revision`, proto FK → `item_protos`), `item_locations` (all 5 kinds, full per-kind CHECKs, self-containment), `corpses`, `banks` (+`revision`). Spec: §8.
-- [ ] **M1-T5** Migration `0005`: `ledger` (`num_nonnulls` CHECKs), `kills`, `bans/mutes`. Spec: §8.
+- [x] **M1-T5** Migration `0005`: `ledger` (`num_nonnulls` CHECKs), `kills`, `bans/mutes`. Spec: §8.
 - [ ] **M1-T6a** sqlc: accounts/characters (+slot-claimed create → map unique-violation to `slot_occupied`/`name_taken`). Spec: §8.
 - [ ] **M1-T6b** sqlc: spells/skills get/set, item+location txn helpers, corpses, banks. (All catalog access lives in T6d.) Spec: §8.
 - [ ] **M1-T6c** sqlc: ledger/kill appends, bans/mutes. Spec: §8.

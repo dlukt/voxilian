@@ -802,3 +802,277 @@ func TestMigration0003RejectsInvalidExisting(t *testing.T) {
 		t.Fatalf("version after failed migration = %d, %v; want 2", ver, err)
 	}
 }
+
+// m5Fixtures creates two accounts, two characters (one each), one item
+// proto + instance, and two mob protos. Returns ids for test use.
+func m5Fixtures(t *testing.T, db *sql.DB) (a1, a2, c1, c2, item, m1, m2 int64) {
+	t.Helper()
+	row := db.QueryRow(`INSERT INTO accounts (keycloak_sub) VALUES ('sub-m5a') RETURNING id`)
+	if err := row.Scan(&a1); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`INSERT INTO accounts (keycloak_sub) VALUES ('sub-m5b') RETURNING id`).Scan(&a2); err != nil {
+		t.Fatal(err)
+	}
+	mkchar := func(acct int64, slot int, name string) int64 {
+		var id int64
+		err := db.QueryRow(`INSERT INTO characters
+			(account_id, slot, name, gender, face, might, intellect, stamina, agility, mysticism, aim,
+			 karma, hometown, pos_x, pos_y, pos_z, vitals, advancement, flags, updated_at)
+			VALUES ($1,$2,$3,0,'{}',10,10,10,10,10,10,0,'tos',0,0,0,'{}','{}',0,now()) RETURNING id`,
+			acct, slot, name).Scan(&id)
+		if err != nil {
+			t.Fatalf("insert character %s: %v", name, err)
+		}
+		return id
+	}
+	c1, c2 = mkchar(a1, 0, "Killer"), mkchar(a2, 0, "Victim")
+	mustExec(t, db, `INSERT INTO item_protos (id,kind,slot,base,version) VALUES (600,0,NULL,'{}',1)`)
+	if err := db.QueryRow(`INSERT INTO item_instances (proto,qty,hits,enchants) VALUES (600,1,100,'{}') RETURNING id`).Scan(&item); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, `INSERT INTO mob_protos (id,key,level,difficulty,karma,atk,resists,spells,loot_tid,version) VALUES (700,'mob-a',45,6,-40,'{}','{}','{}',NULL,1)`)
+	mustExec(t, db, `INSERT INTO mob_protos (id,key,level,difficulty,karma,atk,resists,spells,loot_tid,version) VALUES (701,'mob-b',50,4,-30,'{}','{}','{}',NULL,1)`)
+	m1, m2 = 700, 701
+	return a1, a2, c1, c2, item, m1, m2
+}
+
+// TestMigration0005 proves the M1-T5 audit/kill/sanction schema against
+// real PostgreSQL 18. Pinned to version 5.
+func TestMigration0005(t *testing.T) {
+	pg := simtest.StartPostgres18(t)
+	db := openMigratedTo(t, pg.DSN, 5)
+
+	// 1-2: version and table.
+	var ver int64
+	if err := db.QueryRow(`SELECT version_id FROM goose_db_version ORDER BY version_id DESC LIMIT 1`).Scan(&ver); err != nil {
+		t.Fatalf("goose version: %v", err)
+	}
+	if ver != 5 {
+		t.Fatalf("goose version = %d, want 5", ver)
+	}
+	if !tableExists(t, db, "ledger") {
+		t.Fatal("table ledger missing")
+	}
+
+	a1, a2, c1, c2, item, m1, m2 := m5Fixtures(t, db)
+
+	// 3-4: actor-only variants succeed.
+	mustExec(t, db, `INSERT INTO ledger (kind,actor_account_id) VALUES (1,$1)`, a1)
+	mustExec(t, db, `INSERT INTO ledger (kind,actor_character_id) VALUES (1,$1)`, c1)
+
+	// 5-6: missing/both actors fail actor check.
+	if _, err := db.Exec(`INSERT INTO ledger (kind) VALUES (1)`); err == nil ||
+		!strings.Contains(err.Error(), "ledger_actor_identity_check") {
+		t.Fatalf("actor err = %v, want ledger_actor_identity_check", err)
+	}
+	if _, err := db.Exec(`INSERT INTO ledger (kind,actor_account_id,actor_character_id) VALUES (1,$1,$2)`, a1, c1); err == nil ||
+		!strings.Contains(err.Error(), "ledger_actor_identity_check") {
+		t.Fatalf("actor err = %v, want ledger_actor_identity_check", err)
+	}
+
+	// 7-9: counterparty absent/account/character succeed.
+	mustExec(t, db, `INSERT INTO ledger (kind,actor_character_id) VALUES (2,$1)`, c1)
+	mustExec(t, db, `INSERT INTO ledger (kind,actor_character_id,cpty_account_id) VALUES (2,$1,$2)`, c1, a2)
+	mustExec(t, db, `INSERT INTO ledger (kind,actor_character_id,cpty_character_id) VALUES (2,$1,$2)`, c1, c2)
+
+	// 10: both counterparty forms fail.
+	if _, err := db.Exec(`INSERT INTO ledger (kind,actor_character_id,cpty_account_id,cpty_character_id) VALUES (2,$1,$2,$3)`, c1, a2, c2); err == nil ||
+		!strings.Contains(err.Error(), "ledger_counterparty_identity_check") {
+		t.Fatalf("cpty err = %v, want ledger_counterparty_identity_check", err)
+	}
+
+	// 11-15: FK rejections.
+	for _, tc := range []struct {
+		name, sql string
+		args      []any
+	}{
+		{"actor-account", `INSERT INTO ledger (kind,actor_account_id) VALUES (1,999999)`, nil},
+		{"actor-character", `INSERT INTO ledger (kind,actor_character_id) VALUES (1,999999)`, nil},
+		{"cpty-account", `INSERT INTO ledger (kind,actor_character_id,cpty_account_id) VALUES (1,$1,999999)`, []any{c1}},
+		{"cpty-character", `INSERT INTO ledger (kind,actor_character_id,cpty_character_id) VALUES (1,$1,999999)`, []any{c1}},
+		{"item", `INSERT INTO ledger (kind,actor_character_id,item_id) VALUES (1,$1,999999)`, []any{c1}},
+	} {
+		if _, err := db.Exec(tc.sql, tc.args...); err == nil ||
+			!strings.Contains(err.Error(), "violates foreign key constraint") {
+			t.Fatalf("%s err = %v, want FK violation", tc.name, err)
+		}
+	}
+
+	// 16-19: payload shapes — actor+kind only, BIGINT/negative amount,
+	// NULL qty and item_id.
+	mustExec(t, db, `INSERT INTO ledger (kind,actor_account_id,amount,qty,item_id) VALUES (3,$1,5000000000,NULL,$2)`, a1, item)
+	mustExec(t, db, `UPDATE ledger SET amount = -250 WHERE kind = 3 AND actor_account_id = $1`, a1)
+	var amt int64
+	if err := db.QueryRow(`SELECT amount FROM ledger WHERE kind=3 AND actor_account_id=$1`, a1).Scan(&amt); err != nil || amt != -250 {
+		t.Fatalf("amount = %d, %v", amt, err)
+	}
+
+	// 20-21: identity generated, created_at defaults.
+	var lid int64
+	var created bool
+	if err := db.QueryRow(`INSERT INTO ledger (kind,actor_account_id) VALUES (4,$1) RETURNING id`, a1).Scan(&lid); err != nil || lid <= 0 {
+		t.Fatalf("ledger id = %d, %v", lid, err)
+	}
+	if err := db.QueryRow(`SELECT created_at IS NOT NULL FROM ledger WHERE id = $1`, lid).Scan(&created); err != nil || !created {
+		t.Fatalf("created_at default missing: %v", err)
+	}
+
+	// Ledger indexes exist (catalog inspection).
+	for _, idx := range []string{"ledger_actor_character_created_idx", "ledger_actor_account_created_idx"} {
+		if !indexExists(t, db, idx) {
+			t.Fatalf("index %s missing", idx)
+		}
+	}
+
+	// 22-25: all four killer/victim pairings.
+	kill := func(kk string, kv any, vk string, vv any) {
+		t.Helper()
+		q := `INSERT INTO kills (killer_kind,killer_character_id,killer_mob_id,victim_kind,victim_character_id,victim_mob_id,pos_x,pos_y,pos_z) VALUES (` +
+			kk + `,$1,$2,` + vk + `,$3,$4,0,0,0)`
+		var kc, km, vc, vm any
+		if kk == "0" {
+			kc, km = kv, nil
+		} else {
+			kc, km = nil, kv
+		}
+		if vk == "0" {
+			vc, vm = vv, nil
+		} else {
+			vc, vm = nil, vv
+		}
+		if _, err := db.Exec(q, kc, km, vc, vm); err != nil {
+			t.Fatalf("kill %s/%s: %v", kk, vk, err)
+		}
+	}
+	kill("0", c1, "0", c2)
+	kill("0", c1, "1", m2)
+	kill("1", m1, "0", c2)
+	kill("1", m1, "1", m2)
+
+	// 26-32: killer identity violations.
+	for _, tc := range []struct{ name, kset, vset string }{
+		{"kind0-no-char", `killer_kind=0,killer_character_id=NULL,killer_mob_id=NULL`, `victim_kind=0,victim_character_id=` + itoa64(c2) + `,victim_mob_id=NULL`},
+		{"kind0-with-mob", `killer_kind=0,killer_character_id=NULL,killer_mob_id=` + itoa64(m1), `victim_kind=0,victim_character_id=` + itoa64(c2) + `,victim_mob_id=NULL`},
+		{"kind1-no-mob", `killer_kind=1,killer_character_id=NULL,killer_mob_id=NULL`, `victim_kind=0,victim_character_id=` + itoa64(c2) + `,victim_mob_id=NULL`},
+		{"kind1-with-char", `killer_kind=1,killer_character_id=` + itoa64(c1) + `,killer_mob_id=NULL`, `victim_kind=0,victim_character_id=` + itoa64(c2) + `,victim_mob_id=NULL`},
+		{"both-ids", `killer_kind=0,killer_character_id=` + itoa64(c1) + `,killer_mob_id=` + itoa64(m1), `victim_kind=0,victim_character_id=` + itoa64(c2) + `,victim_mob_id=NULL`},
+		{"kind-neg", `killer_kind=-1,killer_character_id=` + itoa64(c1) + `,killer_mob_id=NULL`, `victim_kind=0,victim_character_id=` + itoa64(c2) + `,victim_mob_id=NULL`},
+		{"kind-2", `killer_kind=2,killer_character_id=` + itoa64(c1) + `,killer_mob_id=NULL`, `victim_kind=0,victim_character_id=` + itoa64(c2) + `,victim_mob_id=NULL`},
+	} {
+		q := `INSERT INTO kills (` + colsOf(tc.kset) + `,` + colsOf(tc.vset) + `,pos_x,pos_y,pos_z) VALUES (` + valsOf(tc.kset) + `,` + valsOf(tc.vset) + `,0,0,0)`
+		if _, err := db.Exec(q); err == nil || !strings.Contains(err.Error(), "kills_killer_identity_check") {
+			t.Fatalf("%s err = %v, want kills_killer_identity_check", tc.name, err)
+		}
+	}
+
+	// Victim violations (mirror, fewer shapes + out-of-range kinds).
+	for _, tc := range []struct{ name, vset string }{
+		{"kind0-no-char", `victim_kind=0,victim_character_id=NULL,victim_mob_id=NULL`},
+		{"kind0-with-mob", `victim_kind=0,victim_character_id=NULL,victim_mob_id=` + itoa64(m2)},
+		{"kind1-no-mob", `victim_kind=1,victim_character_id=NULL,victim_mob_id=NULL`},
+		{"kind1-with-char", `victim_kind=1,victim_character_id=` + itoa64(c2) + `,victim_mob_id=NULL`},
+		{"both-ids", `victim_kind=0,victim_character_id=` + itoa64(c2) + `,victim_mob_id=` + itoa64(m2)},
+		{"kind-neg", `victim_kind=-1,victim_character_id=` + itoa64(c2) + `,victim_mob_id=NULL`},
+		{"kind-2", `victim_kind=2,victim_character_id=` + itoa64(c2) + `,victim_mob_id=NULL`},
+	} {
+		q := `INSERT INTO kills (killer_kind,killer_character_id,killer_mob_id,` + colsOf(tc.vset) + `,pos_x,pos_y,pos_z) VALUES (0,` + itoa64(c1) + `,NULL,` + valsOf(tc.vset) + `,0,0,0)`
+		if _, err := db.Exec(q); err == nil || !strings.Contains(err.Error(), "kills_victim_identity_check") {
+			t.Fatalf("%s err = %v, want kills_victim_identity_check", tc.name, err)
+		}
+	}
+
+	// Kill FKs rejected.
+	for _, q := range []string{
+		`INSERT INTO kills (killer_kind,killer_character_id,victim_kind,victim_character_id,pos_x,pos_y,pos_z) VALUES (0,999999,0,` + itoa64(c2) + `,0,0,0)`,
+		`INSERT INTO kills (killer_kind,killer_mob_id,victim_kind,victim_character_id,pos_x,pos_y,pos_z) VALUES (1,9999,0,` + itoa64(c2) + `,0,0,0)`,
+		`INSERT INTO kills (killer_kind,killer_character_id,victim_kind,victim_character_id,pos_x,pos_y,pos_z) VALUES (0,` + itoa64(c1) + `,0,999999,0,0,0)`,
+		`INSERT INTO kills (killer_kind,killer_character_id,victim_kind,victim_mob_id,pos_x,pos_y,pos_z) VALUES (0,` + itoa64(c1) + `,1,9999,0,0,0)`,
+	} {
+		if _, err := db.Exec(q); err == nil || !strings.Contains(err.Error(), "violates foreign key constraint") {
+			t.Fatalf("kill FK err = %v", err)
+		}
+	}
+
+	// Coordinates beyond int32; mob id types are integer.
+	mustExec(t, db, `INSERT INTO kills (killer_kind,killer_mob_id,victim_kind,victim_mob_id,pos_x,pos_y,pos_z) VALUES (1,$1,1,$2,5000000000,-5000000000,0)`, m1, m2)
+	var kx, ky, kz int64
+	if err := db.QueryRow(`SELECT pos_x,pos_y,pos_z FROM kills WHERE killer_mob_id=$1 AND victim_mob_id=$2 ORDER BY id DESC LIMIT 1`, m1, m2).Scan(&kx, &ky, &kz); err != nil || kx != 5000000000 || ky != -5000000000 {
+		t.Fatalf("kill pos = (%d,%d,%d), %v", kx, ky, kz, err)
+	}
+	for _, col := range []string{"killer_mob_id", "victim_mob_id"} {
+		var typ string
+		if err := db.QueryRow(`SELECT data_type FROM information_schema.columns WHERE table_name='kills' AND column_name=$1`, col).Scan(&typ); err != nil || typ != "integer" {
+			t.Fatalf("kills.%s = %q, %v; want integer", col, typ, err)
+		}
+	}
+	if !indexExists(t, db, "kills_victim_character_created_idx") {
+		t.Fatal("kills_victim_character_created_idx missing")
+	}
+
+	// Bans: permanent, temporary, defaults, FK, one-row-per-account, independence.
+	mustExec(t, db, `INSERT INTO bans (account_id,reason,expires_at) VALUES ($1,'cheating',NULL)`, a1)
+	mustExec(t, db, `INSERT INTO bans (account_id,reason,expires_at) VALUES ($1,'spam',now() + interval '1 day')`, a2)
+	var bcreated bool
+	if err := db.QueryRow(`SELECT created_at IS NOT NULL FROM bans WHERE account_id=$1`, a1).Scan(&bcreated); err != nil || !bcreated {
+		t.Fatalf("ban created_at: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO bans (account_id,reason) VALUES (999999,'x')`); err == nil {
+		t.Fatal("bad ban account accepted")
+	}
+	if _, err := db.Exec(`INSERT INTO bans (account_id,reason) VALUES ($1,'again')`, a1); err == nil ||
+		!strings.Contains(err.Error(), "bans_pkey") {
+		t.Fatalf("second ban err = %v, want bans_pkey", err)
+	}
+
+	// Mutes mirror.
+	mustExec(t, db, `INSERT INTO mutes (account_id,reason,expires_at) VALUES ($1,'abuse',NULL)`, a1)
+	mustExec(t, db, `INSERT INTO mutes (account_id,reason,expires_at) VALUES ($1,'caps',now() + interval '1 hour')`, a2)
+	if _, err := db.Exec(`INSERT INTO mutes (account_id,reason) VALUES (999999,'x')`); err == nil {
+		t.Fatal("bad mute account accepted")
+	}
+	if _, err := db.Exec(`INSERT INTO mutes (account_id,reason) VALUES ($1,'again')`, a1); err == nil ||
+		!strings.Contains(err.Error(), "mutes_pkey") {
+		t.Fatalf("second mute err = %v, want mutes_pkey", err)
+	}
+
+	// Rollback 5 → 4.
+	if err := goose.DownTo(db, migrationsDir(t), 4); err != nil {
+		t.Fatalf("goose down to 4: %v", err)
+	}
+	for _, tbl := range []string{"ledger", "kills", "bans", "mutes"} {
+		if tableExists(t, db, tbl) {
+			t.Fatalf("table %s survives down-to-4", tbl)
+		}
+	}
+	if err := db.QueryRow(`SELECT version_id FROM goose_db_version ORDER BY version_id DESC LIMIT 1`).Scan(&ver); err != nil || ver != 4 {
+		t.Fatalf("version after down = %d, %v; want 4", ver, err)
+	}
+	for _, tbl := range []string{"accounts", "characters", "mob_protos", "item_instances", "item_locations", "banks", "corpses", "character_spells"} {
+		if !tableExists(t, db, tbl) {
+			t.Fatalf("table %s lost by down-to-4", tbl)
+		}
+	}
+	if !constraintExists(t, db, "characters_might_check") {
+		t.Fatal("characters_might_check lost by down-to-4")
+	}
+}
+
+// colsOf/valsOf split "a=1,b=2" fragments for negative-case INSERTs.
+func colsOf(frag string) string {
+	parts := strings.Split(frag, ",")
+	cols := make([]string, 0, len(parts))
+	for _, p := range parts {
+		cols = append(cols, strings.SplitN(p, "=", 2)[0])
+	}
+	return strings.Join(cols, ",")
+}
+
+func valsOf(frag string) string {
+	parts := strings.Split(frag, ",")
+	vals := make([]string, 0, len(parts))
+	for _, p := range parts {
+		vals = append(vals, strings.SplitN(p, "=", 2)[1])
+	}
+	return strings.Join(vals, ",")
+}
