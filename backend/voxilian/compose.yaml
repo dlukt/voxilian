@@ -1,7 +1,9 @@
 name: voxilian
 
-# Development stack (plan M0-T1). Single VPS prod profile from M12-T1
-# reuses this shape with the GHCR image + external PG (spec §10).
+# Development stack (plan M0-T3). Pre-M1 topology rule: NOTHING in the
+# default `compose up` path may depend on a command that intentionally
+# fails (migrate stub until M1-T8, serve stub until M3). M1-T8 promotes
+# `migrate` to a real startup dependency and M3 promotes `app`.
 services:
   postgres:
     image: postgres:18-alpine
@@ -10,35 +12,39 @@ services:
       POSTGRES_PASSWORD: voxdev
       POSTGRES_DB: voxilian
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # PG18+ images refuse a mount directly on the data dir; mount the
+      # parent so versioned data subdirs are managed by the image.
+      - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U vox -d voxilian"]
       interval: 5s
       timeout: 3s
       retries: 10
 
-  # Wiring only in M0: runs `voxilian migrate up` once PG is healthy.
-  # The migrate command is a stub until M1-T8, so this service is
-  # expected to fail until then (restart: "no" keeps it from looping).
+  # Opt-in until M1-T8: real `voxilian migrate up` one-shot against the
+  # existing prod PG (spec §10). Run explicitly:
+  #   docker compose --profile tools run --rm migrate
   migrate:
+    profiles: ["tools"]
     build: .
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["./voxilian", "migrate", "up"]
+    # ENTRYPOINT is the binary itself, so this is argv, not a shell line.
+    command: ["migrate", "up"]
     environment:
       VOX_PG_DSN: postgres://vox:voxdev@postgres:5432/voxilian?sslmode=disable
     restart: "no"
 
+  # Opt-in until serve exists (M3): the binary runs but `serve` is a
+  # fail-loud stub, so this service is NOT part of default startup.
   app:
+    profiles: ["tools"]
     build: .
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-    ports:
-      - "8080:8080"
     environment:
       VOX_PG_DSN: postgres://vox:voxdev@postgres:5432/voxilian?sslmode=disable
+    ports:
+      - "8080:8080"
 
 volumes:
   pgdata:

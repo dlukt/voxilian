@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: go build/vet/fmt/test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend/voxilian
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/voxilian/go.mod
+          cache: true
+      - run: go build ./...
+      - run: go vet ./...
+      - run: test -z "$(gofmt -l .)"
+      - run: go test ./...
+
+  docker:
+    name: docker image build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: backend/voxilian
+          file: backend/voxilian/Dockerfile
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Proves the runner can execute containers for the future M0-T4
+  # testcontainers suites. Real PG smoke, independent of Voxilian
+  # migrations (which do not exist until M1).
+  pg-smoke:
+    name: postgres container smoke
+    runs-on: ubuntu-latest
+    steps:
+      - run: docker run -d --name vox-pg-smoke -e POSTGRES_PASSWORD=smoke -e POSTGRES_DB=smoke postgres:18-alpine
+      - run: |
+          for i in $(seq 1 30); do
+            docker exec vox-pg-smoke pg_isready -U postgres -d smoke && break
+            sleep 2
+          done
+          docker exec vox-pg-smoke pg_isready -U postgres -d smoke
+          docker exec vox-pg-smoke psql -U postgres -d smoke -tAc 'show server_version;'
+      - run: docker rm -f vox-pg-smoke
+        if: always()

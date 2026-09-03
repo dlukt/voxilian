@@ -1,0 +1,4 @@
+# Build context is backend/voxilian (see Dockerfile header).
+# Godot project files and the Meridian59 reference tree live outside
+# the context and are never sent to the daemon.
+.git
