@@ -1,7 +1,3 @@
-/*
-Copyright © 2026 NAME HERE <EMAIL ADDRESS>
-
-*/
 package cmd
 
 import (
@@ -10,21 +6,16 @@ import (
 	"github.com/spf13/cobra"
 )
 
-
-
-// rootCmd represents the base command when called without any subcommands
+// rootCmd is the base command for the Voxilian authoritative game server.
+// Backend working directory is backend/voxilian; see docs/implementation-plan.md.
 var rootCmd = &cobra.Command{
 	Use:   "voxilian",
-	Short: "A brief description of your application",
-	Long: `A longer description that spans multiple lines and likely contains
-examples and usage of using your application. For example:
+	Short: "Voxilian authoritative game server",
+	Long: `Voxilian authoritative game server (Go backend for the Godot voxel client).
 
-Cobra is a CLI library for Go that empowers applications.
-This application is a tool to generate the needed files
-to quickly create a Cobra application.`,
-	// Uncomment the following line if your bare application
-	// has an action associated with it:
-	// Run: func(cmd *cobra.Command, args []string) { },
+Subcommands: serve (world server), migrate (database migrations),
+admin (operations), seed (prototype content loading).
+See docs/backend-spec.md for the architecture specification.`,
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
@@ -37,15 +28,6 @@ func Execute() {
 }
 
 func init() {
-	// Here you will define your flags and configuration settings.
-	// Cobra supports persistent flags, which, if defined here,
-	// will be global for your application.
-
-	// rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.voxilian.yaml)")
-
-	// Cobra also supports local flags, which will only run
-	// when this action is called directly.
-	rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	// Persistent flags (config file, log level, etc.) are introduced
+	// with the config loader in M0-T2.
 }
-
-

@@ -1,6 +1,6 @@
 # Voxilian Backend — Implementation Plan (v1.2)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.4).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.6).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -44,7 +44,7 @@ Tasks are scoped so one task ≈ one session. Anything bigger was split.
 
 Exit: `compose up` gives PG 18 + builder (migrate init step wired, no-op stub until M1); CI builds, vets, tests, publishes GHCR image.
 
-- [ ] **M0-T1** Extend the existing Go/Cobra scaffold (do NOT recreate the module). Under `backend/voxilian/`, add `internal/{config,gateway,sim,store,session,auth,admin,observe,world}`, extend `cmd/` to `serve/migrate/admin/seed` (stubs printing not-implemented), add `migrations/`, `queries/`, `sqlc.yaml`, `compose.yaml` (dev profile: `postgres:18-alpine` + build target + healthcheck + migrate init step wiring). Spec: §3, §10.
+- [x] **M0-T1** Extend the existing Go/Cobra scaffold (do NOT recreate the module). Under `backend/voxilian/`, add `internal/{config,gateway,sim,store,session,auth,admin,observe,world}`, extend `cmd/` to `serve/migrate/admin/seed` (stubs printing not-implemented), add `migrations/`, `queries/`, `sqlc.yaml`, `compose.yaml` (dev profile: `postgres:18-alpine` + build target + healthcheck + migrate init step wiring). Spec: §3, §10.
 - [ ] **M0-T2** Config + observability skeleton. `VOX_*` env + `config.yaml` loader (§10 config list); `/healthz` (liveness stub), `/readyz` (not-ready stub), `/metrics` (Prometheus, empty registry + build info); structured `slog` with `tick/cell/charID` fields wired. Tests: config precedence (file < env), endpoint smoke tests.
 - [ ] **M0-T3** Dockerfile + CI + GHCR publish. Multi-stage `Dockerfile` (build + `migrate` one-shot compatible); workflow: build, vet, fmt-check, `go test ./...`, build+push `ghcr.io/dlukt/voxilian` on `main` (prod compose pulls it, §10). Include `testcontainers-go` availability check job. (CI migration-execution check lives in M1, not here — M0 has no migrations yet.)
 - [ ] **M0-T4** Test harness conventions. Fake clock + seeded RNG helpers (`internal/simtest` or similar), testcontainers PG 18 helper, golden-file helper reading repo-root `testdata/protocol/*.hex`. One example test each. Spec: §12.

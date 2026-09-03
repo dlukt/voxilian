@@ -1,0 +1,44 @@
+name: voxilian
+
+# Development stack (plan M0-T1). Single VPS prod profile from M12-T1
+# reuses this shape with the GHCR image + external PG (spec §10).
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: vox
+      POSTGRES_PASSWORD: voxdev
+      POSTGRES_DB: voxilian
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vox -d voxilian"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Wiring only in M0: runs `voxilian migrate up` once PG is healthy.
+  # The migrate command is a stub until M1-T8, so this service is
+  # expected to fail until then (restart: "no" keeps it from looping).
+  migrate:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["./voxilian", "migrate", "up"]
+    environment:
+      VOX_PG_DSN: postgres://vox:voxdev@postgres:5432/voxilian?sslmode=disable
+    restart: "no"
+
+  app:
+    build: .
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    environment:
+      VOX_PG_DSN: postgres://vox:voxdev@postgres:5432/voxilian?sslmode=disable
+
+volumes:
+  pgdata:

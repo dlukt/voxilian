@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.5 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.6 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -425,10 +425,12 @@ Tables (D4; M59 property names in parens where ported):
   slot)`, `chars_name_uidx ON characters(name)`. The slot index enforces
   the 2-char limit **transactionally** (no app-level race); the name
   index lets deleted names be reused while live names stay globally
-  unique. Display-name rules still open (§13.3).
-- `character_spells(character_id, spell_id, ability SMALLINT 1–99, atrophy_flag BOOL)`,
-  `character_skills(...)` — PK(char, id).
-- `item_instances(id BIGINT, proto SMALLINT FK → item_protos, qty INT, hits INT, enchants JSONB,
+  unique. Display-name rules DECIDED (§9 creation rule).
+- `character_spells(character_id, spell_id INT FK → spell_protos
+  (CHECK 1..65535 via domain), ability SMALLINT 1–99, atrophy_flag BOOL)`,
+  `character_skills(character_id, skill_id INT FK → skill_protos, ...)`
+  — PK(char, id).
+- `item_instances(id BIGINT, proto INT FK → item_protos (CHECK 1..65535), qty INT, hits INT, enchants JSONB,
   revision BIGINT, created_at)` + `item_locations(item_id PK → instances,
   kind SMALLINT (0=inventory,1=ground,2=corpse,3=vault,4=container),
   character_id NULLABLE FK, corpse_id NULLABLE FK,
@@ -476,9 +478,9 @@ Tables (D4; M59 property names in parens where ported):
   amount BIGINT NULLABLE, qty INT NULLABLE, item_id NULLABLE FK,
   created_at)` — append-only money/item movements (trade/bank/vault/loot).
 - `kills(id BIGINT, killer_kind SMALLINT (0=character,1=mob),
-  killer_character_id NULLABLE FK, killer_mob_proto TEXT NULLABLE,
-  victim_kind SMALLINT, victim_character_id NULLABLE FK,
-  victim_mob_proto TEXT NULLABLE, pos_x/pos_y/pos_z BIGINT mm,
+  killer_character_id NULLABLE FK, killer_mob_id INT NULLABLE FK →
+  mob_protos, victim_kind SMALLINT, victim_character_id NULLABLE FK,
+  victim_mob_id INT NULLABLE FK → mob_protos, pos_x/pos_y/pos_z BIGINT mm,
   created_at)` for advancement audit + karma/justice phase 2.
 - `bans/mutes` minimal for admin MVP.
 - Indexes: characters(account_id), item_locations(character_id, corpse_id),
@@ -515,8 +517,8 @@ max 32767, allows negatives):
   atk JSONB, resists JSONB, spells JSONB, loot_tid TEXT, version INT)`
   — numeric IDs for ALL concrete prototypes (plus symbolic key), because
   the client must distinguish them on the wire (see `entityEntry.proto`,
-  §6.3). Same rule for vendors: `shop_listings(vendor_id INT
-  (stable vendor proto ID), listing INT CHECK 1..65535,
+  §6.3). Vendors ARE mob protos (NPC roles): `shop_listings.vendor_id INT
+  FK → mob_protos.id, listing INT CHECK 1..65535,
   item_proto INT FK → item_protos, price BIGINT, qty INT,
   PK(vendor_id, listing))`.
 - Version semantics (idempotency is exact, not "bump on run"): `version`
@@ -769,6 +771,9 @@ ledger is never replayed.
 
 ## 14. Version history
 
+- v0.3.6: leftover consistency — INT proto FKs in §8 summary (incl.
+  numeric `kills` mob FKs, `vendor_id → mob_protos`), display-name
+  pointer fixed, plan header sync.
 - v0.3.5: catalog coherence — migration-safe order note (catalogs before
   dependents), INTEGER 1..65535 stable IDs (never SMALLINT), numeric
   mob/vendor IDs + `entityEntry.proto`, exact seed version semantics,
