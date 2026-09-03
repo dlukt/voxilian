@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -38,6 +39,47 @@ func TestReadyzGate(t *testing.T) {
 	r.SetReady() // idempotent
 	if rec := get(t, s.Handler(), "/readyz"); rec.Code != http.StatusOK {
 		t.Fatalf("readyz after ready = %d, want 200", rec.Code)
+	}
+	r.SetNotReady()
+	r.SetNotReady() // idempotent
+	if rec := get(t, s.Handler(), "/readyz"); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("readyz after unready = %d, want 503", rec.Code)
+	}
+	r.SetReady()
+	if rec := get(t, s.Handler(), "/readyz"); rec.Code != http.StatusOK {
+		t.Fatalf("readyz after re-ready = %d, want 200", rec.Code)
+	}
+	// /healthz stays independent of readiness throughout.
+	if rec := get(t, s.Handler(), "/healthz"); rec.Code != http.StatusOK {
+		t.Fatalf("healthz = %d, want 200 regardless of readiness", rec.Code)
+	}
+}
+
+func TestReadinessConcurrent(t *testing.T) {
+	r := NewReadiness()
+	s := New(r)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				if (i+j)%2 == 0 {
+					r.SetReady()
+				} else {
+					r.SetNotReady()
+				}
+				_ = r.Ready()
+				req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+				s.Handler().ServeHTTP(httptest.NewRecorder(), req)
+			}
+		}(i)
+	}
+	wg.Wait()
+	// Deterministic end state after the storm.
+	r.SetReady()
+	if rec := get(t, s.Handler(), "/readyz"); rec.Code != http.StatusOK {
+		t.Fatalf("readyz = %d, want 200", rec.Code)
 	}
 }
 

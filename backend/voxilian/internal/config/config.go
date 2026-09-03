@@ -63,17 +63,24 @@ func Defaults() Config {
 	}
 }
 
+// fileRateLimitConfig mirrors RateLimitConfig field-wise so omitted
+// nested keys retain defaults instead of zeroing the whole struct.
+type fileRateLimitConfig struct {
+	MovePerSec   *int `yaml:"move_per_sec"`
+	IntentPerSec *int `yaml:"intent_per_sec"`
+}
+
 // fileConfig mirrors Config with pointer fields so YAML overlay can
 // distinguish "absent" from "explicit zero".
 type fileConfig struct {
-	PGDSN                   *string          `yaml:"pg_dsn"`
-	WSBind                  *string          `yaml:"ws_bind"`
-	WorldConstantsPath      *string          `yaml:"world_constants_path"`
-	TickHz                  *int             `yaml:"tick_hz"`
-	SnapshotIntervalSeconds *int             `yaml:"snapshot_interval_seconds"`
-	RateLimits              *RateLimitConfig `yaml:"rate_limits"`
-	SeedDataDir             *string          `yaml:"seed_data_dir"`
-	LogLevel                *string          `yaml:"log_level"`
+	PGDSN                   *string              `yaml:"pg_dsn"`
+	WSBind                  *string              `yaml:"ws_bind"`
+	WorldConstantsPath      *string              `yaml:"world_constants_path"`
+	TickHz                  *int                 `yaml:"tick_hz"`
+	SnapshotIntervalSeconds *int                 `yaml:"snapshot_interval_seconds"`
+	RateLimits              *fileRateLimitConfig `yaml:"rate_limits"`
+	SeedDataDir             *string              `yaml:"seed_data_dir"`
+	LogLevel                *string              `yaml:"log_level"`
 }
 
 // Load builds the effective configuration: defaults, then the YAML file
@@ -118,7 +125,12 @@ func Load(path string) (Config, error) {
 			cfg.SnapshotIntervalSeconds = *fc.SnapshotIntervalSeconds
 		}
 		if fc.RateLimits != nil {
-			cfg.RateLimits = *fc.RateLimits
+			if fc.RateLimits.MovePerSec != nil {
+				cfg.RateLimits.MovePerSec = *fc.RateLimits.MovePerSec
+			}
+			if fc.RateLimits.IntentPerSec != nil {
+				cfg.RateLimits.IntentPerSec = *fc.RateLimits.IntentPerSec
+			}
 		}
 		if fc.SeedDataDir != nil {
 			cfg.SeedDataDir = *fc.SeedDataDir

@@ -12,6 +12,7 @@ package observe
 
 import (
 	"net/http"
+	"sync/atomic"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -24,33 +25,31 @@ var (
 )
 
 // Readiness is the mutable readiness state. Later milestones set it
-// once world load + PG reachability + migration compatibility hold.
+// once world load + PG reachability + migration compatibility hold, and
+// flip it back on PG outage / shutdown (spec §10). Safe for concurrent
+// use; initial state is not-ready.
 type Readiness struct {
-	ready chan struct{}
+	ready atomic.Bool
 }
 
 // NewReadiness starts not-ready.
 func NewReadiness() *Readiness {
-	return &Readiness{ready: make(chan struct{})}
+	return &Readiness{}
 }
 
-// SetReady flips to ready once; repeated calls are no-ops.
+// SetReady moves to ready; repeated calls are harmless.
 func (r *Readiness) SetReady() {
-	select {
-	case <-r.ready:
-	default:
-		close(r.ready)
-	}
+	r.ready.Store(true)
+}
+
+// SetNotReady moves back to not-ready; repeated calls are harmless.
+func (r *Readiness) SetNotReady() {
+	r.ready.Store(false)
 }
 
 // Ready reports current state without blocking.
 func (r *Readiness) Ready() bool {
-	select {
-	case <-r.ready:
-		return true
-	default:
-		return false
-	}
+	return r.ready.Load()
 }
 
 // Server bundles the operational HTTP surface.

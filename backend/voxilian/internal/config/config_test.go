@@ -69,6 +69,41 @@ func TestFileValues(t *testing.T) {
 	}
 }
 
+func TestPartialNestedFileOverlay(t *testing.T) {
+	clearEnv(t)
+	p := writeFile(t, "rate_limits:\n  move_per_sec: 25\n")
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.MovePerSec != 25 || cfg.RateLimits.IntentPerSec != Defaults().RateLimits.IntentPerSec {
+		t.Fatalf("partial nested overlay must preserve sibling default: %+v", cfg.RateLimits)
+	}
+
+	clearEnv(t)
+	p = writeFile(t, "rate_limits:\n  intent_per_sec: 3\n")
+	cfg, err = Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.IntentPerSec != 3 || cfg.RateLimits.MovePerSec != Defaults().RateLimits.MovePerSec {
+		t.Fatalf("partial nested overlay must preserve sibling default: %+v", cfg.RateLimits)
+	}
+}
+
+func TestEnvOverridesNestedFile(t *testing.T) {
+	clearEnv(t)
+	p := writeFile(t, "rate_limits:\n  move_per_sec: 25\n  intent_per_sec: 7\n")
+	t.Setenv("VOX_RATE_MOVE_PER_SEC", "40")
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimits.MovePerSec != 40 || cfg.RateLimits.IntentPerSec != 7 {
+		t.Fatalf("env must win per nested field: %+v", cfg.RateLimits)
+	}
+}
+
 func TestEnvOverridesFile(t *testing.T) {
 	clearEnv(t)
 	p := writeFile(t, "tick_hz: 30\nlog_level: debug\n")
