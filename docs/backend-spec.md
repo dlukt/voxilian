@@ -103,9 +103,9 @@ PG 18 (durable) · memory (ephemeral; rebuilt on restart) · /metrics /healthz
 
 | Loop | Rate | Notes |
 |---|---|---|
-| Movement integration + cell handoff | 20 Hz | Server-authoritative; client sends intents ≤ 10 Hz, sim clamps speed (sprint = M59 haste/run rules) |
+| Movement integration + cell handoff | 20 Hz | Server-authoritative; client intents (dirs + run flag) ≤ 10 Hz, never positions; correct on drift > 0.5 m; walk ~3.5 m/s, run ~7 m/s w/ M59 vigor gate (DECISION §13.2) |
 | Mob AI (chase/move/attack decision) | chase 6–7 Hz equivalent, move/attack 1 Hz (M59: 150 ms / 1500 ms / 1000 ms) | Per-mob staggered timers, not global lockstep |
-| Melee/ranged attacks | max 1 swing/s per attacker (M59 `IsOkayAttackTime`) | Hit `(Off*55)/Def` 10–95%; damage + caps per `meridian59.md` §7 |
+| Melee/ranged attacks | max 1 swing/s per attacker (M59 `IsOkayAttackTime`) | Hit `(Off*55)/Def` 10–95%; server-side range check at processing time, no rewind for MVP; position-history ring kept for future lag comp (§13.2) |
 | Spell casts | per-spell `cast_time` + 2 s post-cast | Mana/vigor/reagent/karma gates per spec |
 | HP/mana/vigor regen | event-driven timers per entity (M59 `CalculateHealthTime/ManaTime`) | Same formulas; sanctuary ×2/×3; faction regen phase 2 |
 | Advancement/HP-gain rolls | on kill events | Same highmark math; write-through to PG on +1 HP / +1% milestone |
@@ -128,7 +128,8 @@ PG 18 (durable) · memory (ephemeral; rebuilt on restart) · /metrics /healthz
   `{reauth, accessToken}` over the existing WS; server swaps the principal
   on the live session and replies `{reauth_ok}` or `{error:
   session_expired}` (→ client re-runs the browser login, then resyncs).
-- C→S intents: `move/{dir+flags}`, `attack/{target}`, `cast/{spell,target}`,
+- C→S intents: `move/{heldDirs,runFlag}` (intents only — positions sent by
+  the client are rejected), `attack/{target}`, `cast/{spell,target}`,
   `use/{skill/item}`, `get/drop/put/give`, `offer/counter/accept/cancel`,
   `buy`, `rest/stand`, `eat`, `say/say_group`, `safety_toggle`, `respawn_ack`.
   Unknown/rate-limited intents → `{error}` (no disconnect on first offense).
@@ -282,9 +283,19 @@ Tables (D4; M59 property names in parens where ported):
 
 1. **Chunk/cell constants**: voxel chunk size (16³?), sim cell size (32 m?),
    AOI radius (96–128 m?), portal volume format — need Godot-side agreement
-   before protocol freeze.
-2. **Movement authority details**: client intent rate (10 Hz?), max speeds
-   per state, correction epsilon, lag-compensation for melee (none MVP?).
+   before protocol freeze. Constraint: **low-end clients targeted**, so err
+   toward conservative streaming/AOI budgets and validate with the load
+   harness on min-spec hardware.
+2. **Movement authority**: DECIDED — **server-authoritative** (M59 was
+   client-authoritative with log-only enforcement; we do the opposite).
+   Client sends intents (held directions + run flag, never positions) at
+   ≤ 10 Hz; server integrates at 20 Hz, owns position, corrects on
+   divergence > 0.5 m. Speeds: walk ~3.5 m/s, run ~7 m/s with M59 vigor
+   gate (run needs vigor ≥ 10). Melee validated by server-side range check
+   at processing time. **Lag compensation: skipped for MVP but designed
+   for** — sim keeps a per-entity position-history ring (2 s @ 20 Hz) from
+   day one and hit validation lives in one isolated function, so rewind
+   plugs in later without protocol changes.
 3. **Characters/account limits**: DECIDED — **2/account** (enforced
    app-level on active/non-deleted characters). Still open: name rules,
    deletion semantics.
