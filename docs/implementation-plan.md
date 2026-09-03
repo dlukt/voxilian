@@ -217,7 +217,7 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M7-T1 | M9-T1 (seed pipeline) + M1-T6b | `backend/voxilian/internal/sim`, `seed/` fixtures |
 | M7-T2a…c, T3, T4 | M4-T1…T3a, M1-T7b | `backend/voxilian/internal/sim` |
 | M8-T1, T2 | M1-T7a…c, M3-T1, M4-T3b/c | `backend/voxilian/internal/sim`, `internal/store` |
-| M9-T1 | M1-T5 (catalog tables) + M1-T6d (registry API) | `backend/voxilian/seed/` + validator |
+| M9-T1 | M1-T2 (catalog tables) + M1-T6d (registry API) | `backend/voxilian/seed/` + validator |
 | M9-T2…T13 | M9-T1 | `backend/voxilian/seed/` content only |
 | M10-T1…T2c | M4-T1 | `backend/voxilian/internal/world`, `seed/world` |
 | M10-T3 | M10-T1 | generator only |

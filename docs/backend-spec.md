@@ -538,6 +538,19 @@ max 32767, allows negatives):
   strict no-op (row untouched). A changed record MUST carry a newer
   `version`; seed refuses version rollback unless explicitly forced
   (`--allow-downgrade`, logged, admin-only).
+- Shop-listing version ownership: listings are NEVER independently
+  versioned or seeded. A vendor's complete `shop_listings` set is part of
+  that vendor's `mob_proto` source record and inherits
+  `mob_protos.version`. Any listing change for a vendor — add, remove,
+  item, price, or qty — requires a newer vendor `mob_proto.version` (or
+  explicit forced downgrade). On an accepted vendor version transition,
+  its listing set is replaced transactionally as a whole; an empty
+  incoming set removes all prior listings. Re-running the same vendor
+  version with an identical listing set is a strict no-op; the same
+  version with a different set is a version conflict. Listing order in
+  source is not semantic; identity is `(vendor_id, listing)`.
+  `--allow-downgrade` applies to the vendor proto and its listing set
+  together.
 
 `item_instances.proto` references `item_protos.id` (INT, range-checked);
 character spell/skill rows reference `spell_protos`/`skill_protos` IDs.
