@@ -81,6 +81,8 @@ PG 18 (durable) · memory (ephemeral; rebuilt on restart) · /metrics /healthz
 - Coordinates: world units in meters, float64 server-side; voxel chunk size
   and origin defined by `internal/world` and shared with the Godot client
   (single source: `world.toml` or generated constants — DECISION NEEDED §13.1).
+  World content comes from the configured `WorldSource` (DECISION §13.5):
+  `classic` authored data or `procedural` deterministic generation.
 - Spatial index: uniform grid cells (e.g. 32 m; tune) → each cell has an owner
   worker (MVP: all local). Neighbor lookup for melee/AoE/AOI.
 - AOI/interest: per-session subscription = cells within view radius R
@@ -115,8 +117,8 @@ PG 18 (durable) · memory (ephemeral; rebuilt on restart) · /metrics /healthz
 ## 6. WebSocket protocol (v0 envelopes, JSON)
 
 - Connect: `wss://host/play` → `{hello, clientVersion, token}` → server
-  `{welcome, serverTick, worldConstants{chunk, aoiRadius, tickRates}}` or
-  `{error}`. Token = opaque session token issued at login (DECISION §13.4),
+  `{welcome, serverTick, worldConstants{chunk, aoiRadius, tickRates},
+  world{mode, seed, version}}` or `{error}`. Token = opaque session token issued at login (DECISION §13.4),
   validated against the in-memory session registry, mapped to
   account/character loaded from PG.
 - C→S intents: `move/{dir+flags}`, `attack/{target}`, `cast/{spell,target}`,
@@ -233,6 +235,12 @@ Tables (D4; M59 property names in parens where ported):
 - Admin (cobra `voxilian admin ...` + WS admin role): create account/character,
   grant/revoke, kick/ban, save-now, spawn/teleport (logged), give (logged,
   dev-only flag).
+- Seed data (`voxilian seed`, DECISION §13.7): all spell/skill/mob protos load
+  from versioned structured data files — one per school plus bestiary
+  (e.g. `seed/shalille.yaml`, `seed/bestiary.yaml`) — so the full-scope port
+  is reviewable in chunks. Seed files are validated against the same
+  CHECK constraints as live writes; re-running seed is idempotent
+  (upsert by stable proto id).
 
 ## 11. Security
 
@@ -267,8 +275,15 @@ Tables (D4; M59 property names in parens where ported):
    deletion semantics.
 4. **Session token format + expiry**, password-reset flow (out of scope MVP?),
    age/rating handling.
-5. **World authoring**: hand-built starter region vs procedural seed; format
-   (Tiled/custom → `world.toml`?); who owns the map pipeline.
+5. **World authoring**: DECIDED — **two modes**: `classic` (hand-authored,
+   M59-faithful regions for returning players; more work, ships incrementally
+   starting with the starter region) and `procedural` (deterministic
+   seeded generation). Mode + seed are server config (`world.mode`,
+   `world.seed`); sim runs against a `WorldSource` interface so both feed the
+   same cells/volumes/flags pipeline. Layouts are M59-*inspired*, not copied
+   (trademark/content note in `meridian59.md` header). Still open: authored
+   format details (Tiled/custom → `world.toml`?); generator algorithm +
+   versioning; whether classic regions can embed inside procedural worlds.
 6. **Prod target**: DECIDED — **single VPS + compose**; app image from
    **GHCR** (`ghcr.io/dlukt/voxilian`, CI-published); PG is the **existing
    prod instance** (dedicated database + owner user, external to compose).
