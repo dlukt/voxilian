@@ -10,12 +10,21 @@ import (
 	"github.com/dlukt/voxilian/internal/simtest"
 )
 
-// rootUpdateRe matches a statement-level UPDATE of the CAS aggregate
-// root not yet owned: banks (T7c). characters/item_instances moved to
-// file-ownership rules (T7a/T7b).
-// It deliberately does NOT match the `DO UPDATE SET` clause inside the
-// sanctioned UpsertItemLocation (M1-T7b building block).
-var rootUpdateRe = regexp.MustCompile(`(?mi)^\s*UPDATE\s+(banks)\b`)
+// rootUpdateRe is now empty-by-construction: every aggregate-root UPDATE
+// has an explicit owner file (characters→character_cas.sql T7a,
+// item_instances→item_cas.sql T7b, banks→bank_cas.sql T7c). It remains as
+// a tripwire matching nothing; per-file rules below do the real work.
+// It deliberately does NOT match the `DO UPDATE SET` clause inside
+// sanctioned upserts (UpsertItemLocation, UpsertBan/Mute).
+var rootUpdateRe = regexp.MustCompile(`(?mi)^\s*UPDATE\s+(ZZZ_NO_SUCH_TABLE)\b`)
+
+// bankCASFile owns the only production UPDATE banks (T7c).
+var bankCASFile = "bank_cas.sql"
+
+var bankRootUpdateRe = regexp.MustCompile(`(?mi)^\s*UPDATE\s+banks\b`)
+
+// bankDeleteRe forbids bank deletion: deletion semantics unspecified.
+var bankDeleteRe = regexp.MustCompile(`(?mi)^\s*DELETE\s+FROM\s+banks\b`)
 
 // itemCASFile owns the only production UPDATE item_instances (T7b).
 var itemCASFile = "item_cas.sql"
@@ -104,6 +113,17 @@ func TestNoMutableRootQueries(t *testing.T) {
 				if !strings.Contains(string(raw), "-- name: "+want) {
 					t.Errorf("%s missing required query %s", name, want)
 				}
+			}
+		}
+		if m := bankRootUpdateRe.FindString(string(raw)); m != "" && name != bankCASFile {
+			t.Errorf("%s contains UPDATE banks outside %s", name, bankCASFile)
+		}
+		if m := bankDeleteRe.FindString(string(raw)); m != "" {
+			t.Errorf("%s contains forbidden %q (bank deletion unspecified)", name, m)
+		}
+		if name == bankCASFile {
+			if !strings.Contains(string(raw), "-- name: CASUpdateBankBalance") {
+				t.Errorf("%s missing required query CASUpdateBankBalance", name)
 			}
 		}
 		if m := auditMutateRe.FindString(string(raw)); m != "" {

@@ -51,56 +51,6 @@ type CharacterSnapshot struct {
 	Skills []CharacterSkillSnapshot
 }
 
-// SaveCharacterSnapshot persists a complete character aggregate snapshot:
-// root CAS FIRST (advancing revision), then full child replacement, all
-// in one transaction. Stale roots abort before any child write; child
-// failures roll the root advance back. No re-read/retry on stale.
-func SaveCharacterSnapshot(ctx context.Context, pool *pgxpool.Pool, snap CharacterSnapshot) (int64, error) {
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("store: save character snapshot: begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	q := gen.New(tx)
-
-	newRev, err := q.CASUpdateCharacterSnapshot(ctx, gen.CASUpdateCharacterSnapshotParams{
-		Karma: snap.Karma, PosX: snap.PosX, PosY: snap.PosY, PosZ: snap.PosZ,
-		Vitals: snap.Vitals, Advancement: snap.Advancement, Flags: snap.Flags,
-		ExpectedRevision: snap.ExpectedRevision, ID: snap.ID,
-	})
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return 0, staleRevision("save character snapshot", snap.ID, snap.ExpectedRevision)
-		}
-		return 0, fmt.Errorf("store: save character snapshot: root CAS: %w", err)
-	}
-
-	if err := q.DeleteCharacterSpells(ctx, snap.ID); err != nil {
-		return 0, fmt.Errorf("store: save character snapshot: clear spells: %w", err)
-	}
-	for _, s := range snap.Spells {
-		if err := q.InsertCharacterSpell(ctx, gen.InsertCharacterSpellParams{
-			CharacterID: snap.ID, SpellID: s.SpellID, Ability: s.Ability, AtrophyFlag: s.AtrophyFlag,
-		}); err != nil {
-			return 0, fmt.Errorf("store: save character snapshot: spell %d: %w", s.SpellID, err)
-		}
-	}
-	if err := q.DeleteCharacterSkills(ctx, snap.ID); err != nil {
-		return 0, fmt.Errorf("store: save character snapshot: clear skills: %w", err)
-	}
-	for _, s := range snap.Skills {
-		if err := q.InsertCharacterSkill(ctx, gen.InsertCharacterSkillParams{
-			CharacterID: snap.ID, SkillID: s.SkillID, Ability: s.Ability, AtrophyFlag: s.AtrophyFlag,
-		}); err != nil {
-			return 0, fmt.Errorf("store: save character snapshot: skill %d: %w", s.SkillID, err)
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("store: save character snapshot: commit: %w", err)
-	}
-	return newRev, nil
-}
-
 // SoftDeleteCharacter CAS-deletes a live character: single atomic UPDATE,
 // no child touch, revision advance. A second delete (or any racing
 // save/delete on the same expected revision) is stale, not idempotent.

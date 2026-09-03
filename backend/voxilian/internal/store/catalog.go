@@ -322,15 +322,9 @@ func replaceListings(ctx context.Context, q *gen.Queries, r MobProtoRecord) erro
 	return nil
 }
 
-// UpsertCatalogBatch applies a version-ruled batch atomically: spells,
-// skills, items, then mobs with listing sets. Items precede listings so
-// listing FKs resolve. One transaction; any failure rolls everything back.
-func UpsertCatalogBatch(ctx context.Context, pool *pgxpool.Pool, batch CatalogBatch, allowDowngrade bool) error {
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("store: catalog batch: begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
+// upsertCatalogBatchTx applies a version-ruled batch inside a caller-owned
+// transaction (spells, skills, items, then mobs with listing sets).
+func upsertCatalogBatchTx(ctx context.Context, tx pgx.Tx, batch CatalogBatch, allowDowngrade bool) error {
 	q := gen.New(tx)
 	for _, r := range batch.Spells {
 		if err := upsertSpell(ctx, q, r, allowDowngrade); err != nil {
@@ -351,9 +345,6 @@ func UpsertCatalogBatch(ctx context.Context, pool *pgxpool.Pool, batch CatalogBa
 		if err := upsertMob(ctx, q, r, allowDowngrade); err != nil {
 			return err
 		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("store: catalog batch: commit: %w", err)
 	}
 	return nil
 }
@@ -471,10 +462,10 @@ func (r *CatalogRegistry) ShopListings(vendorID int32) []ShopListing {
 	return out
 }
 
-// LoadCatalogRegistry reads all five catalogs under ONE repeatable-read
+// loadCatalogRegistry reads all five catalogs under ONE repeatable-read
 // read-only transaction: a concurrent reseed can never produce a mixed
 // registry.
-func LoadCatalogRegistry(ctx context.Context, pool *pgxpool.Pool) (*CatalogRegistry, error) {
+func loadCatalogRegistry(ctx context.Context, pool *pgxpool.Pool) (*CatalogRegistry, error) {
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, fmt.Errorf("store: load registry: begin: %w", err)

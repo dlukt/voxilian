@@ -9,7 +9,6 @@ import (
 	"github.com/dlukt/voxilian/internal/store/gen"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // ErrContainerCycle reports a rejected containment placement: destination
@@ -66,26 +65,6 @@ func textNull(v *string) pgtype.Text {
 	return pgtype.Text{String: *v, Valid: true}
 }
 
-// SaveItemSnapshot persists a complete item aggregate snapshot: root CAS
-// FIRST, then (for container destinations) advisory serialization plus
-// ancestry validation, then the complete location upsert — one READ
-// COMMITTED transaction. Any failure rolls the root advance back.
-func SaveItemSnapshot(ctx context.Context, pool *pgxpool.Pool, snap ItemSnapshot) (int64, error) {
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("store: save item snapshot: begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	rev, err := saveItemSnapshotTx(ctx, tx, snap)
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("store: save item snapshot: commit: %w", err)
-	}
-	return rev, nil
-}
-
 // saveItemSnapshotTx is the private seam later critical operations reuse
 // to compose materialized state + ledger in one Store transaction.
 // pgx.Tx never escapes internal/store.
@@ -97,10 +76,9 @@ func saveItemSnapshotTx(ctx context.Context, tx pgx.Tx, snap ItemSnapshot) (int6
 		ExpectedRevision: snap.ExpectedRevision, ID: snap.ID,
 	})
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return 0, staleRevision("save item snapshot", snap.ID, snap.ExpectedRevision)
-		}
-		return 0, fmt.Errorf("store: save item snapshot: root CAS: %w", err)
+		// Raw return: the public method maps pgx.ErrNoRows to
+		// ErrStaleRevision exactly once (and counts it there).
+		return 0, err
 	}
 
 	loc := snap.Location

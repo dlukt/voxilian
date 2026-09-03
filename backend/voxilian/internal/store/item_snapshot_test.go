@@ -64,6 +64,7 @@ func readLoc(t *testing.T, q *gen.Queries, id int64) gen.ItemLocation {
 
 func TestSaveItemSnapshotSuccess(t *testing.T) {
 	pool, q := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	charID, _ := itemSnapFixture(t, pool, q)
 	root, _, err := createItemWithLocation(ctx, pool,
@@ -74,7 +75,7 @@ func TestSaveItemSnapshotSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rev, err := SaveItemSnapshot(ctx, pool, groundSnap(root.ID, 0))
+	rev, err := st.SaveItemSnapshot(ctx, groundSnap(root.ID, 0))
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -97,6 +98,7 @@ func TestSaveItemSnapshotSuccess(t *testing.T) {
 
 func TestSaveItemLocationReplacement(t *testing.T) {
 	pool, q := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	charID, _ := itemSnapFixture(t, pool, q)
 	root, _, err := createItemWithLocation(ctx, pool,
@@ -111,7 +113,7 @@ func TestSaveItemLocationReplacement(t *testing.T) {
 	slot := "mainhand"
 	snap := groundSnap(root.ID, 0)
 	snap.Location = ItemLocationSnapshot{Kind: 0, CharacterID: &charID, Slot: &slot}
-	if _, err := SaveItemSnapshot(ctx, pool, snap); err != nil {
+	if _, err := st.SaveItemSnapshot(ctx, snap); err != nil {
 		t.Fatal(err)
 	}
 	loc := readLoc(t, q, root.ID)
@@ -123,7 +125,7 @@ func TestSaveItemLocationReplacement(t *testing.T) {
 	region := "barloque"
 	snap.ExpectedRevision = 1
 	snap.Location = ItemLocationSnapshot{Kind: 3, CharacterID: &charID, VaultRegion: &region, Slot: &slot}
-	if _, err := SaveItemSnapshot(ctx, pool, snap); err != nil {
+	if _, err := st.SaveItemSnapshot(ctx, snap); err != nil {
 		t.Fatal(err)
 	}
 	loc = readLoc(t, q, root.ID)
@@ -142,7 +144,7 @@ func TestSaveItemLocationReplacement(t *testing.T) {
 	snap.ExpectedRevision = 2
 	pocket := "pocket"
 	snap.Location = ItemLocationSnapshot{Kind: 4, ContainerItemID: &bag.ID, Slot: &pocket}
-	if _, err := SaveItemSnapshot(ctx, pool, snap); err != nil {
+	if _, err := st.SaveItemSnapshot(ctx, snap); err != nil {
 		t.Fatal(err)
 	}
 	loc = readLoc(t, q, root.ID)
@@ -153,6 +155,7 @@ func TestSaveItemLocationReplacement(t *testing.T) {
 
 func TestSaveItemInvalidLocationRollback(t *testing.T) {
 	pool, q := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	_, _ = itemSnapFixture(t, pool, q)
 	root, _, err := createItemWithLocation(ctx, pool,
@@ -165,7 +168,7 @@ func TestSaveItemInvalidLocationRollback(t *testing.T) {
 	bad := groundSnap(root.ID, 0)
 	bad.Qty = 99
 	bad.Location = ItemLocationSnapshot{Kind: 0} // missing character+slot
-	_, err = SaveItemSnapshot(ctx, pool, bad)
+	_, err = st.SaveItemSnapshot(ctx, bad)
 	var pgErr *pgconn.PgError
 	if err == nil || !errors.As(err, &pgErr) || pgErr.ConstraintName != "item_locations_kind_state_check" {
 		t.Fatalf("err = %v, want kind_state_check", err)
@@ -182,6 +185,7 @@ func TestSaveItemInvalidLocationRollback(t *testing.T) {
 
 func TestSaveItemFKRollback(t *testing.T) {
 	pool, q := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	_, _ = itemSnapFixture(t, pool, q)
 	root, _, err := createItemWithLocation(ctx, pool,
@@ -194,7 +198,7 @@ func TestSaveItemFKRollback(t *testing.T) {
 	ghost := int64(999999)
 	bad := groundSnap(root.ID, 0)
 	bad.Location = ItemLocationSnapshot{Kind: 2, CorpseID: &ghost}
-	_, err = SaveItemSnapshot(ctx, pool, bad)
+	_, err = st.SaveItemSnapshot(ctx, bad)
 	var pgErr *pgconn.PgError
 	if err == nil || !errors.As(err, &pgErr) {
 		t.Fatalf("err = %v, want preserved PgError", err)
@@ -209,6 +213,7 @@ func TestSaveItemFKRollback(t *testing.T) {
 
 func TestSaveItemStale(t *testing.T) {
 	pool, q := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	_, _ = itemSnapFixture(t, pool, q)
 	root, _, err := createItemWithLocation(ctx, pool,
@@ -218,14 +223,14 @@ func TestSaveItemStale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := SaveItemSnapshot(ctx, pool, groundSnap(root.ID, 0)); err != nil {
+	if _, err := st.SaveItemSnapshot(ctx, groundSnap(root.ID, 0)); err != nil {
 		t.Fatal(err)
 	}
 	stale := groundSnap(root.ID, 0)
 	stale.Qty = 99
 	nine := int64(9)
 	stale.Location = ItemLocationSnapshot{Kind: 1, PosX: &nine, PosY: &nine, PosZ: &nine}
-	if _, err := SaveItemSnapshot(ctx, pool, stale); !errors.Is(err, ErrStaleRevision) {
+	if _, err := st.SaveItemSnapshot(ctx, stale); !errors.Is(err, ErrStaleRevision) {
 		t.Fatalf("err = %v, want stale", err)
 	}
 	if got := readItem(t, q, root.ID); got.Revision != 1 || got.Qty != 3 {
@@ -235,13 +240,14 @@ func TestSaveItemStale(t *testing.T) {
 		t.Fatalf("location touched: %+v", loc)
 	}
 	stale.ExpectedRevision = 99
-	if _, err := SaveItemSnapshot(ctx, pool, stale); !errors.Is(err, ErrStaleRevision) {
+	if _, err := st.SaveItemSnapshot(ctx, stale); !errors.Is(err, ErrStaleRevision) {
 		t.Fatalf("future err = %v, want stale", err)
 	}
 }
 
 func TestSaveItemRace(t *testing.T) {
 	pool, q := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	_, _ = itemSnapFixture(t, pool, q)
 	root, _, err := createItemWithLocation(ctx, pool,
@@ -267,7 +273,7 @@ func TestSaveItemRace(t *testing.T) {
 		wg.Add(1)
 		go func(s ItemSnapshot) {
 			defer wg.Done()
-			rev, err := SaveItemSnapshot(ctx, pool, s)
+			rev, err := st.SaveItemSnapshot(ctx, s)
 			ch <- res{rev, err}
 		}(s)
 	}
@@ -301,6 +307,7 @@ func TestSaveItemRace(t *testing.T) {
 
 func TestItemSelfContainer(t *testing.T) {
 	pool, q := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	_, _ = itemSnapFixture(t, pool, q)
 	root, _, err := createItemWithLocation(ctx, pool,
@@ -313,7 +320,7 @@ func TestItemSelfContainer(t *testing.T) {
 	slot := "pocket"
 	self := groundSnap(root.ID, 0)
 	self.Location = ItemLocationSnapshot{Kind: 4, ContainerItemID: &root.ID, Slot: &slot}
-	if _, err := SaveItemSnapshot(ctx, pool, self); !errors.Is(err, ErrContainerCycle) {
+	if _, err := st.SaveItemSnapshot(ctx, self); !errors.Is(err, ErrContainerCycle) {
 		t.Fatalf("err = %v, want cycle", err)
 	}
 	if got := readItem(t, q, root.ID); got.Revision != 0 {
@@ -323,6 +330,7 @@ func TestItemSelfContainer(t *testing.T) {
 
 func TestItemDeepCycles(t *testing.T) {
 	pool, q := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	_, _ = itemSnapFixture(t, pool, q)
 	mkground := func() int64 {
@@ -339,7 +347,7 @@ func TestItemDeepCycles(t *testing.T) {
 		slot := "pocket"
 		s := groundSnap(id, rev)
 		s.Location = ItemLocationSnapshot{Kind: 4, ContainerItemID: &cont, Slot: &slot}
-		if _, err := SaveItemSnapshot(ctx, pool, s); err != nil {
+		if _, err := st.SaveItemSnapshot(ctx, s); err != nil {
 			t.Fatalf("setup place %d→%d: %v", id, cont, err)
 		}
 	}
@@ -350,7 +358,7 @@ func TestItemDeepCycles(t *testing.T) {
 	slot := "pocket"
 	ab := groundSnap(a, 0)
 	ab.Location = ItemLocationSnapshot{Kind: 4, ContainerItemID: &b, Slot: &slot}
-	if _, err := SaveItemSnapshot(ctx, pool, ab); !errors.Is(err, ErrContainerCycle) {
+	if _, err := st.SaveItemSnapshot(ctx, ab); !errors.Is(err, ErrContainerCycle) {
 		t.Fatalf("A→B err = %v, want cycle", err)
 	}
 	if got := readItem(t, q, a); got.Revision != 0 {
@@ -361,13 +369,14 @@ func TestItemDeepCycles(t *testing.T) {
 	putIn(c, 0, b)
 	ac := groundSnap(a, 0)
 	ac.Location = ItemLocationSnapshot{Kind: 4, ContainerItemID: &c, Slot: &slot}
-	if _, err := SaveItemSnapshot(ctx, pool, ac); !errors.Is(err, ErrContainerCycle) {
+	if _, err := st.SaveItemSnapshot(ctx, ac); !errors.Is(err, ErrContainerCycle) {
 		t.Fatalf("A→C err = %v, want cycle", err)
 	}
 }
 
 func TestItemCorruptAncestryTerminates(t *testing.T) {
 	pool, q := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	_, _ = itemSnapFixture(t, pool, q)
 	mkground := func() int64 {
@@ -393,7 +402,7 @@ func TestItemCorruptAncestryTerminates(t *testing.T) {
 	zs.Location = ItemLocationSnapshot{Kind: 4, ContainerItemID: &y, Slot: &slot}
 	done := make(chan error, 1)
 	go func() {
-		_, err := SaveItemSnapshot(ctx, pool, zs)
+		_, err := st.SaveItemSnapshot(ctx, zs)
 		done <- err
 	}()
 	select {
@@ -411,6 +420,7 @@ func TestItemCorruptAncestryTerminates(t *testing.T) {
 
 func TestItemReverseCycleRace(t *testing.T) {
 	pool, q := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	_, _ = itemSnapFixture(t, pool, q)
 	mkground := func() int64 {
@@ -438,12 +448,12 @@ func TestItemReverseCycleRace(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, err := SaveItemSnapshot(ctx, pool, mkMove(a, b))
+		_, err := st.SaveItemSnapshot(ctx, mkMove(a, b))
 		ch <- res{a, err}
 	}()
 	go func() {
 		defer wg.Done()
-		_, err := SaveItemSnapshot(ctx, pool, mkMove(b, a))
+		_, err := st.SaveItemSnapshot(ctx, mkMove(b, a))
 		ch <- res{b, err}
 	}()
 	wg.Wait()

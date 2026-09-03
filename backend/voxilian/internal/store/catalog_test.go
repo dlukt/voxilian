@@ -66,7 +66,8 @@ func seedBatch() CatalogBatch {
 
 func mustUpsert(t *testing.T, pool *pgxpool.Pool, b CatalogBatch, allow bool) {
 	t.Helper()
-	if err := UpsertCatalogBatch(context.Background(), pool, b, allow); err != nil {
+	st := newTestStore(t, pool)
+	if err := st.UpsertCatalogBatch(context.Background(), b, allow); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 }
@@ -83,10 +84,11 @@ func xminOf(t *testing.T, pool *pgxpool.Pool, table, where string, args ...any) 
 
 func TestCatalogRegistryLoad(t *testing.T) {
 	pool, _ := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	mustUpsert(t, pool, seedBatch(), false)
 
-	reg, err := LoadCatalogRegistry(ctx, pool)
+	reg, err := st.LoadCatalogRegistry(ctx)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -136,7 +138,7 @@ func TestCatalogRegistryLoad(t *testing.T) {
 		Version:  1,
 		Listings: []ShopListingRecord{{Listing: 10, ItemProto: 100, Price: 999, Qty: 1}},
 	}}}, false)
-	reg, err = LoadCatalogRegistry(ctx, pool)
+	reg, err = st.LoadCatalogRegistry(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,9 +163,10 @@ func TestCatalogRegistryLoad(t *testing.T) {
 
 func TestCatalogRegistryImmutable(t *testing.T) {
 	pool, _ := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	mustUpsert(t, pool, seedBatch(), false)
-	reg, err := LoadCatalogRegistry(ctx, pool)
+	reg, err := st.LoadCatalogRegistry(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,9 +194,10 @@ func TestCatalogRegistryImmutable(t *testing.T) {
 
 func TestCatalogHolderSwap(t *testing.T) {
 	pool, _ := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	mustUpsert(t, pool, seedBatch(), false)
-	a, err := LoadCatalogRegistry(ctx, pool)
+	a, err := st.LoadCatalogRegistry(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +206,7 @@ func TestCatalogHolderSwap(t *testing.T) {
 		t.Fatal("holder initial")
 	}
 	mustUpsert(t, pool, CatalogBatch{Spells: []SpellProtoRecord{spellRec(1, 2, 11, `{"a":1}`)}}, false)
-	b, err := LoadCatalogRegistry(ctx, pool)
+	b, err := st.LoadCatalogRegistry(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,11 +263,12 @@ func TestCatalogJSONSemanticNoOp(t *testing.T) {
 
 func TestCatalogSameVersionConflict(t *testing.T) {
 	pool, _ := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	mustUpsert(t, pool, seedBatch(), false)
 
 	// Proto field change, same version.
-	err := UpsertCatalogBatch(ctx, pool, CatalogBatch{Spells: []SpellProtoRecord{spellRec(1, 1, 11, `{"a":1}`)}}, false)
+	err := st.UpsertCatalogBatch(ctx, CatalogBatch{Spells: []SpellProtoRecord{spellRec(1, 1, 11, `{"a":1}`)}}, false)
 	var cv *CatalogVersionError
 	if !errors.As(err, &cv) || !errors.Is(err, ErrCatalogVersionConflict) {
 		t.Fatalf("err = %v, want conflict", err)
@@ -272,14 +277,14 @@ func TestCatalogSameVersionConflict(t *testing.T) {
 		t.Fatalf("details = %+v", cv)
 	}
 	// Row untouched.
-	reg, _ := LoadCatalogRegistry(ctx, pool)
+	reg, _ := st.LoadCatalogRegistry(ctx)
 	sp, _ := reg.Spell(1)
 	if sp.Mana != 10 {
 		t.Fatalf("conflict mutated row: %+v", sp)
 	}
 
 	// Vendor listing price change, same version.
-	err = UpsertCatalogBatch(ctx, pool, CatalogBatch{Mobs: []MobProtoRecord{{
+	err = st.UpsertCatalogBatch(ctx, CatalogBatch{Mobs: []MobProtoRecord{{
 		ID: 200, Key: "vendor-a", Level: 45, Difficulty: 6, Karma: -40,
 		Atk: json.RawMessage(`{}`), Resists: json.RawMessage(`{}`), Spells: json.RawMessage(`{}`),
 		LootTID: strp("TID_ORC"), Version: 1,
@@ -290,7 +295,7 @@ func TestCatalogSameVersionConflict(t *testing.T) {
 	}
 
 	// Listing removal, same version.
-	err = UpsertCatalogBatch(ctx, pool, CatalogBatch{Mobs: []MobProtoRecord{{
+	err = st.UpsertCatalogBatch(ctx, CatalogBatch{Mobs: []MobProtoRecord{{
 		ID: 200, Key: "vendor-a", Level: 45, Difficulty: 6, Karma: -40,
 		Atk: json.RawMessage(`{}`), Resists: json.RawMessage(`{}`), Spells: json.RawMessage(`{}`),
 		LootTID: strp("TID_ORC"), Version: 1,
@@ -303,6 +308,7 @@ func TestCatalogSameVersionConflict(t *testing.T) {
 
 func TestCatalogNewerVersion(t *testing.T) {
 	pool, _ := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	mustUpsert(t, pool, seedBatch(), false)
 
@@ -317,7 +323,7 @@ func TestCatalogNewerVersion(t *testing.T) {
 		}},
 	}, false)
 
-	reg, err := LoadCatalogRegistry(ctx, pool)
+	reg, err := st.LoadCatalogRegistry(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,10 +339,11 @@ func TestCatalogNewerVersion(t *testing.T) {
 
 func TestCatalogRollbackAndForcedDowngrade(t *testing.T) {
 	pool, _ := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	mustUpsert(t, pool, CatalogBatch{Spells: []SpellProtoRecord{spellRec(9, 5, 10, `{}`)}}, false)
 
-	err := UpsertCatalogBatch(ctx, pool, CatalogBatch{Spells: []SpellProtoRecord{spellRec(9, 4, 11, `{}`)}}, false)
+	err := st.UpsertCatalogBatch(ctx, CatalogBatch{Spells: []SpellProtoRecord{spellRec(9, 4, 11, `{}`)}}, false)
 	var cv *CatalogVersionError
 	if !errors.As(err, &cv) || !errors.Is(err, ErrCatalogVersionRollback) {
 		t.Fatalf("err = %v, want rollback", err)
@@ -344,13 +351,13 @@ func TestCatalogRollbackAndForcedDowngrade(t *testing.T) {
 	if cv.Table != "spell_protos" || cv.ID != 9 || cv.Current != 5 || cv.Incoming != 4 {
 		t.Fatalf("details = %+v", cv)
 	}
-	reg, _ := LoadCatalogRegistry(ctx, pool)
+	reg, _ := st.LoadCatalogRegistry(ctx)
 	if sp, _ := reg.Spell(9); sp.Version != 5 || sp.Mana != 10 {
 		t.Fatalf("rollback mutated: %+v", sp)
 	}
 
 	mustUpsert(t, pool, CatalogBatch{Spells: []SpellProtoRecord{spellRec(9, 4, 11, `{}`)}}, true)
-	reg, _ = LoadCatalogRegistry(ctx, pool)
+	reg, _ = st.LoadCatalogRegistry(ctx)
 	if sp, _ := reg.Spell(9); sp.Version != 4 || sp.Mana != 11 {
 		t.Fatalf("forced = %+v", sp)
 	}
@@ -358,6 +365,7 @@ func TestCatalogRollbackAndForcedDowngrade(t *testing.T) {
 
 func TestCatalogBatchAtomic(t *testing.T) {
 	pool, _ := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	mustUpsert(t, pool, CatalogBatch{
 		Spells: []SpellProtoRecord{spellRec(11, 3, 10, `{}`)},
@@ -371,19 +379,19 @@ func TestCatalogBatchAtomic(t *testing.T) {
 	}, false)
 
 	// Earlier valid update + later conflict → whole batch rolls back.
-	err := UpsertCatalogBatch(ctx, pool, CatalogBatch{
+	err := st.UpsertCatalogBatch(ctx, CatalogBatch{
 		Spells: []SpellProtoRecord{spellRec(11, 4, 99, `{}`), spellRec(11, 4, 100, `{}`)},
 	}, false)
 	if !errors.Is(err, ErrCatalogVersionConflict) {
 		t.Fatalf("err = %v, want conflict", err)
 	}
-	reg, _ := LoadCatalogRegistry(ctx, pool)
+	reg, _ := st.LoadCatalogRegistry(ctx)
 	if sp, _ := reg.Spell(11); sp.Version != 3 || sp.Mana != 10 {
 		t.Fatalf("partial commit: %+v", sp)
 	}
 
 	// PG error (listing references missing item) rolls back earlier writes.
-	err = UpsertCatalogBatch(ctx, pool, CatalogBatch{
+	err = st.UpsertCatalogBatch(ctx, CatalogBatch{
 		Spells: []SpellProtoRecord{spellRec(11, 4, 99, `{}`)},
 		Mobs: []MobProtoRecord{{
 			ID: 211, Key: "atomic-w", Level: 1, Difficulty: 1, Karma: 0,
@@ -395,7 +403,7 @@ func TestCatalogBatchAtomic(t *testing.T) {
 	if err == nil {
 		t.Fatal("bad listing FK accepted")
 	}
-	reg, _ = LoadCatalogRegistry(ctx, pool)
+	reg, _ = st.LoadCatalogRegistry(ctx)
 	if sp, _ := reg.Spell(11); sp.Version != 3 {
 		t.Fatalf("FK failure committed partial batch: %+v", sp)
 	}
@@ -406,12 +414,13 @@ func TestCatalogBatchAtomic(t *testing.T) {
 
 func TestCatalogExplicitIDs(t *testing.T) {
 	pool, _ := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	mustUpsert(t, pool, CatalogBatch{
 		Spells: []SpellProtoRecord{spellRec(1, 1, 1, `{}`), spellRec(65535, 1, 1, `{}`)},
 		Items:  []ItemProtoRecord{itemRec(65535, 1, nil)},
 	}, false)
-	reg, err := LoadCatalogRegistry(ctx, pool)
+	reg, err := st.LoadCatalogRegistry(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -50,10 +50,11 @@ func readRoot(t *testing.T, q *gen.Queries, id int64) gen.Character {
 
 func TestSaveSnapshotSuccess(t *testing.T) {
 	pool, q := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	id, snap := snapFixture(t, pool, q, "sub-snap", "Snapper", 0)
 
-	rev, err := SaveCharacterSnapshot(ctx, pool, snap)
+	rev, err := st.SaveCharacterSnapshot(ctx, snap)
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -81,7 +82,7 @@ func TestSaveSnapshotSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	snap.ExpectedRevision = 1
-	if _, err := SaveCharacterSnapshot(ctx, pool, snap); err != nil {
+	if _, err := st.SaveCharacterSnapshot(ctx, snap); err != nil {
 		t.Fatal(err)
 	}
 	got = readRoot(t, q, id)
@@ -92,15 +93,16 @@ func TestSaveSnapshotSuccess(t *testing.T) {
 
 func TestSaveSnapshotChildReplacement(t *testing.T) {
 	pool, q := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	id, snap := snapFixture(t, pool, q, "sub-repl", "Replacer", 0)
-	if _, err := SaveCharacterSnapshot(ctx, pool, snap); err != nil {
+	if _, err := st.SaveCharacterSnapshot(ctx, snap); err != nil {
 		t.Fatal(err)
 	}
 	snap.ExpectedRevision = 1
 	snap.Spells = []CharacterSpellSnapshot{{SpellID: 2, Ability: 50}, {SpellID: 3, Ability: 70, AtrophyFlag: true}}
 	snap.Skills = []CharacterSkillSnapshot{{SkillID: 2, Ability: 44}}
-	if _, err := SaveCharacterSnapshot(ctx, pool, snap); err != nil {
+	if _, err := st.SaveCharacterSnapshot(ctx, snap); err != nil {
 		t.Fatal(err)
 	}
 	spells, err := q.ListCharacterSpells(ctx, id)
@@ -115,15 +117,16 @@ func TestSaveSnapshotChildReplacement(t *testing.T) {
 
 func TestSaveSnapshotEmptyClears(t *testing.T) {
 	pool, q := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	id, snap := snapFixture(t, pool, q, "sub-empty", "Emptier", 0)
-	if _, err := SaveCharacterSnapshot(ctx, pool, snap); err != nil {
+	if _, err := st.SaveCharacterSnapshot(ctx, snap); err != nil {
 		t.Fatal(err)
 	}
 	snap.ExpectedRevision = 1
 	snap.Spells = nil
 	snap.Skills = []CharacterSkillSnapshot{}
-	if _, err := SaveCharacterSnapshot(ctx, pool, snap); err != nil {
+	if _, err := st.SaveCharacterSnapshot(ctx, snap); err != nil {
 		t.Fatal(err)
 	}
 	if spells, _ := q.ListCharacterSpells(ctx, id); len(spells) != 0 {
@@ -136,9 +139,10 @@ func TestSaveSnapshotEmptyClears(t *testing.T) {
 
 func TestSaveSnapshotStale(t *testing.T) {
 	pool, q := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	id, snap := snapFixture(t, pool, q, "sub-stale", "Staler", 0)
-	if _, err := SaveCharacterSnapshot(ctx, pool, snap); err != nil {
+	if _, err := st.SaveCharacterSnapshot(ctx, snap); err != nil {
 		t.Fatal(err)
 	}
 	stale := snap // ExpectedRevision still 0, radically different content
@@ -147,7 +151,7 @@ func TestSaveSnapshotStale(t *testing.T) {
 	stale.Vitals = json.RawMessage(`{"hp":1}`)
 	stale.Spells = []CharacterSpellSnapshot{{SpellID: 3, Ability: 99}}
 	stale.Skills = nil
-	if _, err := SaveCharacterSnapshot(ctx, pool, stale); !errors.Is(err, ErrStaleRevision) {
+	if _, err := st.SaveCharacterSnapshot(ctx, stale); !errors.Is(err, ErrStaleRevision) {
 		t.Fatalf("err = %v, want ErrStaleRevision", err)
 	}
 	got := readRoot(t, q, id)
@@ -165,23 +169,24 @@ func TestSaveSnapshotStale(t *testing.T) {
 
 	// Future revision is equally stale.
 	stale.ExpectedRevision = 99
-	if _, err := SaveCharacterSnapshot(ctx, pool, stale); !errors.Is(err, ErrStaleRevision) {
+	if _, err := st.SaveCharacterSnapshot(ctx, stale); !errors.Is(err, ErrStaleRevision) {
 		t.Fatalf("future err = %v, want ErrStaleRevision", err)
 	}
 }
 
 func TestSaveSnapshotChildRollback(t *testing.T) {
 	pool, q := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	id, snap := snapFixture(t, pool, q, "sub-rb", "Rollbacker", 0)
-	if _, err := SaveCharacterSnapshot(ctx, pool, snap); err != nil {
+	if _, err := st.SaveCharacterSnapshot(ctx, snap); err != nil {
 		t.Fatal(err)
 	}
 	bad := snap
 	bad.ExpectedRevision = 1
 	bad.Karma = 777
 	bad.Spells = []CharacterSpellSnapshot{{SpellID: 9999, Ability: 10}}
-	if _, err := SaveCharacterSnapshot(ctx, pool, bad); err == nil {
+	if _, err := st.SaveCharacterSnapshot(ctx, bad); err == nil {
 		t.Fatal("bad spell FK accepted")
 	}
 	got := readRoot(t, q, id)
@@ -196,7 +201,7 @@ func TestSaveSnapshotChildRollback(t *testing.T) {
 	bad2 := snap
 	bad2.ExpectedRevision = 1
 	bad2.Skills = []CharacterSkillSnapshot{{SkillID: 1, Ability: 0}}
-	if _, err := SaveCharacterSnapshot(ctx, pool, bad2); err == nil {
+	if _, err := st.SaveCharacterSnapshot(ctx, bad2); err == nil {
 		t.Fatal("ability 0 accepted")
 	}
 	got = readRoot(t, q, id)
@@ -207,6 +212,7 @@ func TestSaveSnapshotChildRollback(t *testing.T) {
 
 func TestSaveSnapshotRace(t *testing.T) {
 	pool, q := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	id, snap := snapFixture(t, pool, q, "sub-race", "Racer", 0)
 	a, b := snap, snap
@@ -224,7 +230,7 @@ func TestSaveSnapshotRace(t *testing.T) {
 		wg.Add(1)
 		go func(s CharacterSnapshot) {
 			defer wg.Done()
-			rev, err := SaveCharacterSnapshot(ctx, pool, s)
+			rev, err := st.SaveCharacterSnapshot(ctx, s)
 			ch <- res{rev, err}
 		}(s)
 	}
@@ -261,15 +267,16 @@ func TestSaveSnapshotRace(t *testing.T) {
 
 func TestSoftDeleteCAS(t *testing.T) {
 	pool, q := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	id, snap := snapFixture(t, pool, q, "sub-del", "Deleter", 0)
-	if _, err := SaveCharacterSnapshot(ctx, pool, snap); err != nil {
+	if _, err := st.SaveCharacterSnapshot(ctx, snap); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE characters SET updated_at = '2020-01-01' WHERE id = $1`, id); err != nil {
 		t.Fatal(err)
 	}
-	rev, err := SoftDeleteCharacter(ctx, pool, id, 1)
+	rev, err := st.SoftDeleteCharacter(ctx, id, 1)
 	if err != nil || rev != 2 {
 		t.Fatalf("delete rev = %d, %v", rev, err)
 	}
@@ -289,7 +296,7 @@ func TestSoftDeleteCAS(t *testing.T) {
 	}
 	// Saving a deleted character is stale.
 	snap.ExpectedRevision = 2
-	if _, err := SaveCharacterSnapshot(ctx, pool, snap); !errors.Is(err, ErrStaleRevision) {
+	if _, err := st.SaveCharacterSnapshot(ctx, snap); !errors.Is(err, ErrStaleRevision) {
 		t.Fatalf("post-delete save err = %v, want stale", err)
 	}
 	// Slot+name released: recreate succeeds.
@@ -297,13 +304,14 @@ func TestSoftDeleteCAS(t *testing.T) {
 		t.Fatalf("reuse after delete: %v", err)
 	}
 	// Second delete on old revision is stale, not idempotent success.
-	if _, err := SoftDeleteCharacter(ctx, pool, id, 1); !errors.Is(err, ErrStaleRevision) {
+	if _, err := st.SoftDeleteCharacter(ctx, id, 1); !errors.Is(err, ErrStaleRevision) {
 		t.Fatalf("second delete err = %v, want stale", err)
 	}
 }
 
 func TestSaveVsDeleteRace(t *testing.T) {
 	pool, q := openQueries(t)
+	st := newTestStore(t, pool)
 	ctx := context.Background()
 	id, snap := snapFixture(t, pool, q, "sub-sd", "Raced", 0)
 
@@ -314,11 +322,11 @@ func TestSaveVsDeleteRace(t *testing.T) {
 		defer wg.Done()
 		s := snap
 		s.Karma = 555
-		_, saveErr = SaveCharacterSnapshot(ctx, pool, s)
+		_, saveErr = st.SaveCharacterSnapshot(ctx, s)
 	}()
 	go func() {
 		defer wg.Done()
-		_, delErr = SoftDeleteCharacter(ctx, pool, id, 0)
+		_, delErr = st.SoftDeleteCharacter(ctx, id, 0)
 	}()
 	wg.Wait()
 
