@@ -23,7 +23,7 @@ jobs:
           cache: true
           cache-dependency-path: backend/voxilian/go.sum
       - run: go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate
-      - run: git diff --exit-code -- backend/voxilian/internal/store/gen
+      - run: git diff --exit-code -- internal/store/gen
       - run: go build ./...
       - run: go vet ./...
       - run: test -z "$(gofmt -l .)"
