@@ -21,6 +21,18 @@ func openMigrated(t *testing.T, dsn string) *sql.DB {
 	return openMigratedTo(t, dsn, 1)
 }
 
+// openDB opens the disposable database without migrating; callers own
+// version control explicitly.
+func openDB(t *testing.T, dsn string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
 // openMigratedTo migrates a fresh disposable database to exactly version.
 // Per-migration tests pin their own version so later migrations never
 // break earlier tests.
@@ -324,5 +336,206 @@ func withID(table string, id int) string {
 		return "INSERT INTO skill_protos (id,division,level,exertion,params,version) VALUES (" + uitoa(id) + ",1,1,1,'{}',1)"
 	default: // item_protos
 		return "INSERT INTO item_protos (id,kind,slot,base,version) VALUES (" + uitoa(id) + ",0,NULL,'{}',1)"
+	}
+}
+
+// insertAbilityCharacter creates an account + character with all stats at
+// `stat`, returning both ids. Explicit fixture, no production API.
+func insertAbilityCharacter(t *testing.T, db *sql.DB, sub, name string, slot, stat int) (int64, int64) {
+	t.Helper()
+	var acct int64
+	err := db.QueryRow(`INSERT INTO accounts (keycloak_sub) VALUES ($1) RETURNING id`, sub).Scan(&acct)
+	if err != nil {
+		t.Fatalf("insert account: %v", err)
+	}
+	var char int64
+	err = db.QueryRow(`INSERT INTO characters
+		(account_id, slot, name, gender, face, might, intellect, stamina, agility, mysticism, aim,
+		 karma, hometown, pos_x, pos_y, pos_z, vitals, advancement, flags, updated_at)
+		VALUES ($1,$2,$3,0,'{}',$4,$4,$4,$4,$4,$4,0,'tos',0,0,0,'{}','{}',0,now()) RETURNING id`,
+		acct, slot, name, stat).Scan(&char)
+	if err != nil {
+		t.Fatalf("insert character: %v", err)
+	}
+	return acct, char
+}
+
+func constraintExists(t *testing.T, db *sql.DB, name string) bool {
+	t.Helper()
+	var found bool
+	q := `SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = $1)`
+	if err := db.QueryRow(q, name).Scan(&found); err != nil {
+		t.Fatalf("pg_constraint: %v", err)
+	}
+	return found
+}
+
+// TestMigration0003 proves the M1-T3 ability tables and stat CHECKs
+// against real PostgreSQL 18. Pinned to version 3.
+func TestMigration0003(t *testing.T) {
+	pg := simtest.StartPostgres18(t)
+	db := openMigratedTo(t, pg.DSN, 3)
+
+	// 1-3: version and tables.
+	var ver int64
+	if err := db.QueryRow(`SELECT version_id FROM goose_db_version ORDER BY version_id DESC LIMIT 1`).Scan(&ver); err != nil {
+		t.Fatalf("goose version: %v", err)
+	}
+	if ver != 3 {
+		t.Fatalf("goose version = %d, want 3", ver)
+	}
+	for _, tbl := range []string{"character_spells", "character_skills"} {
+		if !tableExists(t, db, tbl) {
+			t.Fatalf("table %s missing", tbl)
+		}
+	}
+
+	_, char := insertAbilityCharacter(t, db, "sub-m3", "Mightyor", 0, 10)
+
+	// Stat constraints: 1/50 accepted, 0/51 rejected with explicit names.
+	stats := []struct{ col, check string }{
+		{"might", "characters_might_check"},
+		{"intellect", "characters_intellect_check"},
+		{"stamina", "characters_stamina_check"},
+		{"agility", "characters_agility_check"},
+		{"mysticism", "characters_mysticism_check"},
+		{"aim", "characters_aim_check"},
+	}
+	for _, s := range stats {
+		for _, v := range []int{1, 50} {
+			mustExec(t, db, `UPDATE characters SET `+s.col+` = $2::smallint WHERE id = $1`, char, v)
+		}
+		for _, v := range []int{0, 51} {
+			_, err := db.Exec(`UPDATE characters SET `+s.col+` = $2::smallint WHERE id = $1`, char, v)
+			if err == nil || !strings.Contains(err.Error(), s.check) {
+				t.Fatalf("%s=%d err = %v, want %s", s.col, v, err, s.check)
+			}
+		}
+		mustExec(t, db, `UPDATE characters SET `+s.col+` = 10 WHERE id = $1`, char)
+	}
+
+	// Catalog fixtures for ability FKs.
+	mustExec(t, db, `INSERT INTO spell_protos (id,school,level,mana,exertion,cast_ms,min_hp,outlaw,harmful,reagents,params,version) VALUES (1,1,1,3,2,0,1,false,false,'{}','{}',1)`)
+	mustExec(t, db, `INSERT INTO skill_protos (id,division,level,exertion,params,version) VALUES (1,1,1,2,'{}',1)`)
+
+	// 4-5: valid ability rows.
+	mustExec(t, db, `INSERT INTO character_spells (character_id,spell_id,ability,atrophy_flag) VALUES ($1,1,50,false)`, char)
+	mustExec(t, db, `INSERT INTO character_skills (character_id,skill_id,ability,atrophy_flag) VALUES ($1,1,50,false)`, char)
+
+	// 6-7: ability 1/99 accepted both tables.
+	for _, tbl := range []struct {
+		table, idcol string
+	}{{"character_spells", "spell_id"}, {"character_skills", "skill_id"}} {
+		for _, v := range []int{1, 99} {
+			mustExec(t, db, `UPDATE `+tbl.table+` SET ability = $2::smallint WHERE character_id = $1 AND `+tbl.idcol+` = 1`, char, v)
+		}
+	}
+
+	// 8-11: ability 0/100 rejected with explicit CHECK names.
+	for _, tc := range []struct {
+		table, idcol, check string
+	}{
+		{"character_spells", "spell_id", "character_spells_ability_check"},
+		{"character_skills", "skill_id", "character_skills_ability_check"},
+	} {
+		for _, v := range []int{0, 100} {
+			_, err := db.Exec(`UPDATE `+tc.table+` SET ability = $2::smallint WHERE character_id = $1 AND `+tc.idcol+` = 1`, char, v)
+			if err == nil || !strings.Contains(err.Error(), tc.check) {
+				t.Fatalf("%s ability=%d err = %v, want %s", tc.table, v, err, tc.check)
+			}
+		}
+	}
+
+	// 12-14: FKs rejected (bad character, bad spell, bad skill).
+	if _, err := db.Exec(`INSERT INTO character_spells (character_id,spell_id,ability,atrophy_flag) VALUES (999999,1,10,false)`); err == nil {
+		t.Fatal("bad character_id accepted (spells)")
+	}
+	if _, err := db.Exec(`INSERT INTO character_spells (character_id,spell_id,ability,atrophy_flag) VALUES ($1,9999,10,false)`, char); err == nil {
+		t.Fatal("bad spell_id accepted")
+	}
+	if _, err := db.Exec(`INSERT INTO character_skills (character_id,skill_id,ability,atrophy_flag) VALUES (999999,1,10,false)`); err == nil {
+		t.Fatal("bad character_id accepted (skills)")
+	}
+	if _, err := db.Exec(`INSERT INTO character_skills (character_id,skill_id,ability,atrophy_flag) VALUES ($1,9999,10,false)`, char); err == nil {
+		t.Fatal("bad skill_id accepted")
+	}
+
+	// 15-16: composite PKs reject duplicates.
+	if _, err := db.Exec(`INSERT INTO character_spells (character_id,spell_id,ability,atrophy_flag) VALUES ($1,1,10,false)`, char); err == nil ||
+		!strings.Contains(err.Error(), "character_spells_pkey") {
+		t.Fatalf("dup spell err = %v, want character_spells_pkey", err)
+	}
+	if _, err := db.Exec(`INSERT INTO character_skills (character_id,skill_id,ability,atrophy_flag) VALUES ($1,1,10,false)`, char); err == nil ||
+		!strings.Contains(err.Error(), "character_skills_pkey") {
+		t.Fatalf("dup skill err = %v, want character_skills_pkey", err)
+	}
+
+	// 17-18: same spell/skill on a second character is fine.
+	_, char2 := insertAbilityCharacter(t, db, "sub-m3b", "Secondor", 0, 10)
+	mustExec(t, db, `INSERT INTO character_spells (character_id,spell_id,ability,atrophy_flag) VALUES ($1,1,10,true)`, char2)
+	mustExec(t, db, `INSERT INTO character_skills (character_id,skill_id,ability,atrophy_flag) VALUES ($1,1,10,true)`, char2)
+
+	// atrophy_flag round-trips both values.
+	var flag bool
+	if err := db.QueryRow(`SELECT atrophy_flag FROM character_spells WHERE character_id = $1`, char2).Scan(&flag); err != nil || !flag {
+		t.Fatalf("atrophy_flag = %v, %v; want true", flag, err)
+	}
+	if err := db.QueryRow(`SELECT atrophy_flag FROM character_skills WHERE character_id = $1`, char).Scan(&flag); err != nil || flag {
+		t.Fatalf("atrophy_flag = %v, %v; want false", flag, err)
+	}
+
+	// Rollback 3 → 2: tables gone, version 2, catalogs and
+	// M1-T1 tables intact, stat CHECKs gone (pg_constraint inspection).
+	if err := goose.DownTo(db, migrationsDir(t), 2); err != nil {
+		t.Fatalf("goose down to 2: %v", err)
+	}
+	for _, tbl := range []string{"character_spells", "character_skills"} {
+		if tableExists(t, db, tbl) {
+			t.Fatalf("table %s survives down-to-2", tbl)
+		}
+	}
+	if err := db.QueryRow(`SELECT version_id FROM goose_db_version ORDER BY version_id DESC LIMIT 1`).Scan(&ver); err != nil || ver != 2 {
+		t.Fatalf("version after down = %d, %v; want 2", ver, err)
+	}
+	for _, tbl := range []string{"spell_protos", "skill_protos", "item_protos", "mob_protos", "shop_listings", "accounts", "characters"} {
+		if !tableExists(t, db, tbl) {
+			t.Fatalf("table %s lost by down-to-2", tbl)
+		}
+	}
+	for _, c := range []string{"characters_might_check", "characters_aim_check"} {
+		if constraintExists(t, db, c) {
+			t.Fatalf("constraint %s survives down-to-2", c)
+		}
+	}
+}
+
+// TestMigration0003RejectsInvalidExisting proves migration 2 → 3 fails
+// loudly on pre-existing invalid stat data. Isolated container: a failed
+// goose run must not contaminate TestMigration0003.
+func TestMigration0003RejectsInvalidExisting(t *testing.T) {
+	pg := simtest.StartPostgres18(t)
+	db := openDB(t, pg.DSN)
+	if err := goose.SetDialect("postgres"); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.UpTo(db, migrationsDir(t), 2); err != nil {
+		t.Fatalf("up to 2: %v", err)
+	}
+	var acct int64
+	if err := db.QueryRow(`INSERT INTO accounts (keycloak_sub) VALUES ('sub-bad') RETURNING id`).Scan(&acct); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, `INSERT INTO characters
+		(account_id, slot, name, gender, face, might, intellect, stamina, agility, mysticism, aim,
+		 karma, hometown, pos_x, pos_y, pos_z, vitals, advancement, flags, updated_at)
+		VALUES ($1,0,'Badstat',0,'{}',0,10,10,10,10,10,0,'tos',0,0,0,'{}','{}',0,now())`, acct)
+	if err := goose.Up(db, migrationsDir(t)); err == nil {
+		t.Fatal("migration 2 → 3 succeeded with might=0; must fail loudly")
+	} else if !strings.Contains(err.Error(), "characters_might_check") {
+		t.Fatalf("migration error = %v, want characters_might_check", err)
+	}
+	var ver int64
+	if err := db.QueryRow(`SELECT version_id FROM goose_db_version ORDER BY version_id DESC LIMIT 1`).Scan(&ver); err != nil || ver != 2 {
+		t.Fatalf("version after failed migration = %d, %v; want 2", ver, err)
 	}
 }
