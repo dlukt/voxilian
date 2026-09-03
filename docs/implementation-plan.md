@@ -1,4 +1,4 @@
-# Voxilian Backend — Implementation Plan (v1.1)
+# Voxilian Backend — Implementation Plan (v1.2)
 
 > Source of truth for WHAT: `docs/backend-spec.md` (v0.3.4).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
@@ -55,13 +55,14 @@ Exit: `compose up` gives PG 18 + builder (migrate init step wired, no-op stub un
 Exit: all §8 tables (incl. prototype catalogs) exist via goose; `Store` covers CRUD + CAS per aggregate; stale-write + CI-migration checks green.
 
 - [ ] **M1-T1** Migration `0001`: `citext` extension + `accounts` + `characters` (+ partial unique indexes `chars_acct_slot_uidx`, `chars_name_uidx` via `CREATE UNIQUE INDEX ... WHERE deleted_at IS NULL`). Spec: §8.
-- [ ] **M1-T2** Migration `0002`: `character_spells`, `character_skills` (+PKs, ability CHECK 1–99, stat CHECKs 1–50 on characters). Spec: §8.
-- [ ] **M1-T3** Migration `0003`: `item_instances` (+`revision`), `item_locations` (all 5 kinds, full per-kind CHECKs with `IS [NOT] NULL`, self-containment CHECK), `corpses`, `banks` (+`revision`). Spec: §8.
-- [ ] **M1-T4** Migration `0004`: `ledger` (`num_nonnulls` CHECKs), `kills`, `bans/mutes`. Spec: §8.
-- [ ] **M1-T5** Migration `0005`: prototype catalog tables — `spell_protos`, `skill_protos`, `item_protos`, `mob_protos`, `shop_listings`, all keyed by stable `u16` proto/listing ID + `version` (spec §8.2 amendment). `voxilian seed` upserts these; runtime reads protos from PG (YAML files are the versioned source, PG is the runtime registry).
+- [ ] **M1-T2** Migration `0002`: prototype catalog tables — `spell_protos`, `skill_protos`, `item_protos`, `mob_protos`, `shop_listings` (stable INTEGER IDs `CHECK 1..65535`, symbolic keys, versions; spec §8.2). Catalogs BEFORE their dependents so FKs are created inline, never via later ALTERs.
+- [ ] **M1-T3** Migration `0003`: `character_spells`, `character_skills` (+PKs, FKs → catalogs, ability CHECK 1–99, stat CHECKs 1–50 on characters). Spec: §8.
+- [ ] **M1-T4** Migration `0004`: `item_instances` (+`revision`, proto FK → `item_protos`), `item_locations` (all 5 kinds, full per-kind CHECKs, self-containment), `corpses`, `banks` (+`revision`). Spec: §8.
+- [ ] **M1-T5** Migration `0005`: `ledger` (`num_nonnulls` CHECKs), `kills`, `bans/mutes`. Spec: §8.
 - [ ] **M1-T6a** sqlc: accounts/characters (+slot-claimed create → map unique-violation to `slot_occupied`/`name_taken`). Spec: §8.
-- [ ] **M1-T6b** sqlc: spells/skills get/set, item+location txn helpers, corpses, banks, catalog reads. Spec: §8.
+- [ ] **M1-T6b** sqlc: spells/skills get/set, item+location txn helpers, corpses, banks. (All catalog access lives in T6d.) Spec: §8.
 - [ ] **M1-T6c** sqlc: ledger/kill appends, bans/mutes. Spec: §8.
+- [ ] **M1-T6d** sqlc + store: catalog registry — load-all per table + transactional upsert (stable ID + version rules, §8.2). This is the ONLY write API `voxilian seed` may use. Spec: §8.2.
 - [ ] **M1-T7a** `Store` CAS: character aggregate (root CAS → child spells/skills in same txn). Stale-revision test. Spec: §8.1, D7.
 - [ ] **M1-T7b** `Store` CAS: item aggregate (root CAS → location row in same txn). Stale-revision test. Spec: §8.1.
 - [ ] **M1-T7c** `Store` CAS: bank balance + `Store` interface assembly. Stale-revision test + metric. Spec: §8.1.
@@ -76,7 +77,7 @@ Exit: every §6 opcode encodes/decodes both sides (Go done; Godot side stubs + f
 - [ ] **M2-T2** Opcodes `100/101/200/201/202` (hello/welcome/reauth/reauth_ok/error) + `216/217/219` (character_list/op, world_ready) + `121–126` (char CRUD/ack/leave). Round-trip tests. Spec: §6.1, §6.2.
 - [ ] **M2-T3a** Intents codec `102–120` + `126` (incl. `inputSeq`/`yaw`, fixed-`u32` `105 use`, vendor+stable-listing `114 buy`). Round-trip tests. Spec: §6.3.
 - [ ] **M2-T3b** Entity/stat codec `203–210`, `213–215` (incl. `lastProcessedInputSeq`, entryLen framing). Round-trip tests. Spec: §6.3.
-- [ ] **M2-T3c** Container codec `211/212/216/220/218` + FREEZE the `211` entry layout here: document every field+width in §6 first (spec-edit commit), then implement. Round-trip tests. Spec: §6.3.
+- [ ] **M2-T3c** Container codec `211/212/218/220` (`216` belongs to M2-T2) + FREEZE the `211` entry layout here: document every field+width in §6 first (spec-edit commit), then implement. Round-trip tests. Spec: §6.3.
 - [ ] **M2-T4** Golden binary fixtures: checked-in hex vectors under repo-root `testdata/protocol/` for ≥1 message per opcode; Go decode test; fixture format README for the Godot client plan. Spec: §12.
 - [ ] **M2-T5** Fuzz + robustness: Go fuzz targets per decoder; malformed/truncated/oversized corpus tests; unknown-opcode and unknown-trailing-bytes tolerance tests; `seq`/`inputSeq` wraparound tests (modulo-2³² arithmetic). Spec: §12.
 - [ ] **M2 exit criteria met** (all opcodes round-trip; fuzz 60 s clean per target; fixtures committed).
@@ -97,7 +98,7 @@ Exit: full §6.1 state machine live over real WS; char CRUD end-to-end against P
 Exit: 20 Hz tick loop, cells, server-authoritative movement with reconciliation anchors, handoff, history ring, CAS saver.
 
 - [ ] **M4-T1** Tick loop + cell grid + entity registry. 20 Hz sim, 32 m cells, single-writer-per-cell structure (one process), injectable clock+RNG, per-entity position-history ring (2 s @ 20 Hz). Determinism test (fixed seed → identical trace). Spec: §4, §5.
-- [ ] **M4-T2** Movement integration: `102` intents → integrate (walk 3.5/run 7 m/s, vigor gate hook) → `205` with `lastProcessedInputSeq`; server-side collision vs voxel/world source stub; anomaly tripwire (speed/teleport → correct+log). Reconciliation-anchor unit tests (processed-seq monotonicity). Spec: §5, §6.3, §11.
+- [ ] **M4-T2** Movement integration: `102` intents → integrate (walk 3.5/run 7 m/s, vigor gate hook) → `205` with `lastProcessedInputSeq`; server-side collision against a MINIMAL `CollisionWorld` seam owned HERE (tiny interface: solid-check + volume flags at a position); anomaly tripwire (speed/teleport → correct+log). M10's richer `WorldSource` implements/embeds this seam, never replaces it. Reconciliation-anchor unit tests (processed-seq monotonicity). Spec: §5, §6.3, §11.
 - [ ] **M4-T3a** Cell ownership + entity handoff: epoch/generation, migrate-queue routing (`202 error{retry}` only on saturation). Handoff tests. Spec: §5.1.
 - [ ] **M4-T3b** Cross-cell op infrastructure: `opID` generation/delivery/dedupe/retry (bounded cache) against a SYNTHETIC aggregate operation — no real trade logic here. Spec: §5.1.
 - [ ] **M4-T3c** Post-commit reconciliation infrastructure: synthetic durable commit + dropped notification → aggregate reloaded from PG before next mutation. (Real trade semantics belong solely to M8.) Spec: §5.1, §8.1.
@@ -150,7 +151,7 @@ Exit: atomic player trade + bank/vault with ledger audit; race tests green.
 
 Exit: every school/skill/mob/weapon/armor in versioned seed files, `voxilian seed` idempotent into catalog tables.
 
-- [ ] **M9-T1** Seed pipeline: file format + validator (CHECK-mirroring) + idempotent upsert-by-stable-`u16`-proto-id into `*_protos` catalog tables + `voxilian seed` wiring. One sample school to prove it. Spec: §8.2 (new), §10 seed bullet.
+- [ ] **M9-T1** Seed pipeline: file format + validator (CHECK-mirroring) + `voxilian seed` built ON the M1-T6d registry API (no direct pgx outside `store`) + idempotent version-ruled upsert. One sample school to prove it. Spec: §8.2 (new), §10 seed bullet.
 - [ ] **M9-T2** School Shal'ille (all spells: costs/effects/reqs). Spec: meridian59 §5.
 - [ ] **M9-T3** School Qor. Spec: meridian59 §5.
 - [ ] **M9-T4** School Kraanan. Spec: meridian59 §5.
@@ -206,7 +207,9 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M1-T1…T5 | M0 | `backend/voxilian/migrations/` only |
 | M1-T6a…c, T7a…c, T8 | per-table predecessor migrations | `backend/voxilian/queries/`, `internal/store` |
 | M2-T1, T2, T3a…c, T4, T5 | M0 | `backend/voxilian/internal/proto`, repo-root `testdata/protocol/` |
-| M3-T1…T5 | M1-T6a + M1-T8 (migrate CLI), M2-T1, M2-T2 | `backend/voxilian/internal/{gateway,session}` |
+| M3-T1, T2, T5 | M1-T8 (migrate CLI), M2-T1, M2-T2 | `backend/voxilian/internal/{gateway,session}` |
+| M3-T3 | M1-T7a (character CAS), M2-T2 | `backend/voxilian/internal/{gateway,session}` |
+| M3-T4 | M1-T7a, M2-T3b, M2-T3c, M3-T3 | fake baseline + barrier (real world in M10-T4) |
 | M4-T1, T2, T5 | M2-T3a/b, M3-T1 | `backend/voxilian/internal/sim` |
 | M4-T3a…c, T4 | M1-T7a…c (CAS), M3-T1 | `backend/voxilian/internal/sim`, `internal/store` |
 | M5-T1…T6 | M4-T1, M4-T2 | `backend/voxilian/internal/sim` (combat/vitals/intents) |
@@ -214,7 +217,7 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M7-T1 | M9-T1 (seed pipeline) + M1-T6b | `backend/voxilian/internal/sim`, `seed/` fixtures |
 | M7-T2a…c, T3, T4 | M4-T1…T3a, M1-T7b | `backend/voxilian/internal/sim` |
 | M8-T1, T2 | M1-T7a…c, M3-T1, M4-T3b/c | `backend/voxilian/internal/sim`, `internal/store` |
-| M9-T1 | M1-T5 (catalog tables) | `backend/voxilian/seed/` + validator |
+| M9-T1 | M1-T5 (catalog tables) + M1-T6d (registry API) | `backend/voxilian/seed/` + validator |
 | M9-T2…T13 | M9-T1 | `backend/voxilian/seed/` content only |
 | M10-T1…T2c | M4-T1 | `backend/voxilian/internal/world`, `seed/world` |
 | M10-T3 | M10-T1 | generator only |
@@ -239,5 +242,5 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 
 ## Plan history
 
+- v1.2: review pass — migration order (catalogs 0002), M1-T6d registry API, M2 opcode split fix, `CollisionWorld` seam, corrected M3/M9 deps, backend-only M11, bounded soaks, (+spec v0.3.5: INTEGER IDs, numeric mob/vendor IDs, `entityEntry.proto`, seed versioning, catalog cache, exact display names).
 - v1.1: review pass — working-directory rule, Dockerfile task, M0/M1 dep fix, catalog-table decision (+spec §8.2), fake-vs-real baseline split, AOI task, opcode matrix, task splits (M1/M2/M4/M7/M9/M10), corrected deps, Jala phase-2 note, backend-only M11, bounded soaks, display-name decision.
-- v1.0: initial milestones M0–M12.

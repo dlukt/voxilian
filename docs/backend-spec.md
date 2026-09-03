@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.4 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.5 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -309,8 +309,10 @@ holds dirty in-memory state.
   intents → `202 error` (no disconnect on first offense).
 - S→C deltas (`202–220`): `202 error {code u16, message string}`,
   `203 cell_snapshot {cell, count u16 + [[u16 entryLen]entityEntry]...}`
-  where `entityEntry = {entity u32 NetEntityID, kind u8, pos, angle u16,
-  speed u8}`, `204 entity_create {entityEntry}`, `205 entity_move
+  where `entityEntry = {entity u32 NetEntityID, kind u8, proto u16, pos,
+  angle u16, speed u8}` (`proto` = stable ID in the namespace selected by
+  `kind`: spell/skill/item/mob proto or vendor ID — so the client knows
+  orc from troll from banker), `204 entity_create {entityEntry}`, `205 entity_move
   {entity u32, pos, angle u16, speed u8, lastProcessedInputSeq u32}`
   (the reconciliation anchor for the client's OWN character only; for
   entities not controlled by this session it MUST be 0 and MUST be
@@ -491,24 +493,39 @@ Tables (D4; M59 property names in parens where ported):
 ### 8.2 Prototype catalog tables (runtime content registry)
 
 Seed files (YAML, versioned in repo) are the SOURCE; PG catalog tables
-are the RUNTIME registry `voxilian seed` upserts into (idempotent,
-upsert by stable `u16` ID + `version` bump). Sim and gateway read
-protos/listing IDs from PG, never from files at runtime:
+are the RUNTIME registry `voxilian seed` upserts into. Sim and gateway
+read protos/listing IDs from an IMMUTABLE IN-MEMORY REGISTRY loaded
+from PG at startup/world load — gameplay hot paths MUST NOT query PG
+for prototype data (this also keeps combat/loot working under the §10
+PG-outage grace). A reseed swaps a validated registry atomically.
 
-- `spell_protos(id SMALLINT PK (stable wire ID), school SMALLINT,
+Wire-visible stable IDs are `u16` on the wire but MUST be `INTEGER NOT
+NULL CHECK (id BETWEEN 1 AND 65535)` in PG — never `SMALLINT` (signed,
+max 32767, allows negatives):
+
+- `spell_protos(id INT PK CHECK 1..65535, school SMALLINT,
   level SMALLINT, mana INT, exertion INT, cast_ms INT, min_hp INT,
   outlaw BOOL, harmful BOOL, reagents JSONB, params JSONB, version INT)`
-- `skill_protos(id SMALLINT PK, division SMALLINT, level SMALLINT,
-  exertion INT, params JSONB, version INT)`
-- `item_protos(id SMALLINT PK, kind SMALLINT, slot TEXT, base JSONB
-  (damage/armor/signatures per kind), version INT)`
-- `mob_protos(proto TEXT PK, level SMALLINT, difficulty SMALLINT, karma
-  INT, atk JSONB, resists JSONB, spells JSONB, loot_tid TEXT, version INT)`
-- `shop_listings(vendor_proto TEXT, listing SMALLINT, item_proto SMALLINT
-  FK → item_protos, price BIGINT, qty INT, PK(vendor_proto, listing))`
-  — the stable `114 buy{listing}` IDs.
+- `skill_protos(id INT PK CHECK 1..65535, division SMALLINT,
+  level SMALLINT, exertion INT, params JSONB, version INT)`
+- `item_protos(id INT PK CHECK 1..65535, kind SMALLINT, slot TEXT,
+  base JSONB, version INT)`
+- `mob_protos(id INT PK CHECK 1..65535, key TEXT UNIQUE (e.g.
+  "orc_warrior"), level SMALLINT, difficulty SMALLINT, karma INT,
+  atk JSONB, resists JSONB, spells JSONB, loot_tid TEXT, version INT)`
+  — numeric IDs for ALL concrete prototypes (plus symbolic key), because
+  the client must distinguish them on the wire (see `entityEntry.proto`,
+  §6.3). Same rule for vendors: `shop_listings(vendor_id INT
+  (stable vendor proto ID), listing INT CHECK 1..65535,
+  item_proto INT FK → item_protos, price BIGINT, qty INT,
+  PK(vendor_id, listing))`.
+- Version semantics (idempotency is exact, not "bump on run"): `version`
+  is SOURCE-DEFINED per record. Re-running identical source data is a
+  strict no-op (row untouched). A changed record MUST carry a newer
+  `version`; seed refuses version rollback unless explicitly forced
+  (`--allow-downgrade`, logged, admin-only).
 
-`item_instances.proto` references `item_protos.id` (SMALLINT, not TEXT);
+`item_instances.proto` references `item_protos.id` (INT, range-checked);
 character spell/skill rows reference `spell_protos`/`skill_protos` IDs.
 
 ### 8.1 Persistence ordering and recovery (D7)
@@ -569,9 +586,11 @@ ledger is never replayed.
 
 - Creation: `122 character_create` validates slot 0/1 (+ transactional
   uniqueness, §8), name — Unicode letters/marks/numbers plus space,
-  apostrophe, hyphen; NFC-normalized; 3–16 chars; case-insensitive
-  global-live-unique (CITEXT partial index); reserved + blocklist
-  (`seed/blocklist.yaml`) — 6×(1–50) + sum ≤ 200, 45-pt
+  apostrophe, hyphen; NFC-normalized FIRST, then length counted as 3–16
+  Unicode CODE POINTS (not grapheme clusters, not bytes);
+  case-insensitive global-live-unique (CITEXT partial index); blocklist
+  (`seed/blocklist.yaml`) matched EXACT-NAME after normalization +
+  case-folding (no substring matching); reserved names likewise — 6×(1–50) + sum ≤ 200, 45-pt
   ability budget (L2=25 else 10); grant Blink + Mace + 500
   (+leaving-newbie-zone package); karma seed. All in one PG txn (§8.1).
 - Vitals/regen: HP=level (20 start, cap `100+Stam`/150); mana `15+Myst/5`
@@ -750,6 +769,10 @@ ledger is never replayed.
 
 ## 14. Version history
 
+- v0.3.5: catalog coherence — migration-safe order note (catalogs before
+  dependents), INTEGER 1..65535 stable IDs (never SMALLINT), numeric
+  mob/vendor IDs + `entityEntry.proto`, exact seed version semantics,
+  in-memory catalog registry rule.
 - v0.3.4: planning blocker fix — §8.2 prototype catalog tables (seed
   upsert target; SMALLINT proto FKs), display-name rules decided (§9,
   §13.3 closed).
