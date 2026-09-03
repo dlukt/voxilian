@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.2 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -14,6 +14,7 @@
 | D4 | Persistence | **Snapshot + write-through**: PG is authoritative; sim keeps hot state in memory, snapshots every N sec + write-through on critical events (death, trade, logout, guild/faction change) |
 | D5 | DB stack | **PostgreSQL 18 + pgx + sqlc + goose**. No other datastore. Current pinned versions in §2 |
 | D6 | Auth | **External Keycloak IdP (OIDC)**. Godot client uses Authorization Code + PKCE via system browser; backend validates access JWTs via cached JWKS and never sees passwords (DECISION §13.4) |
+| D7 | Persistence rule | **PG materialized state = recovery source of truth; ledger = audit trail, NOT event sourcing.** Critical ops update state + ledger atomically in one PG txn; every entity carries a monotonic `revision` so async snapshots can never overwrite newer critical writes (§8.1) |
 
 ## 1. Goals / non-goals
 
@@ -98,9 +99,12 @@ PG 18 (durable) · memory (ephemeral; rebuilt on restart) · /metrics /healthz
   bandwidth is entities-only; classic mode streams chunk data (hence the
   conservative 96 m default).
 - Embedded interiors: dungeons/Underworld/guildhall volumes flagged
-  `INTERIOR`; entry by walking through portal volumes (position continuity
-  preserved — seamless feel), NOT by teleport RPC, except death-respawn and
-  admin summons (explicit, logged).
+  `INTERIOR`; entry by walking through portal volumes. Wording precision:
+  a portal to a distant coordinate band IS a server-side coordinate
+  remap under the hood — the "seamless" guarantee is no loading screen,
+  no session break, uninterrupted input (optionally masked by a short
+  fade), followed by a cell-snapshot swap. Only death-respawn and admin
+  summons use explicit remaps outside portals (logged).
 - Portals/doors/locks (M59 shatter-lock, guildhall keys) are volume
   edge-rules evaluated by sim.
 
@@ -114,56 +118,135 @@ PG 18 (durable) · memory (ephemeral; rebuilt on restart) · /metrics /healthz
 | Spell casts | per-spell `cast_time` + 2 s post-cast | Mana/vigor/reagent/karma gates per spec |
 | HP/mana/vigor regen | event-driven timers per entity (M59 `CalculateHealthTime/ManaTime`) | Same formulas; sanctuary ×2/×3; faction regen phase 2 |
 | Advancement/HP-gain rolls | on kill events | Same highmark math; write-through to PG on +1 HP / +1% milestone |
-| Snapshot saver | every 60 s dirty-entities + on critical events | Write-through: death, trade accept, logout, char create, guild/faction change (phase 2) |
+| Snapshot saver | every 60 s dirty-entities + on critical events | Revision-guarded conditional writes only (§8.1); write-through: death, trade accept, logout, char create/delete, guild/faction change (phase 2) |
 
 - MUST: sim uses injectable clock + RNG for deterministic tests.
 - MUST: all damage/rolls happen server-side; client-sent damage values are
   rejected (anti-cheat carries M59's buffed-Max halving, PK loot tags, reagent
   checks).
 
+### 5.1 Cell ownership and handoff (single-writer seam for future sharding)
+
+MVP runs all cells in one process, but the ownership rules below are
+normative NOW so sharding later is a transport change, not a rewrite:
+
+- An entity has exactly one authoritative cell owner at any tick.
+- Handoff carries an ownership epoch (cell + `u64` generation bumped per
+  transfer). Source cell stops mutating the entity after hand-over;
+  destination installs it before/at a well-defined tick and only then
+  accepts its intents.
+- Intents arriving mid-migration are queued at the gateway and routed to
+  the destination owner — never processed twice, never dropped silently
+  (sender gets `202 error{retry}` only if the queue itself is saturated,
+  §7).
+- Cross-cell actions (attacks, trades, AoE across a boundary) always
+  execute under ONE coordinator: the attacker's/trader's cell owner,
+  reading a committed snapshot of the neighbor — never by mutating two
+  cells in one step.
+
 ## 6. WebSocket protocol (binary, versioned — DECISION §13.8)
 
 Framing: every WS message is one binary frame (D2):
 `[u16 opcode][u16 msg_version][u32 seq][u32 tick][payload...]`.
-Integers little-endian; `string` = `u16 len + UTF-8 bytes`; positions are
-`i32` millimeters (fixed-point, deterministic); angles `u16` 0–4095
-(M59's 12-bit convention). Codecs use stdlib only — Go
+Integers little-endian; `string` = `u16 len + UTF-8 bytes` (max 1024
+bytes; chat text max 512); `array` = `u16 count + elements` (max 1024
+elements); `cell` = `i32 cx + i32 cz`; `pos` = `3×i32` millimeters
+(fixed-point, deterministic); angles `u16` 0–4095 (M59's 12-bit
+convention). Max frame 64 KiB — larger frames are rejected with
+`202 error`, never parsed. Codecs use stdlib only — Go
 `encoding/binary`, Godot `PackedByteArray.encode_*/decode_*` (both C++,
 fast on low-end; no protobuf/GDExtension weight). Protobuf is the
 documented escape hatch if hand maintenance ever stops scaling; the
 opcode envelope survives that migration.
-Rules: `hello` negotiates `protoVersion` (breaking changes bump it, old
-clients rejected with `202 error`); unknown opcodes → `202 error`, never
-disconnect, never crash (forward compatibility).
+Versioning: `protoVersion` (in `100 hello`) versions the whole protocol
+— breaking changes bump it and old clients are rejected. `msg_version`
+(per-message) versions one message's layout — additive changes bump it
+and parsers MUST ignore trailing unknown bytes (forward compatibility
+within a `protoVersion`).
+Sequencing: header `seq` is a per-session `u32` counter (S→C and C→S
+independent). Comparison is modulo-2³² serial arithmetic (RFC 1982
+style); wraparound is normal, not an error. Header `tick` is the `u32`
+sim-tick counter (wraps, same arithmetic); `200 welcome` additionally
+carries `serverTimeMs u64` wall-clock for client clock sync — the two
+fields are distinct by construction.
+Identity: the wire NEVER carries database IDs. All `entity`/`item`/
+`target` fields are `u32 NetEntityID` — session-local handles issued in
+`203 cell_snapshot` / `204 entity_create` / `211 inventory_delta` and
+invalidated by `206 entity_remove` or disconnect. Durable IDs stay
+`BIGINT` inside PG only. Using a stale/invalid handle → `202 error`,
+never a crash.
 
-- Connect: `100 hello {clientVersion u32, protoVersion u16, accessToken
-  string}` → `200 welcome {serverTick u64, chunk u8, aoiRadius u16,
-  tickRates u8[..], world{mode u8, seed u64, version u32}}` or `202 error`.
-  `accessToken` = Keycloak access JWT (D6), JWKS-validated, `sub` mapped
-  to account (auto-provisioned, §8) and character loaded from PG.
-- Re-auth (no reconnect): `101 reauth {accessToken string}` over the live
-  WS → `201 reauth_ok {}` or `202 error{session_expired}` (→ browser login,
-  then resync).
-- C→S intents (`102–120`): `102 move {heldDirs u8 bitmask, runFlag u8}`
-  (intents only — client-sent positions rejected), `103 attack {target
-  u32}`, `104 cast {spell u16, target u32}`, `105 use {kind u8, id u32}`,
-  `106 get {entity u32, item u32}`, `107 drop {item u32}`, `108 put {item
-  u32, container u32}`, `109 give {target u32, item u32, qty u16}`,
-  `110 offer {target u32, items..}`, `111 counter {items..}`,
-  `112 accept {}`, `113 cancel {}`, `114 buy {listing u32, qty u16}`,
-  `115 rest {state u8}`, `116 eat {item u32}`, `117 say {channel u8, text
-  string}`, `118 say_group {text string}`, `119 safety_toggle {}`,
-  `120 respawn_ack {}`. Unknown/rate-limited intents → `202 error` (no
-  disconnect on first offense).
-- S→C deltas (`203–215`): `203 cell_snapshot {cell, entities..}`,
-  `204 entity_create`, `205 entity_move {entity, pos, angle, speed}`,
-  `206 entity_remove {entity}`, `207 stat {entity u32, statId u8,
-  value/min/max/curmax i32}` (M59 shape — reuse for HUD), `208 stat_group`,
-  `209 said {from u32, channel u8, text string}`, `210 effect {id u16,
-  target u32, pos}`, `211 inventory_delta`, `212 offer_update`,
-  `213 trade_result {ok u8}`, `214 death {victim u32}`, `215 respawn {pos}`.
-  `seq` is monotonic per session; client acks highest applied `seq` for
-  resync decisions.
+### 6.1 Session lifecycle
+
+States: `CONNECTED → AUTHENTICATED → CHARACTER_SELECTED → IN_WORLD`.
+`100 hello` authenticates (D6) and opens an **account session**
+(`CONNECTED → AUTHENTICATED`) — no character is loaded yet. Gameplay
+intents (`102–120`) are legal ONLY in `IN_WORLD`; sent earlier → `202
+error`. Character management (`121–125`) is legal in `AUTHENTICATED` and
+later.
+
+- `121 character_list {}` → `216 character_list {count u16 +
+  [{slot u8, charName string, level u16}...]}`.
+- `122 character_create {slot u8 (0/1), name string, gender u8, face
+  bytes, stats[6] u8, spells u16[..], skills u16[..]}` → `217
+  character_op {op u8, ok u8}` (failures also via `202 error` with codes:
+  `name_taken`, `slot_occupied`, `bad_stats`, `bad_budget`). Slot + stats
+  + budget validated server-side per §9; row created in the same PG txn
+  (§8.1).
+- `123 character_delete {slot u8}` → `217 character_op` (soft-delete;
+  name becomes reusable, §8).
+- `124 enter_world {slot u8}` → loads character, binds session to it
+  (`AUTHENTICATED → CHARACTER_SELECTED`), streams initial snapshots,
+  then `217 character_op{enter,ok}` + first `203 cell_snapshot`
+  (`→ IN_WORLD`).
+- `125 ack {ackSeq u32}` — client acknowledges highest applied S→C
+  `seq`. ACKs drive flow control only (§7); the server keeps NO replay
+  buffer. Reconnect (new WS + `hello`) ALWAYS performs a full resync
+  (fresh snapshots); previous `seq` state is discarded.
+
+Duplicate login: one session per character. A second `enter_world` for
+an in-use character kicks the old session (`206`-style disconnect with
+`202 error{kicked}`) and binds the new one. One account MAY hold two
+sessions for its two different characters simultaneously.
+
+### 6.2 Connect / re-auth
+
+- `100 hello {clientVersion u32, protoVersion u16, accessToken string}`
+  → `200 welcome {serverTimeMs u64, chunk u8, aoiRadius u16, tickRates
+  {count u8 + u16[..]}, world{mode u8, seed u64, version u32}}` or `202
+  error`. `accessToken` = Keycloak access JWT (D6), JWKS-validated
+  (`iss`/`aud`/expiry/signature), `sub` mapped to account
+  (auto-provisioned, §8). Opens the account session (`→ AUTHENTICATED`).
+- `101 reauth {accessToken string}` over the live WS → `201 reauth_ok {}`
+  or `202 error{session_expired}` (→ browser login, then full resync).
+  Re-auth has a hard deadline (§11): 90 s grace after token expiry, then
+  disconnect.
+
+### 6.3 Message catalog
+
+- C→S gameplay intents (`102–120`, `IN_WORLD` only): `102 move {heldDirs
+  u8 bitmask, runFlag u8}` (intents only — client-sent positions
+  rejected), `103 attack {target u32 NetEntityID}`, `104 cast {spell u16,
+  target u32}`, `105 use {kind u8, id u32}`, `106 get {entity u32, item
+  u32}`, `107 drop {item u32}`, `108 put {item u32, container u32}`,
+  `109 give {target u32, item u32, qty u16}`, `110 offer {target u32,
+  items {count u16 + u32[..]}}`, `111 counter {items {count u16 +
+  u32[..]}}`, `112 accept {}`, `113 cancel {}`, `114 buy {listing u32,
+  qty u16}`, `115 rest {state u8}`, `116 eat {item u32}`, `117 say
+  {channel u8, text string}`, `118 say_group {text string}`, `119
+  safety_toggle {}`, `120 respawn_ack {}`. Unknown/rate-limited intents →
+  `202 error` (no disconnect on first offense).
+- S→C deltas (`202–215`): `202 error {code u16, message string}`,
+  `203 cell_snapshot {cell, count u16 + [entityEntries]}`, `204
+  entity_create {entity u32, kind u8, pos, angle u16, ...}`,
+  `205 entity_move {entity u32, pos, angle u16, speed u8}`,
+  `206 entity_remove {entity u32}`, `207 stat {entity u32, statId u8,
+  value/min/max/curmax i32}` (M59 shape — reuse for HUD), `208 stat_group
+  {entity u32, count u16 + statEntries}`, `209 said {from u32, channel u8,
+  text string}`, `210 effect {id u16, target u32, pos}`, `211
+  inventory_delta {count u16 + itemEntries}`, `212 offer_update {...}`,
+  `213 trade_result {ok u8}`, `214 death {victim u32}`,
+  `215 respawn {pos}`.
 - MUST: server reconciles movement (client predicts, server corrects with
   authoritative position when divergence > epsilon, §13.2).
 
@@ -172,9 +255,11 @@ disconnect, never crash (forward compatibility).
 Sessions, presence, and rate limits live in gateway-owned in-memory
 registries (guarded maps / `sync.Map`; single process, no cross-instance sync).
 
-- Sessions: `sub(accountID) → {charID, conn, connectedAt, tokenExp}` keyed
-  by Keycloak `sub`, not by opaque token. Game session lives as long as the
-  WS is up and the client keeps re-authing; expiry of one access token does
+- Sessions: `sessionID → {sub, accountID, charID NULLABLE (set at
+  `enter_world`), conn, state (§6.1), tokenExp}`, indexed by `sub` and by
+  character. Keyed by Keycloak `sub`, not by opaque token. Game session
+  lives as long as the WS is up and the client keeps re-authing (hard
+  90 s deadline past token expiry, §11); expiry of one access token does
   NOT drop the session. Logout/death do NOT rely on it.
 - Presence: `charID → {conn, currentCells, heartbeatAt}` (heartbeat 15 s,
   sweep every 30 s). AOI cell sets derived from sim positions, deleted on
@@ -184,8 +269,24 @@ registries (guarded maps / `sync.Map`; single process, no cross-instance sync).
   future bus would carry, so sharding later only swaps the transport).
 - Restart semantics (accepted tradeoff of D3): sessions drop on restart —
   clients re-login; presence rebuilds on connect; authoritative sim state
-  restores from PG snapshot + write-through ledger. MUST document this in the
-  client reconnect flow (`{error: session_expired}` → re-login → resync).
+  restores from PG materialized state (D7, §8.1). MUST document this in the
+  client reconnect flow (`202 error{session_expired}` → re-login → full
+  resync).
+
+### 7.1 Slow-client and backpressure rules
+
+- Every session has a bounded outbound queue (e.g. 256 KiB / 1024
+  messages; exact budgets in `config.yaml`, validated on min-spec).
+- Movement/state deltas MAY be coalesced or dropped in favor of newest
+  state. Critical ordered events (`trade_result`, `death`, `stat`
+  milestones, `offer_update`, `enter_world` flow) MUST NOT be silently
+  dropped — they queue behind the same bound.
+- If a client cannot drain within budget, the server disconnects it;
+  reconnect performs a full resync (§6.1). Saturation is a first-class
+  metric (`vox_session_drops_total`, queue-depth histograms).
+- Same principle internally: sim→gateway channels are bounded with
+  defined overload behavior (shed newest movement first, never critical
+  events; count + log). Unbounded queues are a spec violation.
 
 ## 8. PostgreSQL schema (authoritative; migrations via goose, queries via sqlc)
 
@@ -194,39 +295,88 @@ Tables (D4; M59 property names in parens where ported):
   no passwords anywhere — credentials, reset, registration, and mails live in
   Keycloak. First login with an unknown `sub` auto-provisions a row, then
   in-game character creation applies (max 2 chars, §13.3).
-- `characters(id, account_id FK, name CITEXT UNIQUE, gender, face JSONB,
+- `characters(id BIGINT, account_id FK → accounts, slot SMALLINT 0/1,
+  name CITEXT, gender SMALLINT, face JSONB,
   might/intellect/stamina/agility/mysticism/aim SMALLINT,
-  karma INT, hometown TEXT, pos POINT/double[3], vitals JSONB
-  {hp,base_max,max,mana,max_mana,vigor,threshold,stomach},
+  karma INT, hometown TEXT,
+  pos_x/pos_y/pos_z BIGINT (millimeters, fixed-point — same units as the
+  wire `pos`, NOT `POINT` which is 2-D),
+  vitals JSONB {hp,base_max,max,mana,max_mana,vigor,threshold,stomach},
   advancement JSONB {adv_points, adv_timer_due, gain_chance, school_casts},
-  flags INT (murder/outlaw/safety/pk bits), created_at, updated_at,
-  deleted_at NULL)` — soft-delete keeps corpses/audits consistent; max **2**
-  active (non-deleted) characters per account enforced app-level at creation
-  (DECISION §13.3).
+  flags INT (murder/outlaw/safety/pk bits),
+  revision BIGINT (D7, §8.1), created_at, updated_at, deleted_at NULL)` —
+  soft-delete keeps corpses/audits consistent.
+  `UNIQUE(account_id, slot) WHERE deleted_at IS NULL` enforces the 2-char
+  limit **transactionally** (no app-level race); `UNIQUE(name) WHERE
+  deleted_at IS NULL` (partial index) lets deleted names be reused while
+  live names stay globally unique. Display-name rules still open (§13.3).
 - `character_spells(character_id, spell_id, ability SMALLINT 1–99, atrophy_flag BOOL)`,
   `character_skills(...)` — PK(char, id).
-- `items(id, character_id NULLABLE FK (NULL = in-world/corpse), proto TEXT,
-  slot TEXT, qty INT, hits INT, enchants JSONB, pos NULLABLE, created_at)` —
-  single-owner invariant enforced in SQL + app-level transactions.
-- `corpses(id, character_id, pos, created_at, expires_at)` + `corpse_items`.
-- `banks(account_or_char, system TEXT, balance BIGINT)` (two systems like M59:
-  Tos/Jasper-shared vs Kocatan — rename to world regions later).
-- `vaults(character_id, region TEXT, item_id)` (item storage, fee log in ledger).
-- `ledger(id, kind, actor, counterparty NULL, amount/qty, item_id NULL,
+- `item_instances(id BIGINT, proto TEXT, qty INT, hits INT, enchants JSONB,
+  revision BIGINT, created_at)` + `item_locations(item_id PK → instances,
+  kind SMALLINT (0=inventory,1=ground,2=corpse,3=vault,4=container),
+  character_id NULLABLE FK, corpse_id NULLABLE FK, pos_x/pos_y/pos_z
+  NULLABLE BIGINT mm, slot TEXT NULLABLE, CHECK exactly-one-owner per
+  kind)`. One row in `item_locations` = one location: SQL itself makes
+  “item simultaneously in inventory and corpse” impossible. No separate
+  `corpse_items`/`vaults-item` tables.
+- `corpses(id BIGINT, character_id FK, pos_x/pos_y/pos_z BIGINT mm,
+  created_at, expires_at)`.
+- `banks(character_id FK, system TEXT, balance BIGINT, revision BIGINT,
+  PK(character_id, system))` (two systems like M59: Tos/Jasper-shared vs
+  Kocatan — rename to world regions later).
+- `ledger(id BIGINT, kind SMALLINT, actor_account_id NULLABLE FK,
+  actor_character_id NULLABLE FK, CHECK exactly one NOT NULL,
+  cpty_account_id/cpty_character_id NULLABLE FK (both NULL = system/mint),
+  amount BIGINT NULLABLE, qty INT NULLABLE, item_id NULLABLE FK,
   created_at)` — append-only money/item movements (trade/bank/vault/loot).
-- `kills(id, killer_kind, killer_id, victim_kind, victim_id, pos, at)` for
-  advancement audit + karma/justice phase 2.
+- `kills(id BIGINT, killer_kind SMALLINT (0=character,1=mob),
+  killer_character_id NULLABLE FK, killer_mob_proto TEXT NULLABLE,
+  victim_kind SMALLINT, victim_character_id NULLABLE FK,
+  victim_mob_proto TEXT NULLABLE, pos_x/pos_y/pos_z BIGINT mm,
+  created_at)` for advancement audit + karma/justice phase 2.
 - `bans/mutes` minimal for admin MVP.
-- Indexes: characters(account_id), items(character_id), corpses(expires_at),
-  ledger(actor, at), kills(victim, at). CHECK constraints on stat/ability
-  ranges (1–50 creation / 1–99 ability) so bad sim code fails loudly.
+- Indexes: characters(account_id), item_locations(character_id, corpse_id),
+  corpses(expires_at), ledger(actor_character_id, created_at),
+  ledger(actor_account_id, created_at), kills(victim_character_id,
+  created_at). CHECK constraints on stat/ability ranges (1–50 creation /
+  1–99 ability) so bad sim code fails loudly.
 - sqlc: `queries/*.sql` → `internal/store/gen/`; migrations embed via
   `go:embed`; `voxilian migrate up/down/status`.
+- Migration `0001` MUST enable the `citext` extension.
+
+### 8.1 Persistence ordering and recovery (D7)
+
+**PG materialized state is the recovery source of truth. The ledger is an
+immutable audit trail, NOT event sourcing** — it cannot and MUST NOT be
+used to reconstruct character state. Recovery = load materialized rows;
+ledger is never replayed.
+
+- Critical operations (death, trade accept, char create/delete, logout
+  flush, +1 HP / +1% milestones, guild/faction phase-2 changes) update
+  materialized state **and** append ledger rows **atomically in one PG
+  transaction**. A crash between the two MUST be impossible by
+  construction, not by cleanup.
+- Every persisted entity row carries `revision BIGINT` (monotonic,
+  incremented on each write). All snapshot writes are conditional:
+  `UPDATE ... SET ... revision = $new WHERE id = $id AND revision <
+  $new` (equivalently `revision = $expected`). An async 60 s snapshot
+  holding stale state can therefore never overwrite a newer critical
+  write — the stale write affects 0 rows and is logged + counted as a
+  metric. The saver works off a per-entity dirty queue carrying the exact
+  revision it read; it never re-reads-and-blind-writes.
+- Restart recovery: load newest materialized rows (any revision), rebuild
+  sim, resume timers from stored due-times. Crash/panic is assumed to
+  bypass ALL cleanup — survival comes from the txn + revision rules
+  above, never from shutdown hooks (though §10 still defines graceful
+  shutdown for the clean path).
 
 ## 9. Gameplay services (what sim MUST enforce; numbers in `meridian59.md`)
 
-- Creation: validate 6×(1–50) + sum ≤ 200 + 45-pt ability budget (L2=25 else
-  10); grant Blink + Mace + 500 (+leaving-newbie-zone package); karma seed.
+- Creation: `122 character_create` validates slot 0/1 (+ transactional
+  uniqueness, §8), name (global-live-unique), 6×(1–50) + sum ≤ 200, 45-pt
+  ability budget (L2=25 else 10); grant Blink + Mace + 500
+  (+leaving-newbie-zone package); karma seed. All in one PG txn (§8.1).
 - Vitals/regen: HP=level (20 start, cap `100+Stam`/150); mana `15+Myst/5`
   + nodes; vigor/exertion/rest thresholds; hunger decay; exact M59 formulas,
   constants server-side (`world.toml`/flags, not client).
@@ -263,10 +413,23 @@ Tables (D4; M59 property names in parens where ported):
     (dedicated database + owner user, DSN via env `VOX_PG_DSN`); no PG
     container of its own. `voxilian migrate up` runs as a one-shot init
     container against that database.
-- Observability: `/healthz` (PG check + sim liveness), `/readyz` (sim loaded),
-  `/metrics` (ticks, AOI fanout, intent rates/errors, saver lag, WS sessions);
-  structured slog with `tick`, `cell`, `charID` fields; panic → supervised
-  restart with sim snapshot-on-shutdown best-effort.
+- Observability: `/healthz` = process/sim liveness ONLY (never PG-gated);
+  `/readyz` = world loaded + PG reachable + migrations compatible;
+  `/metrics` (ticks, AOI fanout, intent rates/errors, saver lag, WS
+  sessions, queue saturation, stale-snapshot writes);
+  structured slog with `tick`, `cell`, `charID` fields.
+- PG-outage behavior: outage flips `/readyz` to unready (NEVER `/healthz`
+  — no supervisor restart loops). While unready: reject new logins and
+  all critical persistence ops (trades, char create/delete, purchases);
+  already-connected clients keep limited movement for a 60 s grace
+  period, then are held (no state progression) until PG returns or the
+  operator drains. Every gameplay service follows this policy — no local
+  exceptions.
+- Graceful shutdown (replaces best-effort panic cleanup): `SIGTERM` →
+  `ready=false` → stop accepting sessions → stop new critical
+  transactions → quiesce sim → flush dirty entities with deadline → close
+  connections → exit. A real crash/panic is assumed to bypass ALL of this
+  — which is exactly why §8.1 (txn + revision) must survive it.
 - Admin (cobra `voxilian admin ...` + WS admin role): create account/character,
   grant/revoke, kick/ban, save-now, spawn/teleport (logged), give (logged,
   dev-only flag).
@@ -285,7 +448,19 @@ Tables (D4; M59 property names in parens where ported):
   tokens surviving restarts). No client secret in the game binary; direct
   grants forbidden. Backend validates access JWTs against cached JWKS
   (`iss`/`aud`/expiry/signature; key rotation via cache TTL + backoff);
-  rejects expired/misissued tokens with `{error: session_expired}`.
+  rejects expired/misissued tokens with `202 error{session_expired}`.
+- Hard re-auth deadline: token expiry does not drop the session, but a
+  **90 s grace period** starts at expiry. After grace: new gameplay
+  intents are rejected, then the session is disconnected. A connected
+  session MUST NOT persist indefinitely without fresh authorization.
+- OIDC login MUST require `state` AND `nonce` (not just PKCE) — validated
+  by the client before code exchange.
+- Pre-auth rate limiting: the `hello`/JWKS-validation path is rate-limited
+  per connection/IP (token bucket), independent of per-character gameplay
+  limits — unauthenticated JWT verification MUST NOT be a free
+  CPU-amplification endpoint.
+- WS admin role is authorized by a Keycloak client role claim
+  (`vox-admin`), never by mere authentication.
 - WS requires TLS in prod (terminate at proxy or Go — DECISION §13.6).
 - Authoritative sim (§5 anti-cheat); per-intent in-memory rate limits;
   movement speed/teleport anomaly detection → correct + log, ban on repeat.
@@ -302,6 +477,14 @@ Tables (D4; M59 property names in parens where ported):
   death/corpse/respawn, snapshot restore, double-accept race.
 - Load: bot harness (N clients random-walk + attack) measuring tick p99,
   AOI fanout bytes, saver lag — gates sharding decision with data.
+- Protocol robustness (hand-written codec): Go fuzz tests for every
+  decoder; malformed/truncated/oversized packet tests; encode/decode
+  round-trips; Go ↔ Godot golden binary fixtures (checked-in
+  hex vectors both sides decode identically).
+- Resilience: slow-client/backpressure tests; crash injection during
+  trade/death/snapshot (assert §8.1 invariants hold); PG-loss/recovery
+  tests; cell-boundary handoff races; reconnect/full-resync tests;
+  stale/duplicate intent tests.
 
 ## 13. Open questions (please decide together)
 
@@ -320,9 +503,10 @@ Tables (D4; M59 property names in parens where ported):
    for** — sim keeps a per-entity position-history ring (2 s @ 20 Hz) from
    day one and hit validation lives in one isolated function, so rewind
    plugs in later without protocol changes.
-3. **Characters/account limits**: DECIDED — **2/account** (enforced
-   app-level on active/non-deleted characters). Still open: name rules,
-   deletion semantics.
+3. **Characters/account limits**: DECIDED — **2/account** (slots 0/1,
+   `UNIQUE(account_id, slot)` on live rows — transactional, §8). Deleted
+   names reusable via partial unique index. Still open: display-name
+   rules (charset/length/profanity).
 4. **Auth**: DECIDED — **external Keycloak IdP, Authorization Code + PKCE
    via system browser** (no Godot OIDC package needed: `OS.shell_open` +
    `TCPServer` loopback callback + `HTTPRequest` exchange + `HashingContext`
@@ -358,6 +542,11 @@ Tables (D4; M59 property names in parens where ported):
 
 ## 14. Version history
 
+- v0.3: review hardening — session lifecycle + char CRUD (§6.1), exact wire
+  layouts/ACK/resync/NetEntityID (§6), persistence ordering + revision guard
+  (D7, §8.1), cell handoff invariants (§5.1), backpressure (§7.1), schema
+  tightening (positions, item locations, slots, names, owners), auth
+  hardening (§11), ops split + PG-outage + shutdown (§10).
 - v0.2: drop Redis; sessions/presence/rate-limits in memory; PG-only stack.
 - v0.1: initial spec (seamless + embedded interiors, WebSocket, single
   process, snapshot + write-through, PG 18 + Redis 8).
