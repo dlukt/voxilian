@@ -80,18 +80,23 @@ PG 18 (durable) · memory (ephemeral; rebuilt on restart) · /metrics /healthz
   (starter town footprint, dungeons as walled complexes / y-separated volumes,
   Underworld as a distant region). M59 `ROOM_*` flags become **volume flags**
   (safe-death, no-PK, no-combat, sanctuary ×2/×3 heal, hometown, kill-zone).
-- Coordinates: world units in meters, float64 server-side; voxel chunk size
-  and origin defined by `internal/world` and shared with the Godot client
-  (single source: `world.toml` or generated constants — DECISION NEEDED §13.1).
-  World content comes from the configured `WorldSource` (DECISION §13.5):
-  `classic` authored data or `procedural` deterministic generation.
-- Spatial index: uniform grid cells (e.g. 32 m; tune) → each cell has an owner
-  worker (MVP: all local). Neighbor lookup for melee/AoE/AOI.
-- AOI/interest: per-session subscription = cells within view radius R
-  (DECISION NEEDED §13.2; start R ≈ 96–128 m) + interior volume override.
-  Gateway sends: full snapshot on cell-enter, then deltas at tick; entity
-  despawn on cell-exit. MUST throttle: movement states ≤ 10 Hz per entity in
-  AOI; combat/vital events immediate.
+- Coordinates: world units in meters, float64 server-side; **voxel chunk
+  16³**, origin and constants defined by `internal/world` and shared with
+  the Godot client (single source: `world.toml` or generated constants —
+  DECISION §13.1). 1 M59 square ≈ 1 m for range ports (validate in
+  playtest). World content comes from the configured `WorldSource`
+  (DECISION §13.5): `classic` authored data or `procedural` deterministic
+  generation.
+- Spatial index: uniform grid cells of **32 m** (2×2 chunks) → each cell has
+  an owner worker (MVP: all local). Neighbor lookup for melee/AoE/AOI.
+- AOI/interest: per-session subscription = cells within **96 m** (3-cell
+  radius; tunable to 128 m if min-spec testing shows headroom — DECISION
+  §13.1) + interior volume override. Gateway sends: full snapshot on
+  cell-enter, then deltas at tick; entity despawn on cell-exit. MUST
+  throttle: movement states ≤ 10 Hz per entity in AOI; combat/vital events
+  immediate. Procedural mode: client generates terrain from seed, AOI
+  bandwidth is entities-only; classic mode streams chunk data (hence the
+  conservative 96 m default).
 - Embedded interiors: dungeons/Underworld/guildhall volumes flagged
   `INTERIOR`; entry by walking through portal volumes (position continuity
   preserved — seamless feel), NOT by teleport RPC, except death-respawn and
@@ -300,11 +305,11 @@ Tables (D4; M59 property names in parens where ported):
 
 ## 13. Open questions (please decide together)
 
-1. **Chunk/cell constants**: voxel chunk size (16³?), sim cell size (32 m?),
-   AOI radius (96–128 m?), portal volume format — need Godot-side agreement
-   before protocol freeze. Constraint: **low-end clients targeted**, so err
-   toward conservative streaming/AOI budgets and validate with the load
-   harness on min-spec hardware.
+1. **Chunk/cell constants**: DECIDED — voxel chunk **16³**, sim cell
+   **32 m**, AOI radius **96 m** default (tunable to 128 m on min-spec
+   evidence); 1 M59 square ≈ 1 m for range ports. Low-end clients targeted:
+   conservative streaming/AOI budgets, validated on min-spec hardware.
+   Still open: portal volume format (needs Godot-side agreement).
 2. **Movement authority**: DECIDED — **server-authoritative** (M59 was
    client-authoritative with log-only enforcement; we do the opposite).
    Client sends intents (held directions + run flag, never positions) at
