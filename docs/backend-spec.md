@@ -609,6 +609,38 @@ ledger is never replayed.
   write, all in the same PG txn. On restart, in-memory revision counters
   initialize FROM the persisted revisions (never from zero).
 
+- Normal live character snapshot CAS. The saver owns gameplay state plus
+  children, and nothing else:
+
+  ```text
+  MAY update: karma, pos_x, pos_y, pos_z, vitals, advancement, flags,
+              updated_at, revision (+ character_spells, character_skills)
+  NEVER via normal save: id, account_id, slot, name, gender, face,
+              might, intellect, stamina, agility, mysticism, aim,
+              hometown, created_at, deleted_at
+  ```
+
+  Changing an identity/profile field later requires its own explicit
+  character-root CAS operation — never a blind setter, never the normal
+  save. The normal save requires `deleted_at IS NULL` and performs
+  root-CAS → replace complete spell snapshot → replace complete skill
+  snapshot → commit in one transaction.
+
+- Character soft-delete CAS (a character-root CAS mutation, not a plain
+  write):
+
+  ```text
+  UPDATE characters
+  SET deleted_at = now(),
+      updated_at = now(),
+      revision = expected + 1
+  WHERE id = ... AND revision = expected AND deleted_at IS NULL
+  ```
+
+  It keeps the row and its spell/skill children (uniqueness releases via
+  the partial indexes), and cannot win a revision race against a
+  concurrent save/delete on the same expected revision.
+
 ## 9. Gameplay services (what sim MUST enforce; numbers in `meridian59.md`)
 
 - Creation: `122 character_create` validates slot 0/1 (+ transactional
