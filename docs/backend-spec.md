@@ -163,7 +163,9 @@ Tables (D4; M59 property names in parens where ported):
   {hp,base_max,max,mana,max_mana,vigor,threshold,stomach},
   advancement JSONB {adv_points, adv_timer_due, gain_chance, school_casts},
   flags INT (murder/outlaw/safety/pk bits), created_at, updated_at,
-  deleted_at NULL)` — soft-delete keeps corpses/audits consistent.
+  deleted_at NULL)` — soft-delete keeps corpses/audits consistent; max **2**
+  active (non-deleted) characters per account enforced app-level at creation
+  (DECISION §13.3).
 - `character_spells(character_id, spell_id, ability SMALLINT 1–99, atrophy_flag BOOL)`,
   `character_skills(...)` — PK(char, id).
 - `items(id, character_id NULLABLE FK (NULL = in-world/corpse), proto TEXT,
@@ -216,9 +218,14 @@ Tables (D4; M59 property names in parens where ported):
 - Config: env + file (`config.yaml` default, env override `VOX_*`); MUST
   include: PG DSN, WS bind, world constants path, tick rates,
   snapshot interval, rate limits, seed data paths, log level.
-- `compose.yaml` (dev): `postgres:18-alpine` + `voxilian` build target;
-  named volume; healthcheck; `voxilian migrate up` as init step.
-  Prod deployment target: DECISION NEEDED (§13.6).
+- `compose.yaml` (dev AND prod — single VPS per DECISION §13.6):
+  - dev profile: `postgres:18-alpine` + `voxilian` local build target; named
+    volume; healthcheck; `voxilian migrate up` as init step.
+  - prod profile: `voxilian` image from GHCR (`ghcr.io/dlukt/voxilian`;
+    published by CI) + connection to the **existing prod PG instance**
+    (dedicated database + owner user, DSN via env `VOX_PG_DSN`); no PG
+    container of its own. `voxilian migrate up` runs as a one-shot init
+    container against that database.
 - Observability: `/healthz` (PG check + sim liveness), `/readyz` (sim loaded),
   `/metrics` (ticks, AOI fanout, intent rates/errors, saver lag, WS sessions);
   structured slog with `tick`, `cell`, `charID` fields; panic → supervised
@@ -234,8 +241,10 @@ Tables (D4; M59 property names in parens where ported):
   DECISION §13.6).
 - Authoritative sim (§5 anti-cheat); per-intent in-memory rate limits;
   movement speed/teleport anomaly detection → correct + log, ban on repeat.
-- No secrets in repo; `.env` local only; PG least-privilege role for app
-  (migrate role separate).
+- No secrets in repo; `.env` local only; prod PG uses a dedicated database +
+  owner user on the existing instance. Runtime app role is least-privilege
+  (DML on game tables only); migrations run as owner (or a dedicated migrate
+  role) via the one-shot migrate container.
 
 ## 12. Testing
 
@@ -253,13 +262,18 @@ Tables (D4; M59 property names in parens where ported):
    before protocol freeze.
 2. **Movement authority details**: client intent rate (10 Hz?), max speeds
    per state, correction epsilon, lag-compensation for melee (none MVP?).
-3. **Characters/account limits** (e.g. 4/account?), name rules, deletion.
+3. **Characters/account limits**: DECIDED — **2/account** (enforced
+   app-level on active/non-deleted characters). Still open: name rules,
+   deletion semantics.
 4. **Session token format + expiry**, password-reset flow (out of scope MVP?),
    age/rating handling.
 5. **World authoring**: hand-built starter region vs procedural seed; format
    (Tiled/custom → `world.toml`?); who owns the map pipeline.
-6. **Prod target**: single VPS + compose vs managed PG vs k8s; TLS
-   termination; backups/PITR for PG.
+6. **Prod target**: DECIDED — **single VPS + compose**; app image from
+   **GHCR** (`ghcr.io/dlukt/voxilian`, CI-published); PG is the **existing
+   prod instance** (dedicated database + owner user, external to compose).
+   Still open: TLS termination (reverse proxy vs Go); backups/PITR for PG
+   (may ride on the existing instance's policy — confirm).
 7. **MVP content scope**: which spell schools / skills / mobs ship first
    (proposal in §9: 2 schools × 4 spells, 4 weapon skills + dodge/block/parry,
    6 mobs) — confirm or cut further.
