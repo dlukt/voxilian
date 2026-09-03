@@ -8,8 +8,10 @@ import (
 
 // rootCmd is the base command for the Voxilian authoritative game server.
 // Backend working directory is backend/voxilian; see docs/implementation-plan.md.
-var rootCmd = &cobra.Command{
-	Use:   "voxilian",
+// cfgFile holds the --config flag value; consumed by serve from M3 on.
+var cfgFile string
+
+var rootCmd = &cobra.Command{Use: "voxilian",
 	Short: "Voxilian authoritative game server",
 	Long: `Voxilian authoritative game server (Go backend for the Godot voxel client).
 
@@ -30,4 +32,5 @@ func Execute() {
 func init() {
 	// Persistent flags (config file, log level, etc.) are introduced
 	// with the config loader in M0-T2.
+	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file path (default config.yaml if present)")
 }
