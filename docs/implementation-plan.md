@@ -64,7 +64,7 @@ Exit: all §8 tables (incl. prototype catalogs) exist via goose; `Store` covers 
 - [x] **M1-T6c** sqlc: ledger/kill appends, bans/mutes. Spec: §8.
 - [x] **M1-T6d** sqlc + store: catalog registry — load-all per table + transactional upsert (stable ID + version rules, §8.2). This is the ONLY write API `voxilian seed` may use. Spec: §8.2.
 - [x] **M1-T7a** `Store` CAS: character aggregate (root CAS → child spells/skills in same txn). Stale-revision test. Spec: §8.1, D7.
-- [ ] **M1-T7b** `Store` CAS: item aggregate (root CAS → location row in same txn). Stale-revision test. Spec: §8.1.
+- [x] **M1-T7b** `Store` CAS: item aggregate (root CAS → location row in same txn). Stale-revision test. Spec: §8.1.
 - [ ] **M1-T7c** `Store` CAS: bank balance + `Store` interface assembly. Stale-revision test + metric. Spec: §8.1.
 - [ ] **M1-T8** `voxilian migrate up/down/status` wired to embedded migrations (one-shot container compatible) + CI migrate-up-against-service-PG check (moved here from M0). Spec: §8, §10.
 - [ ] **M1 exit criteria met** (migrations apply cleanly to fresh PG 18; CAS suites green; CI migration check green).

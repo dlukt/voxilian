@@ -10,12 +10,21 @@ import (
 	"github.com/dlukt/voxilian/internal/simtest"
 )
 
-// rootUpdateRe matches a statement-level UPDATE of a CAS aggregate root
-// that T7 does not own yet: item_instances (T7b) and banks (T7c).
-// characters updates moved to the file-ownership rule below (T7a).
+// rootUpdateRe matches a statement-level UPDATE of the CAS aggregate
+// root not yet owned: banks (T7c). characters/item_instances moved to
+// file-ownership rules (T7a/T7b).
 // It deliberately does NOT match the `DO UPDATE SET` clause inside the
 // sanctioned UpsertItemLocation (M1-T7b building block).
-var rootUpdateRe = regexp.MustCompile(`(?mi)^\s*UPDATE\s+(item_instances|banks)\b`)
+var rootUpdateRe = regexp.MustCompile(`(?mi)^\s*UPDATE\s+(banks)\b`)
+
+// itemCASFile owns the only production UPDATE item_instances (T7b).
+var itemCASFile = "item_cas.sql"
+
+var itemRootUpdateRe = regexp.MustCompile(`(?mi)^\s*UPDATE\s+item_instances\b`)
+
+// itemDeleteRe forbids item destruction everywhere: no DestroyItem API,
+// no tombstones in M1.
+var itemDeleteRe = regexp.MustCompile(`(?mi)^\s*DELETE\s+FROM\s+item_instances\b`)
 
 // characterCASOwner restricts UPDATE characters to queries/character_cas.sql.
 var characterCASFile = "character_cas.sql"
@@ -76,6 +85,19 @@ func TestNoMutableRootQueries(t *testing.T) {
 		}
 		if m := characterDeleteRe.FindString(string(raw)); m != "" {
 			t.Errorf("%s contains forbidden %q (soft-delete only)", name, m)
+		}
+		if m := itemRootUpdateRe.FindString(string(raw)); m != "" && name != itemCASFile {
+			t.Errorf("%s contains UPDATE item_instances outside %s", name, itemCASFile)
+		}
+		if m := itemDeleteRe.FindString(string(raw)); m != "" {
+			t.Errorf("%s contains forbidden %q (no item destruction in M1)", name, m)
+		}
+		if name == itemCASFile {
+			for _, want := range []string{"CASUpdateItemSnapshot", "LockItemContainmentGraph", "WouldCreateItemContainmentCycle"} {
+				if !strings.Contains(string(raw), "-- name: "+want) {
+					t.Errorf("%s missing required query %s", name, want)
+				}
+			}
 		}
 		if name == characterCASFile {
 			for _, want := range []string{"CASUpdateCharacterSnapshot", "CASSoftDeleteCharacter"} {
