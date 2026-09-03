@@ -9,7 +9,7 @@
 | # | Decision | Value |
 |---|---|---|
 | D1 | World model | **Seamless + embedded interiors**: one continuous overworld; dungeons / Underworld / guildhalls are embedded regions/interiors in the same coordinate space (separate coordinate bands or y-layered volumes), NOT boxed instances |
-| D2 | Transport | **WebSocket** (Godot 4.7.2 client). Single WS per session, JSON envelopes for MVP (binary later if profiling demands) |
+| D2 | Transport | **WebSocket + hand-packed binary codec, M59-style** (Godot 4.7.2 client). Opcode envelope, versioned messages, zero codec deps both sides. JSON reserved for admin/debug surfaces only |
 | D3 | Topology | **Single world process** for MVP. Sessions, presence, and rate limits are in-process memory. No Redis, no external bus. Spatial workers are a later scale-out, designed for but not built |
 | D4 | Persistence | **Snapshot + write-through**: PG is authoritative; sim keeps hot state in memory, snapshots every N sec + write-through on critical events (death, trade, logout, guild/faction change) |
 | D5 | DB stack | **PostgreSQL 18 + pgx + sqlc + goose**. No other datastore. Current pinned versions in §2 |
@@ -116,32 +116,51 @@ PG 18 (durable) · memory (ephemeral; rebuilt on restart) · /metrics /healthz
   rejected (anti-cheat carries M59's buffed-Max halving, PK loot tags, reagent
   checks).
 
-## 6. WebSocket protocol (v0 envelopes, JSON)
+## 6. WebSocket protocol (binary, versioned — DECISION §13.8)
 
-- Connect: `wss://host/play` → `{hello, clientVersion, accessToken}` →
-  server `{welcome, serverTick, worldConstants{chunk, aoiRadius, tickRates},
-  world{mode, seed, version}}` or `{error}`. `accessToken` = Keycloak access
-  JWT (D6), validated against cached JWKS (`iss`/`aud`/expiry checked),
-  `sub` mapped to account (auto-provisioned on first login, §8) and
-  character loaded from PG.
-- Re-auth (no reconnect): when the client refreshes tokens it sends
-  `{reauth, accessToken}` over the existing WS; server swaps the principal
-  on the live session and replies `{reauth_ok}` or `{error:
-  session_expired}` (→ client re-runs the browser login, then resyncs).
-- C→S intents: `move/{heldDirs,runFlag}` (intents only — positions sent by
-  the client are rejected), `attack/{target}`, `cast/{spell,target}`,
-  `use/{skill/item}`, `get/drop/put/give`, `offer/counter/accept/cancel`,
-  `buy`, `rest/stand`, `eat`, `say/say_group`, `safety_toggle`, `respawn_ack`.
-  Unknown/rate-limited intents → `{error}` (no disconnect on first offense).
-- S→C deltas: `cell_snapshot`, `entity_{create,move,remove}`, `stat` (M59
-  `{value,min,max,curmax}` shape — reuse for HUD), `stat_group`, `message/said`,
-  `effect`, `inventory_delta`, `offer_update`, `trade_result`, `death`,
-  `respawn`. Every S→C carries `tick` + monotonic `seq` per session for
-  ordering; client acks highest applied `seq` for resync decisions.
+Framing: every WS message is one binary frame (D2):
+`[u16 opcode][u16 msg_version][u32 seq][u32 tick][payload...]`.
+Integers little-endian; `string` = `u16 len + UTF-8 bytes`; positions are
+`i32` millimeters (fixed-point, deterministic); angles `u16` 0–4095
+(M59's 12-bit convention). Codecs use stdlib only — Go
+`encoding/binary`, Godot `PackedByteArray.encode_*/decode_*` (both C++,
+fast on low-end; no protobuf/GDExtension weight). Protobuf is the
+documented escape hatch if hand maintenance ever stops scaling; the
+opcode envelope survives that migration.
+Rules: `hello` negotiates `protoVersion` (breaking changes bump it, old
+clients rejected with `202 error`); unknown opcodes → `202 error`, never
+disconnect, never crash (forward compatibility).
+
+- Connect: `100 hello {clientVersion u32, protoVersion u16, accessToken
+  string}` → `200 welcome {serverTick u64, chunk u8, aoiRadius u16,
+  tickRates u8[..], world{mode u8, seed u64, version u32}}` or `202 error`.
+  `accessToken` = Keycloak access JWT (D6), JWKS-validated, `sub` mapped
+  to account (auto-provisioned, §8) and character loaded from PG.
+- Re-auth (no reconnect): `101 reauth {accessToken string}` over the live
+  WS → `201 reauth_ok {}` or `202 error{session_expired}` (→ browser login,
+  then resync).
+- C→S intents (`102–120`): `102 move {heldDirs u8 bitmask, runFlag u8}`
+  (intents only — client-sent positions rejected), `103 attack {target
+  u32}`, `104 cast {spell u16, target u32}`, `105 use {kind u8, id u32}`,
+  `106 get {entity u32, item u32}`, `107 drop {item u32}`, `108 put {item
+  u32, container u32}`, `109 give {target u32, item u32, qty u16}`,
+  `110 offer {target u32, items..}`, `111 counter {items..}`,
+  `112 accept {}`, `113 cancel {}`, `114 buy {listing u32, qty u16}`,
+  `115 rest {state u8}`, `116 eat {item u32}`, `117 say {channel u8, text
+  string}`, `118 say_group {text string}`, `119 safety_toggle {}`,
+  `120 respawn_ack {}`. Unknown/rate-limited intents → `202 error` (no
+  disconnect on first offense).
+- S→C deltas (`203–215`): `203 cell_snapshot {cell, entities..}`,
+  `204 entity_create`, `205 entity_move {entity, pos, angle, speed}`,
+  `206 entity_remove {entity}`, `207 stat {entity u32, statId u8,
+  value/min/max/curmax i32}` (M59 shape — reuse for HUD), `208 stat_group`,
+  `209 said {from u32, channel u8, text string}`, `210 effect {id u16,
+  target u32, pos}`, `211 inventory_delta`, `212 offer_update`,
+  `213 trade_result {ok u8}`, `214 death {victim u32}`, `215 respawn {pos}`.
+  `seq` is monotonic per session; client acks highest applied `seq` for
+  resync decisions.
 - MUST: server reconciles movement (client predicts, server corrects with
-  authoritative position when divergence > epsilon).
-- SHOULD: protocol version negotiated at hello; breaking changes bump
-  `protoVersion` and reject old clients with a clear error.
+  authoritative position when divergence > epsilon, §13.2).
 
 ## 7. In-memory ephemeral state (no external store)
 
@@ -325,8 +344,12 @@ Tables (D4; M59 property names in parens where ported):
    slice). Consequence: seed data must cover every school/skill/mob proto +
    costs/effects/loot tables up front; phasing applies to meta-systems only
    (guilds/factions/justice stay phase 2).
-8. **Protocol encoding**: stay JSON for all of MVP, or define the binary frame
-   format now for movement deltas?
+8. **Protocol encoding**: DECIDED — **WebSocket + hand-packed binary,
+   M59-style** (§6: opcode envelope, fixed-point positions, stdlib-only
+   codecs both sides; JSON for admin/debug only). gRPC explicitly rejected
+   for the game plane (wrong model for AOI fanout + immature native dep on
+   low-end clients); protobuf is the documented escape hatch, envelope
+   survives it.
 
 ## 14. Version history
 
