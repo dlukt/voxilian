@@ -26,8 +26,8 @@ func openMigrated(t *testing.T, dsn string) *sql.DB {
 	if err := goose.SetDialect("postgres"); err != nil {
 		t.Fatalf("dialect: %v", err)
 	}
-	if err := goose.Up(db, migrationsDir(t)); err != nil {
-		t.Fatalf("goose up: %v", err)
+	if err := goose.UpTo(db, migrationsDir(t), 1); err != nil {
+		t.Fatalf("goose up to 1: %v", err)
 	}
 	return db
 }
