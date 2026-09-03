@@ -408,14 +408,22 @@ type ShopListing struct {
 	Qty       int32
 }
 
+// shopListingKey addresses one listing directly: O(1) pair lookup
+// alongside the per-vendor slices used for enumeration.
+type shopListingKey struct {
+	VendorID  int32
+	ListingID int32
+}
+
 // CatalogRegistry is immutable after construction: no maps escape, JSON
 // is string-typed, and ShopListings returns a copy.
 type CatalogRegistry struct {
-	spells   map[int32]SpellProto
-	skills   map[int32]SkillProto
-	items    map[int32]ItemProto
-	mobs     map[int32]MobProto
-	listings map[int32][]ShopListing
+	spells       map[int32]SpellProto
+	skills       map[int32]SkillProto
+	items        map[int32]ItemProto
+	mobs         map[int32]MobProto
+	listings     map[int32][]ShopListing
+	listingByKey map[shopListingKey]ShopListing
 }
 
 func (r *CatalogRegistry) Spell(id int32) (SpellProto, bool) {
@@ -447,12 +455,10 @@ func (r *CatalogRegistry) Mob(id int32) (MobProto, bool) {
 }
 
 func (r *CatalogRegistry) ShopListing(vendorID, listingID int32) (ShopListing, bool) {
-	for _, l := range r.listings[vendorID] {
-		if l.Listing == listingID {
-			return l, true
-		}
-	}
-	return ShopListing{}, false
+	// Direct map lookup: O(1). ShopListing holds only value fields, so
+	// the returned copy cannot alias mutable registry backing state.
+	v, ok := r.listingByKey[shopListingKey{VendorID: vendorID, ListingID: listingID}]
+	return v, ok
 }
 
 // ShopListings returns a copy in listing-ID order; mutating it cannot
@@ -501,11 +507,12 @@ func LoadCatalogRegistry(ctx context.Context, pool *pgxpool.Pool) (*CatalogRegis
 	}
 
 	reg := &CatalogRegistry{
-		spells:   make(map[int32]SpellProto, len(spells)),
-		skills:   make(map[int32]SkillProto, len(skills)),
-		items:    make(map[int32]ItemProto, len(items)),
-		mobs:     make(map[int32]MobProto, len(mobs)),
-		listings: make(map[int32][]ShopListing),
+		spells:       make(map[int32]SpellProto, len(spells)),
+		skills:       make(map[int32]SkillProto, len(skills)),
+		items:        make(map[int32]ItemProto, len(items)),
+		mobs:         make(map[int32]MobProto, len(mobs)),
+		listings:     make(map[int32][]ShopListing),
+		listingByKey: make(map[shopListingKey]ShopListing, len(listings)),
 	}
 	for _, s := range spells {
 		reg.spells[s.ID] = SpellProto{ID: s.ID, School: s.School, Level: s.Level,
@@ -528,10 +535,12 @@ func LoadCatalogRegistry(ctx context.Context, pool *pgxpool.Pool) (*CatalogRegis
 			LootTID: textPtr(s.LootTid), Version: s.Version}
 	}
 	for _, l := range listings {
-		reg.listings[l.VendorID] = append(reg.listings[l.VendorID], ShopListing{
+		row := ShopListing{
 			VendorID: l.VendorID, Listing: l.Listing, ItemProto: l.ItemProto,
 			Price: l.Price, Qty: l.Qty,
-		})
+		}
+		reg.listings[l.VendorID] = append(reg.listings[l.VendorID], row)
+		reg.listingByKey[shopListingKey{VendorID: l.VendorID, ListingID: l.Listing}] = row
 	}
 	for v := range reg.listings {
 		sort.Slice(reg.listings[v], func(i, j int) bool {

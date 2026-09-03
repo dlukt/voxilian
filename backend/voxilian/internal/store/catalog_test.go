@@ -127,6 +127,36 @@ func TestCatalogRegistryLoad(t *testing.T) {
 	if len(got) != 2 || got[0].Listing != 10 || got[1].Listing != 20 {
 		t.Fatalf("listings order = %+v", got)
 	}
+
+	// Keyed lookup is independent per vendor: same listing number on a
+	// second vendor resolves separately.
+	mustUpsert(t, pool, CatalogBatch{Mobs: []MobProtoRecord{{
+		ID: 202, Key: "vendor-b", Level: 1, Difficulty: 1, Karma: 0,
+		Atk: json.RawMessage(`{}`), Resists: json.RawMessage(`{}`), Spells: json.RawMessage(`{}`),
+		Version:  1,
+		Listings: []ShopListingRecord{{Listing: 10, ItemProto: 100, Price: 999, Qty: 1}},
+	}}}, false)
+	reg, err = LoadCatalogRegistry(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, ok := reg.ShopListing(202, 10)
+	if !ok || other.Price != 999 {
+		t.Fatalf("vendor-b listing = %+v, %v", other, ok)
+	}
+	mine, ok := reg.ShopListing(200, 10)
+	if !ok || mine.Price != 50 {
+		t.Fatalf("vendor-a listing disturbed = %+v, %v", mine, ok)
+	}
+
+	// Mutating an enumeration copy cannot alter keyed lookup results.
+	enum := reg.ShopListings(200)
+	enum[0].Price = 0
+	enum[0].Listing = 999
+	direct, ok := reg.ShopListing(200, 10)
+	if !ok || direct.Price != 50 || direct.Listing != 10 {
+		t.Fatalf("keyed lookup after enum mutation = %+v, %v", direct, ok)
+	}
 }
 
 func TestCatalogRegistryImmutable(t *testing.T) {
