@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.1 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.2 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -10,9 +10,9 @@
 |---|---|---|
 | D1 | World model | **Seamless + embedded interiors**: one continuous overworld; dungeons / Underworld / guildhalls are embedded regions/interiors in the same coordinate space (separate coordinate bands or y-layered volumes), NOT boxed instances |
 | D2 | Transport | **WebSocket** (Godot 4.7.2 client). Single WS per session, JSON envelopes for MVP (binary later if profiling demands) |
-| D3 | Topology | **Single world process** for MVP. Redis is sessions/presence/bus only, never authoritative state. Spatial workers are a later scale-out, designed for but not built |
+| D3 | Topology | **Single world process** for MVP. Sessions, presence, and rate limits are in-process memory. No Redis, no external bus. Spatial workers are a later scale-out, designed for but not built |
 | D4 | Persistence | **Snapshot + write-through**: PG is authoritative; sim keeps hot state in memory, snapshots every N sec + write-through on critical events (death, trade, logout, guild/faction change) |
-| D5 | DB stack | **PostgreSQL 18 + pgx + sqlc + goose**, **Redis 8.x + go-redis**. Current pinned versions in §2 |
+| D5 | DB stack | **PostgreSQL 18 + pgx + sqlc + goose**. No other datastore. Current pinned versions in §2 |
 
 ## 1. Goals / non-goals
 
@@ -22,9 +22,9 @@ Goals (MVP backend):
   death + corpse + Underworld-region respawn.
 - G2: M59 progression port: 6 stats (creation point-buy), spells/skills 1–99%
   use-based improvement, HP-as-level advancement, learn-points gate.
-- G3: Session/presence via Redis; durable ledger in PG 18; clean
-  `sim` vs `store` separation so spatial sharding can be added without
-  rewriting game logic.
+- G3: Sessions/presence/rate-limits in process memory; durable ledger in
+  PG 18; clean `sim` vs `store` separation so spatial sharding can be added
+  without rewriting game logic.
 - G4: Operable locally via compose; observable (logs/metrics/health); admin
   console parity with M59 basics (create account/character, save, kick).
 
@@ -42,24 +42,22 @@ server-reconcile, browser/web export specifics.
 | pgx | `github.com/jackc/pgx/v5` **v5.10.0** | Driver + pool; supports PG14+, Go 1.25+ |
 | sqlc | **v1.31.1** | Generate typed queries from SQL; config `sqlc.yaml`, `pgx/v5` emit |
 | goose | `github.com/pressly/goose/v3` **v3.27.x** | `migrations/*.sql`, embed + `voxilian migrate` cobra subcommand |
-| Redis server | 8.x | Sessions/presence/bus; persistence ON for sessions (RDB+AOF per §7) |
-| go-redis | `github.com/redis/go-redis/v9` **v9.22.0** | RESP3 optional; plain client is enough for MVP |
 | CLI | cobra (already `v1.10.2` in `go.mod`) | `voxilian serve / migrate / admin / seed` |
 | WS | `github.com/coder/websocket` (current) | Pick over archived gorilla; single maintained dep |
 | Logging | `log/slog` (stdlib) | JSON in prod, text in dev |
 | Metrics | Prometheus client (current) + `/metrics` | Counters/histograms per §11 |
-| Testing | stdlib + `testcontainers-go` (current) for PG/Redis integration | Unit sim with fake clock/store |
+| Testing | stdlib + `testcontainers-go` (current) for PG integration | Unit sim with fake clock/store |
 
 ## 3. Process architecture (single world process)
 
 ```text
-                    +------------------- voxilian (one process) -------------------+
-Godot clients <--WS--> gateway (auth, sessions, AOI fanout) <-> sim (rooms→cells, |
-                         combat, AI, regen, advancement) <-> store (sqlc/pgx→PG)  |
-                                             |                                   |
-                                         bus (go-redis → Redis: presence/pubsub) |
-                                             +-----------------------------------+
-PG 18 (durable) · Redis 8.x (ephemeral) · /metrics /healthz · admin subcommands
+              +------------------- voxilian (one process) -------------------+
+Godot clients <--WS--> gateway (auth, sessions, AOI fanout) <-> sim (cells, |
+                         combat, AI, regen, advancement) <-> store (sqlc→PG) |
+                                                                            |
+  sessions/presence/rate-limits: in-memory registries (gateway-owned)        |
+              +--------------------------------------------------------------+
+PG 18 (durable) · memory (ephemeral; rebuilt on restart) · /metrics /healthz
 ```
 
 - MUST: exactly one goroutine-group owns each map cell's mutable sim state
@@ -70,7 +68,7 @@ PG 18 (durable) · Redis 8.x (ephemeral) · /metrics /healthz · admin subcomman
 - MUST: store is the only package importing pgx/sqlc output. Sim depends on a
   `Store` interface (fake-able in tests).
 - Proposed repo layout (docs only):
-  `cmd/ (serve,migrate,admin,seed)` · `internal/{config,gateway,sim,store,bus,auth,admin,observe,world}` ·
+  `cmd/ (serve,migrate,admin,seed)` · `internal/{config,gateway,sim,store,session,auth,admin,observe,world}` ·
   `migrations/` · `queries/` · `sqlc.yaml` · `compose.yaml`.
 
 ## 4. Seamless world model
@@ -119,7 +117,8 @@ PG 18 (durable) · Redis 8.x (ephemeral) · /metrics /healthz · admin subcomman
 - Connect: `wss://host/play` → `{hello, clientVersion, token}` → server
   `{welcome, serverTick, worldConstants{chunk, aoiRadius, tickRates}}` or
   `{error}`. Token = opaque session token issued at login (DECISION §13.4),
-  validated against Redis, mapped to account/character loaded from PG.
+  validated against the in-memory session registry, mapped to
+  account/character loaded from PG.
 - C→S intents: `move/{dir+flags}`, `attack/{target}`, `cast/{spell,target}`,
   `use/{skill/item}`, `get/drop/put/give`, `offer/counter/accept/cancel`,
   `buy`, `rest/stand`, `eat`, `say/say_group`, `safety_toggle`, `respawn_ack`.
@@ -134,19 +133,24 @@ PG 18 (durable) · Redis 8.x (ephemeral) · /metrics /healthz · admin subcomman
 - SHOULD: protocol version negotiated at hello; breaking changes bump
   `protoVersion` and reject old clients with a clear error.
 
-## 7. Redis usage (ephemeral only)
+## 7. In-memory ephemeral state (no external store)
 
-- Sessions: `vox:session:{token}` → `{accountID, charID, connectedAt}` TTL
-  sliding (e.g. 30 min; refresh on activity). Logout/death do NOT rely on it.
-- Presence: `vox:presence:{charID}` (TTL 60 s, heartbeat 15 s) + `vox:aoi:{charID}`
-  (current cell set, no TTL, deleted on disconnect).
-- Bus (pub/sub or streams): `vox:bus:{cellID}` for cross-gateway fanout
-  (MVP single process still publishes — keeps sharding path identical).
-- Rate limits: `vox:rl:{charID}:{intent}` counters (movement/intent caps).
-- MUST NOT store authoritative inventory/HP/spells/guild in Redis. On Redis
-  loss: sessions re-login, presence rebuilds, sim continues from memory + PG.
-- Redis persistence: AOF+RDB ON (sessions survive restart); eviction
-  `noeviction` for session DB.
+Sessions, presence, and rate limits live in gateway-owned in-memory
+registries (guarded maps / `sync.Map`; single process, no cross-instance sync).
+
+- Sessions: `token → {accountID, charID, connectedAt, lastActivity}` with
+  sliding expiry (e.g. 30 min; refresh on activity). Logout/death do NOT rely
+  on it. Token hashes stored, not raw tokens.
+- Presence: `charID → {conn, currentCells, heartbeatAt}` (heartbeat 15 s,
+  sweep every 30 s). AOI cell sets derived from sim positions, deleted on
+  disconnect.
+- Rate limits: per-character token buckets in memory (movement/intent caps).
+- Cross-cell fanout: in-process channels from sim to gateway (same shape a
+  future bus would carry, so sharding later only swaps the transport).
+- Restart semantics (accepted tradeoff of D3): sessions drop on restart —
+  clients re-login; presence rebuilds on connect; authoritative sim state
+  restores from PG snapshot + write-through ledger. MUST document this in the
+  client reconnect flow (`{error: session_expired}` → re-login → resync).
 
 ## 8. PostgreSQL schema (authoritative; migrations via goose, queries via sqlc)
 
@@ -210,12 +214,12 @@ Tables (D4; M59 property names in parens where ported):
 ## 10. Config / deployment / ops
 
 - Config: env + file (`config.yaml` default, env override `VOX_*`); MUST
-  include: PG DSN, Redis addr, WS bind, world constants path, tick rates,
+  include: PG DSN, WS bind, world constants path, tick rates,
   snapshot interval, rate limits, seed data paths, log level.
-- `compose.yaml` (dev): `postgres:18-alpine`, `redis:8-alpine`, `voxilian`
-  build target; named volumes; healthchecks; `voxilian migrate up` as init
-  step. Prod deployment target: DECISION NEEDED (§13.6).
-- Observability: `/healthz` (PG+Redis checks), `/readyz` (sim loaded),
+- `compose.yaml` (dev): `postgres:18-alpine` + `voxilian` build target;
+  named volume; healthcheck; `voxilian migrate up` as init step.
+  Prod deployment target: DECISION NEEDED (§13.6).
+- Observability: `/healthz` (PG check + sim liveness), `/readyz` (sim loaded),
   `/metrics` (ticks, AOI fanout, intent rates/errors, saver lag, WS sessions);
   structured slog with `tick`, `cell`, `charID` fields; panic → supervised
   restart with sim snapshot-on-shutdown best-effort.
@@ -225,9 +229,10 @@ Tables (D4; M59 property names in parens where ported):
 
 ## 11. Security
 
-- Passwords Argon2id; session tokens 256-bit CSPRNG, stored hashed in Redis;
-  WS requires TLS in prod (terminate at proxy or Go — DECISION §13.6).
-- Authoritative sim (§5 anti-cheat); per-intent rate limits in Redis;
+- Passwords Argon2id; session tokens 256-bit CSPRNG, only hashes kept in the
+  in-memory registry; WS requires TLS in prod (terminate at proxy or Go —
+  DECISION §13.6).
+- Authoritative sim (§5 anti-cheat); per-intent in-memory rate limits;
   movement speed/teleport anomaly detection → correct + log, ban on repeat.
 - No secrets in repo; `.env` local only; PG least-privilege role for app
   (migrate role separate).
@@ -236,7 +241,7 @@ Tables (D4; M59 property names in parens where ported):
 
 - Unit: formulas (hit/damage/regen/advancement/learn-points) with golden
   vectors from `meridian59.md`; property tests for caps/clips.
-- Integration (testcontainers PG 18 + Redis 8): creation, trade atomicity,
+- Integration (testcontainers PG 18): creation, trade atomicity,
   death/corpse/respawn, snapshot restore, double-accept race.
 - Load: bot harness (N clients random-walk + attack) measuring tick p99,
   AOI fanout bytes, saver lag — gates sharding decision with data.
@@ -253,9 +258,7 @@ Tables (D4; M59 property names in parens where ported):
    age/rating handling.
 5. **World authoring**: hand-built starter region vs procedural seed; format
    (Tiled/custom → `world.toml`?); who owns the map pipeline.
-6. **Prod target**: single VPS + compose vs managed PG/Redis vs k8s; TLS
+6. **Prod target**: single VPS + compose vs managed PG vs k8s; TLS
    termination; backups/PITR for PG.
-7. **Redis topology**: single + persistence vs Sentinel/cluster later; key
-   eviction review.
-8. **E
+7. **E
 ...[truncated 615 chars]
