@@ -426,10 +426,12 @@ Tables (D4; M59 property names in parens where ported):
   the 2-char limit **transactionally** (no app-level race); the name
   index lets deleted names be reused while live names stay globally
   unique. Display-name rules DECIDED (§9 creation rule).
-- `character_spells(character_id, spell_id INT FK → spell_protos
-  (CHECK 1..65535 via domain), ability SMALLINT 1–99, atrophy_flag BOOL)`,
-  `character_skills(character_id, skill_id INT FK → skill_protos, ...)`
-  — PK(char, id).
+- `character_spells(character_id, spell_id INTEGER FK →
+  spell_protos(id), ability SMALLINT 1–99, atrophy_flag BOOL)`,
+  `character_skills(character_id, skill_id INTEGER FK →
+  skill_protos(id), ...)` — PK(char, id). The valid 1..65535 namespace is
+  guaranteed by the referenced catalog PK rows themselves; no separate
+  SQL domain exists or is required.
 - `item_instances(id BIGINT, proto INT FK → item_protos (CHECK 1..65535), qty INT, hits INT, enchants JSONB,
   revision BIGINT, created_at)` + `item_locations(item_id PK → instances,
   kind SMALLINT (0=inventory,1=ground,2=corpse,3=vault,4=container),
