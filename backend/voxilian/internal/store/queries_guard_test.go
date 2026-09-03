@@ -10,10 +10,24 @@ import (
 	"github.com/dlukt/voxilian/internal/simtest"
 )
 
-// rootUpdateRe matches a statement-level UPDATE of a CAS aggregate root.
+// rootUpdateRe matches a statement-level UPDATE of a CAS aggregate root
+// that T7 does not own yet: item_instances (T7b) and banks (T7c).
+// characters updates moved to the file-ownership rule below (T7a).
 // It deliberately does NOT match the `DO UPDATE SET` clause inside the
 // sanctioned UpsertItemLocation (M1-T7b building block).
-var rootUpdateRe = regexp.MustCompile(`(?mi)^\s*UPDATE\s+(characters|item_instances|banks)\b`)
+var rootUpdateRe = regexp.MustCompile(`(?mi)^\s*UPDATE\s+(item_instances|banks)\b`)
+
+// characterCASOwner restricts UPDATE characters to queries/character_cas.sql.
+var characterCASFile = "character_cas.sql"
+
+var characterRootUpdateRe = regexp.MustCompile(`(?mi)^\s*UPDATE\s+characters\b`)
+
+// characterCASQueryRe allows only the two explicit T7a CAS statements.
+var characterCASQueryRe = regexp.MustCompile(`-- name: (CASUpdateCharacterSnapshot|CASSoftDeleteCharacter)\b`)
+
+// characterDeleteRe forbids physical character deletion everywhere:
+// soft-delete only, always.
+var characterDeleteRe = regexp.MustCompile(`(?mi)^\s*DELETE\s+FROM\s+characters\b`)
 
 // auditMutateRe matches statement-level UPDATE/DELETE of append-only
 // audit tables. Sanction revoke-by-delete (bans/mutes) and sanction
@@ -56,6 +70,19 @@ func TestNoMutableRootQueries(t *testing.T) {
 		}
 		if m := rootUpdateRe.FindString(string(raw)); m != "" {
 			t.Errorf("%s contains forbidden root update %q (CAS owns it in M1-T7)", name, m)
+		}
+		if m := characterRootUpdateRe.FindString(string(raw)); m != "" && name != characterCASFile {
+			t.Errorf("%s contains UPDATE characters outside %s", name, characterCASFile)
+		}
+		if m := characterDeleteRe.FindString(string(raw)); m != "" {
+			t.Errorf("%s contains forbidden %q (soft-delete only)", name, m)
+		}
+		if name == characterCASFile {
+			for _, want := range []string{"CASUpdateCharacterSnapshot", "CASSoftDeleteCharacter"} {
+				if !strings.Contains(string(raw), "-- name: "+want) {
+					t.Errorf("%s missing required query %s", name, want)
+				}
+			}
 		}
 		if m := auditMutateRe.FindString(string(raw)); m != "" {
 			t.Errorf("%s contains forbidden audit mutation %q (ledger/kills are append-only)", name, m)
