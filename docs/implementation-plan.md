@@ -48,7 +48,7 @@ Exit: `compose up` gives PG 18 + builder (migrate init step wired, no-op stub un
 - [x] **M0-T2** Config + observability skeleton. `VOX_*` env + `config.yaml` loader (§10 config list); `/healthz` (liveness stub), `/readyz` (not-ready stub), `/metrics` (Prometheus, empty registry + build info); structured `slog` with `tick/cell/charID` fields wired. Tests: config precedence (file < env), endpoint smoke tests.
 - [x] **M0-T3** Dockerfile + CI + GHCR publish. Multi-stage `Dockerfile` (build + `migrate` one-shot compatible); workflow: build, vet, fmt-check, `go test ./...`, build+push `ghcr.io/dlukt/voxilian` on `main` (prod compose pulls it, §10). Include `testcontainers-go` availability check job. (CI migration-execution check lives in M1, not here — M0 has no migrations yet.)
 - [x] **M0-T4** Test harness conventions. Fake clock + seeded RNG helpers (`internal/simtest` or similar), testcontainers PG 18 helper, golden-file helper reading repo-root `testdata/protocol/*.hex`. One example test each. Spec: §12.
-- [ ] **M0 exit criteria met** (pre-M1 meaning: image builds; default `compose up` brings postgres 18 to healthy with nothing depending on stubs; migrate/app run profile-gated; CI green. Full-stack `up` gates on M1-T8/M3.)
+- [x] **M0 exit criteria met** (pre-M1 meaning: image builds; default `compose up` brings postgres 18 to healthy with nothing depending on stubs; migrate/app run profile-gated; CI green. Full-stack `up` gates on M1-T8/M3.)
 
 ## M1 — Migrations + CAS store layer (first per reviewer order)
 
