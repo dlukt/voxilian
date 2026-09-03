@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.3 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.4 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -426,7 +426,7 @@ Tables (D4; M59 property names in parens where ported):
   unique. Display-name rules still open (§13.3).
 - `character_spells(character_id, spell_id, ability SMALLINT 1–99, atrophy_flag BOOL)`,
   `character_skills(...)` — PK(char, id).
-- `item_instances(id BIGINT, proto TEXT, qty INT, hits INT, enchants JSONB,
+- `item_instances(id BIGINT, proto SMALLINT FK → item_protos, qty INT, hits INT, enchants JSONB,
   revision BIGINT, created_at)` + `item_locations(item_id PK → instances,
   kind SMALLINT (0=inventory,1=ground,2=corpse,3=vault,4=container),
   character_id NULLABLE FK, corpse_id NULLABLE FK,
@@ -488,6 +488,29 @@ Tables (D4; M59 property names in parens where ported):
   `go:embed`; `voxilian migrate up/down/status`.
 - Migration `0001` MUST enable the `citext` extension.
 
+### 8.2 Prototype catalog tables (runtime content registry)
+
+Seed files (YAML, versioned in repo) are the SOURCE; PG catalog tables
+are the RUNTIME registry `voxilian seed` upserts into (idempotent,
+upsert by stable `u16` ID + `version` bump). Sim and gateway read
+protos/listing IDs from PG, never from files at runtime:
+
+- `spell_protos(id SMALLINT PK (stable wire ID), school SMALLINT,
+  level SMALLINT, mana INT, exertion INT, cast_ms INT, min_hp INT,
+  outlaw BOOL, harmful BOOL, reagents JSONB, params JSONB, version INT)`
+- `skill_protos(id SMALLINT PK, division SMALLINT, level SMALLINT,
+  exertion INT, params JSONB, version INT)`
+- `item_protos(id SMALLINT PK, kind SMALLINT, slot TEXT, base JSONB
+  (damage/armor/signatures per kind), version INT)`
+- `mob_protos(proto TEXT PK, level SMALLINT, difficulty SMALLINT, karma
+  INT, atk JSONB, resists JSONB, spells JSONB, loot_tid TEXT, version INT)`
+- `shop_listings(vendor_proto TEXT, listing SMALLINT, item_proto SMALLINT
+  FK → item_protos, price BIGINT, qty INT, PK(vendor_proto, listing))`
+  — the stable `114 buy{listing}` IDs.
+
+`item_instances.proto` references `item_protos.id` (SMALLINT, not TEXT);
+character spell/skill rows reference `spell_protos`/`skill_protos` IDs.
+
 ### 8.1 Persistence ordering and recovery (D7)
 
 **PG materialized state is the recovery source of truth. The ledger is an
@@ -545,7 +568,10 @@ ledger is never replayed.
 ## 9. Gameplay services (what sim MUST enforce; numbers in `meridian59.md`)
 
 - Creation: `122 character_create` validates slot 0/1 (+ transactional
-  uniqueness, §8), name (global-live-unique), 6×(1–50) + sum ≤ 200, 45-pt
+  uniqueness, §8), name — Unicode letters/marks/numbers plus space,
+  apostrophe, hyphen; NFC-normalized; 3–16 chars; case-insensitive
+  global-live-unique (CITEXT partial index); reserved + blocklist
+  (`seed/blocklist.yaml`) — 6×(1–50) + sum ≤ 200, 45-pt
   ability budget (L2=25 else 10); grant Blink + Mace + 500
   (+leaving-newbie-zone package); karma seed. All in one PG txn (§8.1).
 - Vitals/regen: HP=level (20 start, cap `100+Stam`/150); mana `15+Myst/5`
@@ -604,12 +630,12 @@ ledger is never replayed.
 - Admin (cobra `voxilian admin ...` + WS admin role): create account/character,
   grant/revoke, kick/ban, save-now, spawn/teleport (logged), give (logged,
   dev-only flag).
-- Seed data (`voxilian seed`, DECISION §13.7): all spell/skill/mob protos load
-  from versioned structured data files — one per school plus bestiary
-  (e.g. `seed/shalille.yaml`, `seed/bestiary.yaml`) — so the full-scope port
+- Seed data (`voxilian seed`, DECISION §13.7): all spell/skill/mob/item
+  protos load from versioned structured data files — one per school plus
+  bestiary (e.g. `seed/shalille.yaml`, `seed/bestiary.yaml`) — upserted
+  into the §8.2 catalog tables by stable `u16` ID, so the full-scope port
   is reviewable in chunks. Seed files are validated against the same
-  CHECK constraints as live writes; re-running seed is idempotent
-  (upsert by stable proto id).
+  CHECK constraints as live writes; re-running seed is idempotent.
 
 ## 11. Security
 
@@ -688,7 +714,7 @@ ledger is never replayed.
    per account** (second `enter_world` kicks the old world session, §6.1:
    no same-account multiboxing/self-trade by construction — reviewed and
    locked). Deleted names reusable via partial unique index.
-   Still open: display-name rules (charset/length/profanity).
+   Display names DECIDED (§9 creation rule: charset/NFC/3–16/blocklist).
 4. **Auth**: DECIDED — **external Keycloak IdP, Authorization Code + PKCE
    via system browser** (no Godot OIDC package needed: `OS.shell_open` +
    `TCPServer` loopback callback + `HTTPRequest` exchange + `HashingContext`
@@ -724,6 +750,9 @@ ledger is never replayed.
 
 ## 14. Version history
 
+- v0.3.4: planning blocker fix — §8.2 prototype catalog tables (seed
+  upsert target; SMALLINT proto FKs), display-name rules decided (§9,
+  §13.3 closed).
 - v0.3.3: spec-cleanup freeze — real SQL CHECK syntax (`IS [NOT] NULL`,
   `num_nonnulls()`), account lifecycle guard + takeover ordering (§6.1),
   cell-owner non-blocking rule (§7.1), ledger-commit wording + revision-
