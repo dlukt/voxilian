@@ -274,9 +274,11 @@ Tables (D4; M59 property names in parens where ported):
    prod instance** (dedicated database + owner user, external to compose).
    Still open: TLS termination (reverse proxy vs Go); backups/PITR for PG
    (may ride on the existing instance's policy — confirm).
-7. **MVP content scope**: which spell schools / skills / mobs ship first
-   (proposal in §9: 2 schools × 4 spells, 4 weapon skills + dodge/block/parry,
-   6 mobs) — confirm or cut further.
+7. **MVP content scope**: DECIDED — **all spell schools, all skills, all
+   mobs** (full M59 data port per `meridian59.md` §§5/7/8, not the cut-down
+   slice). Consequence: seed data must cover every school/skill/mob proto +
+   costs/effects/loot tables up front; phasing applies to meta-systems only
+   (guilds/factions/justice stay phase 2).
 8. **Protocol encoding**: stay JSON for all of MVP, or define the binary frame
    format now for movement deltas?
 
