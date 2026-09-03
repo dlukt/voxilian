@@ -18,6 +18,14 @@ func migrationsDir(t *testing.T) string {
 
 func openMigrated(t *testing.T, dsn string) *sql.DB {
 	t.Helper()
+	return openMigratedTo(t, dsn, 1)
+}
+
+// openMigratedTo migrates a fresh disposable database to exactly version.
+// Per-migration tests pin their own version so later migrations never
+// break earlier tests.
+func openMigratedTo(t *testing.T, dsn string, version int64) *sql.DB {
+	t.Helper()
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -26,8 +34,8 @@ func openMigrated(t *testing.T, dsn string) *sql.DB {
 	if err := goose.SetDialect("postgres"); err != nil {
 		t.Fatalf("dialect: %v", err)
 	}
-	if err := goose.UpTo(db, migrationsDir(t), 1); err != nil {
-		t.Fatalf("goose up to 1: %v", err)
+	if err := goose.UpTo(db, migrationsDir(t), version); err != nil {
+		t.Fatalf("goose up to %d: %v", version, err)
 	}
 	return db
 }
@@ -157,5 +165,164 @@ func TestMigration0001(t *testing.T) {
 		if tableExists(t, db, tbl) {
 			t.Fatalf("table %s survives down-to-zero", tbl)
 		}
+	}
+}
+
+// uitoa formats non-negative and negative ints without importing more.
+func uitoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		b[i] = '-'
+	}
+	return string(b[i:])
+}
+
+// TestMigration0002 proves the M1-T2 catalog schema against real
+// PostgreSQL 18. Explicit SQL fixtures only; no seed/store APIs
+// (those belong to M1-T6d/M9).
+func TestMigration0002(t *testing.T) {
+	pg := simtest.StartPostgres18(t)
+	db := openMigratedTo(t, pg.DSN, 2)
+
+	// 1: goose reaches exactly version 2.
+	var ver int64
+	if err := db.QueryRow(`SELECT version_id FROM goose_db_version ORDER BY version_id DESC LIMIT 1`).Scan(&ver); err != nil {
+		t.Fatalf("goose version: %v", err)
+	}
+	if ver != 2 {
+		t.Fatalf("goose version = %d, want 2", ver)
+	}
+
+	// 2: all five new tables exist.
+	tables := []string{"spell_protos", "skill_protos", "item_protos", "mob_protos", "shop_listings"}
+	for _, tbl := range tables {
+		if !tableExists(t, db, tbl) {
+			t.Fatalf("table %s missing", tbl)
+		}
+	}
+
+	// 3: id columns are integer, not smallint (u16 wire range needs it).
+	for _, tbl := range []string{"spell_protos", "skill_protos", "item_protos", "mob_protos"} {
+		var typ string
+		q := `SELECT data_type FROM information_schema.columns WHERE table_name = $1 AND column_name = 'id'`
+		if err := db.QueryRow(q, tbl).Scan(&typ); err != nil || typ != "integer" {
+			t.Fatalf("%s.id type = %q, %v; want integer", tbl, typ, err)
+		}
+	}
+	var listTyp string
+	if err := db.QueryRow(`SELECT data_type FROM information_schema.columns WHERE table_name = 'shop_listings' AND column_name = 'listing'`).Scan(&listTyp); err != nil || listTyp != "integer" {
+		t.Fatalf("shop_listings.listing type = %q, %v; want integer", listTyp, err)
+	}
+
+	protos := []string{"spell_protos", "skill_protos", "item_protos", "mob_protos"}
+
+	// 4-5: boundary IDs 1 and 65535 succeed in every proto table.
+	for _, tbl := range protos {
+		for _, id := range []int{1, 65535} {
+			if _, err := db.Exec(withID(tbl, id)); err != nil {
+				t.Fatalf("insert %s id=%d: %v", tbl, id, err)
+			}
+		}
+	}
+
+	// 6-8: 0 and 65536 rejected by each table's range CHECK.
+	// (IDs 1/65535 above are taken, so negatives use fresh keys.)
+	for _, tbl := range protos {
+		for _, id := range []int{0, 65536} {
+			_, err := db.Exec(withID(tbl, id))
+			if err == nil || !strings.Contains(err.Error(), tbl+"_id_check") {
+				t.Fatalf("%s id=%d err = %v, want %s_id_check", tbl, id, err, tbl)
+			}
+		}
+	}
+
+	// 9: duplicate mob key rejected.
+	if _, err := db.Exec(`INSERT INTO mob_protos (id,key,level,difficulty,karma,atk,resists,spells,loot_tid,version) VALUES (100,'dup-key',1,1,0,'{}','{}','{}',NULL,1)`); err != nil {
+		t.Fatalf("insert dup-key base: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO mob_protos (id,key,level,difficulty,karma,atk,resists,spells,loot_tid,version) VALUES (101,'dup-key',1,1,0,'{}','{}','{}',NULL,1)`); err == nil ||
+		!strings.Contains(err.Error(), "mob_protos_key_key") {
+		t.Fatalf("duplicate mob key err = %v, want mob_protos_key_key", err)
+	}
+
+	// 10: valid mob + item + shop listing insert.
+	mustExec(t, db, `INSERT INTO mob_protos (id,key,level,difficulty,karma,atk,resists,spells,loot_tid,version) VALUES (200,'vendor-a',45,6,-40,'{}','{}','{}','TID_ORC',1)`)
+	mustExec(t, db, `INSERT INTO item_protos (id,kind,slot,base,version) VALUES (300,2,'mainhand','{}',1)`)
+	mustExec(t, db, `INSERT INTO shop_listings (vendor_id,listing,item_proto,price,qty) VALUES (200,1,300,150,10)`)
+
+	// 11-12: unknown vendor/item FKs rejected.
+	if _, err := db.Exec(`INSERT INTO shop_listings (vendor_id,listing,item_proto,price,qty) VALUES (9999,1,300,1,1)`); err == nil ||
+		!strings.Contains(err.Error(), "violates foreign key constraint") {
+		t.Fatalf("bad vendor err = %v, want FK violation", err)
+	}
+	if _, err := db.Exec(`INSERT INTO shop_listings (vendor_id,listing,item_proto,price,qty) VALUES (200,2,9999,1,1)`); err == nil ||
+		!strings.Contains(err.Error(), "violates foreign key constraint") {
+		t.Fatalf("bad item err = %v, want FK violation", err)
+	}
+
+	// 13: listing 0 / 65536 rejected.
+	for _, l := range []int{0, 65536} {
+		q := `INSERT INTO shop_listings (vendor_id,listing,item_proto,price,qty) VALUES (200,` + uitoa(l) + `,300,1,1)`
+		if _, err := db.Exec(q); err == nil || !strings.Contains(err.Error(), "shop_listings_listing_check") {
+			t.Fatalf("listing=%d err = %v, want shop_listings_listing_check", l, err)
+		}
+	}
+
+	// 14: duplicate (vendor, listing) rejected.
+	if _, err := db.Exec(`INSERT INTO shop_listings (vendor_id,listing,item_proto,price,qty) VALUES (200,1,300,1,1)`); err == nil ||
+		!strings.Contains(err.Error(), "shop_listings_pkey") {
+		t.Fatalf("duplicate listing err = %v, want shop_listings_pkey", err)
+	}
+
+	// 15: same listing number on a different vendor is fine.
+	mustExec(t, db, `INSERT INTO mob_protos (id,key,level,difficulty,karma,atk,resists,spells,loot_tid,version) VALUES (201,'vendor-b',1,1,0,'{}','{}','{}',NULL,1)`)
+	mustExec(t, db, `INSERT INTO shop_listings (vendor_id,listing,item_proto,price,qty) VALUES (201,1,300,99,5)`)
+
+	// 16: down 2 → 1 removes all five M1-T2 tables.
+	if err := goose.DownTo(db, migrationsDir(t), 1); err != nil {
+		t.Fatalf("goose down to 1: %v", err)
+	}
+	for _, tbl := range tables {
+		if tableExists(t, db, tbl) {
+			t.Fatalf("table %s survives down-to-1", tbl)
+		}
+	}
+
+	// 17: M1-T1 tables still exist; version is 1.
+	for _, tbl := range []string{"accounts", "characters"} {
+		if !tableExists(t, db, tbl) {
+			t.Fatalf("table %s lost by down-to-1", tbl)
+		}
+	}
+	if err := db.QueryRow(`SELECT version_id FROM goose_db_version ORDER BY version_id DESC LIMIT 1`).Scan(&ver); err != nil || ver != 1 {
+		t.Fatalf("version after down = %d, %v; want 1", ver, err)
+	}
+}
+
+// withID rebuilds a proto insert at an arbitrary id for negative tests.
+func withID(table string, id int) string {
+	switch table {
+	case "mob_protos":
+		return "INSERT INTO mob_protos (id,key,level,difficulty,karma,atk,resists,spells,loot_tid,version) VALUES (" + uitoa(id) + ",'neg-" + uitoa(id) + "',1,1,0,'{}','{}','{}',NULL,1)"
+	case "spell_protos":
+		return "INSERT INTO spell_protos (id,school,level,mana,exertion,cast_ms,min_hp,outlaw,harmful,reagents,params,version) VALUES (" + uitoa(id) + ",1,1,1,1,0,1,false,false,'{}','{}',1)"
+	case "skill_protos":
+		return "INSERT INTO skill_protos (id,division,level,exertion,params,version) VALUES (" + uitoa(id) + ",1,1,1,'{}',1)"
+	default: // item_protos
+		return "INSERT INTO item_protos (id,kind,slot,base,version) VALUES (" + uitoa(id) + ",0,NULL,'{}',1)"
 	}
 }
