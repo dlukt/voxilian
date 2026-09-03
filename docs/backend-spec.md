@@ -13,6 +13,7 @@
 | D3 | Topology | **Single world process** for MVP. Sessions, presence, and rate limits are in-process memory. No Redis, no external bus. Spatial workers are a later scale-out, designed for but not built |
 | D4 | Persistence | **Snapshot + write-through**: PG is authoritative; sim keeps hot state in memory, snapshots every N sec + write-through on critical events (death, trade, logout, guild/faction change) |
 | D5 | DB stack | **PostgreSQL 18 + pgx + sqlc + goose**. No other datastore. Current pinned versions in §2 |
+| D6 | Auth | **External Keycloak IdP (OIDC)**. Godot client uses Authorization Code + PKCE via system browser; backend validates access JWTs via cached JWKS and never sees passwords (DECISION §13.4) |
 
 ## 1. Goals / non-goals
 
@@ -44,6 +45,7 @@ server-reconcile, browser/web export specifics.
 | goose | `github.com/pressly/goose/v3` **v3.27.x** | `migrations/*.sql`, embed + `voxilian migrate` cobra subcommand |
 | CLI | cobra (already `v1.10.2` in `go.mod`) | `voxilian serve / migrate / admin / seed` |
 | WS | `github.com/coder/websocket` (current) | Pick over archived gorilla; single maintained dep |
+| OIDC/JWT | TBD at implementation (`lestrrat-go/jwx` v3 vs `golang-jwt/jwt` + JWKS fetch) | Access-token validation against Keycloak JWKS (D6) |
 | Logging | `log/slog` (stdlib) | JSON in prod, text in dev |
 | Metrics | Prometheus client (current) + `/metrics` | Counters/histograms per §11 |
 | Testing | stdlib + `testcontainers-go` (current) for PG integration | Unit sim with fake clock/store |
@@ -116,11 +118,16 @@ PG 18 (durable) · memory (ephemeral; rebuilt on restart) · /metrics /healthz
 
 ## 6. WebSocket protocol (v0 envelopes, JSON)
 
-- Connect: `wss://host/play` → `{hello, clientVersion, token}` → server
-  `{welcome, serverTick, worldConstants{chunk, aoiRadius, tickRates},
-  world{mode, seed, version}}` or `{error}`. Token = opaque session token issued at login (DECISION §13.4),
-  validated against the in-memory session registry, mapped to
-  account/character loaded from PG.
+- Connect: `wss://host/play` → `{hello, clientVersion, accessToken}` →
+  server `{welcome, serverTick, worldConstants{chunk, aoiRadius, tickRates},
+  world{mode, seed, version}}` or `{error}`. `accessToken` = Keycloak access
+  JWT (D6), validated against cached JWKS (`iss`/`aud`/expiry checked),
+  `sub` mapped to account (auto-provisioned on first login, §8) and
+  character loaded from PG.
+- Re-auth (no reconnect): when the client refreshes tokens it sends
+  `{reauth, accessToken}` over the existing WS; server swaps the principal
+  on the live session and replies `{reauth_ok}` or `{error:
+  session_expired}` (→ client re-runs the browser login, then resyncs).
 - C→S intents: `move/{dir+flags}`, `attack/{target}`, `cast/{spell,target}`,
   `use/{skill/item}`, `get/drop/put/give`, `offer/counter/accept/cancel`,
   `buy`, `rest/stand`, `eat`, `say/say_group`, `safety_toggle`, `respawn_ack`.
@@ -140,9 +147,10 @@ PG 18 (durable) · memory (ephemeral; rebuilt on restart) · /metrics /healthz
 Sessions, presence, and rate limits live in gateway-owned in-memory
 registries (guarded maps / `sync.Map`; single process, no cross-instance sync).
 
-- Sessions: `token → {accountID, charID, connectedAt, lastActivity}` with
-  sliding expiry (e.g. 30 min; refresh on activity). Logout/death do NOT rely
-  on it. Token hashes stored, not raw tokens.
+- Sessions: `sub(accountID) → {charID, conn, connectedAt, tokenExp}` keyed
+  by Keycloak `sub`, not by opaque token. Game session lives as long as the
+  WS is up and the client keeps re-authing; expiry of one access token does
+  NOT drop the session. Logout/death do NOT rely on it.
 - Presence: `charID → {conn, currentCells, heartbeatAt}` (heartbeat 15 s,
   sweep every 30 s). AOI cell sets derived from sim positions, deleted on
   disconnect.
@@ -157,8 +165,10 @@ registries (guarded maps / `sync.Map`; single process, no cross-instance sync).
 ## 8. PostgreSQL schema (authoritative; migrations via goose, queries via sqlc)
 
 Tables (D4; M59 property names in parens where ported):
-- `accounts(id, email CITEXT UNIQUE, password_hash, created_at)`; Argon2id
-  hashes (PHC string), never plaintext.
+- `accounts(id, keycloak_sub TEXT UNIQUE NOT NULL, email CITEXT, created_at)`;
+  no passwords anywhere — credentials, reset, registration, and mails live in
+  Keycloak. First login with an unknown `sub` auto-provisions a row, then
+  in-game character creation applies (max 2 chars, §13.3).
 - `characters(id, account_id FK, name CITEXT UNIQUE, gender, face JSONB,
   might/intellect/stamina/agility/mysticism/aim SMALLINT,
   karma INT, hometown TEXT, pos POINT/double[3], vitals JSONB
@@ -244,9 +254,14 @@ Tables (D4; M59 property names in parens where ported):
 
 ## 11. Security
 
-- Passwords Argon2id; session tokens 256-bit CSPRNG, only hashes kept in the
-  in-memory registry; WS requires TLS in prod (terminate at proxy or Go —
-  DECISION §13.6).
+- Auth (D6): no local credentials — no password hashes, no reset/mails in the
+  backend. Keycloak public client, Authorization Code + PKCE (S256), loopback
+  redirect; scopes `openid profile email` (+ `offline_access` for refresh
+  tokens surviving restarts). No client secret in the game binary; direct
+  grants forbidden. Backend validates access JWTs against cached JWKS
+  (`iss`/`aud`/expiry/signature; key rotation via cache TTL + backoff);
+  rejects expired/misissued tokens with `{error: session_expired}`.
+- WS requires TLS in prod (terminate at proxy or Go — DECISION §13.6).
 - Authoritative sim (§5 anti-cheat); per-intent in-memory rate limits;
   movement speed/teleport anomaly detection → correct + log, ban on repeat.
 - No secrets in repo; `.env` local only; prod PG uses a dedicated database +
@@ -273,8 +288,13 @@ Tables (D4; M59 property names in parens where ported):
 3. **Characters/account limits**: DECIDED — **2/account** (enforced
    app-level on active/non-deleted characters). Still open: name rules,
    deletion semantics.
-4. **Session token format + expiry**, password-reset flow (out of scope MVP?),
-   age/rating handling.
+4. **Auth**: DECIDED — **external Keycloak IdP, Authorization Code + PKCE
+   via system browser** (no Godot OIDC package needed: `OS.shell_open` +
+   `TCPServer` loopback callback + `HTTPRequest` exchange + `HashingContext`
+   S256; direct grants forbidden as insecure). Registration/reset/mails stay
+   in Keycloak. Access JWT ~5 min + `reauth` over live WS; refresh via
+   `offline_access`. Still open: Keycloak realm/client names, access-token
+   TTL, age/rating handling.
 5. **World authoring**: DECIDED — **two modes**: `classic` (hand-authored,
    M59-faithful regions for returning players; more work, ships incrementally
    starting with the starter region) and `procedural` (deterministic
