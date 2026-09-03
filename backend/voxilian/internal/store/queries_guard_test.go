@@ -20,9 +20,25 @@ var rootUpdateRe = regexp.MustCompile(`(?mi)^\s*UPDATE\s+(characters|item_instan
 // ON CONFLICT replacement are normative and NOT matched here.
 var auditMutateRe = regexp.MustCompile(`(?mi)^\s*(UPDATE\s+ledger|DELETE\s+FROM\s+ledger|UPDATE\s+kills|DELETE\s+FROM\s+kills)\b`)
 
+// catalogAccessRe matches production SQL touching catalog tables. Only
+// queries/catalogs.sql may do so (M1-T6d owns all catalog access).
+// Comments are stripped first so prose like "never UPDATE ledger" or
+// "catalog tables: ..." cannot trip the guard.
+var catalogTables = []string{"spell_protos", "skill_protos", "item_protos", "mob_protos", "shop_listings"}
+
+var catalogAccessRe = regexp.MustCompile(`(?is)\b(SELECT\b[^;]*?\bFROM\s+(?:spell_protos|skill_protos|item_protos|mob_protos|shop_listings)\b|INSERT\s+INTO\s+(?:spell_protos|skill_protos|item_protos|mob_protos|shop_listings)\b|UPDATE\s+(?:spell_protos|skill_protos|item_protos|mob_protos|shop_listings)\b|DELETE\s+FROM\s+(?:spell_protos|skill_protos|item_protos|mob_protos|shop_listings)\b)`)
+
+var sqlLineCommentRe = regexp.MustCompile(`(?m)--[^\n]*$`)
+
+func stripSQLComments(s string) string {
+	return sqlLineCommentRe.ReplaceAllString(s, "")
+}
+
 // TestNoMutableRootQueries guards the D7 escape hatch: before M1-T7a/b/c,
 // no production query source may contain a root UPDATE on characters,
-// item_instances, or banks. Raw SQL inside *_test.go files is excluded.
+// item_instances, or banks. It also guards ledger/kills append-only and
+// catalog-table isolation (only queries/catalogs.sql may touch catalogs).
+// Raw SQL inside *_test.go files is excluded.
 func TestNoMutableRootQueries(t *testing.T) {
 	queries := filepath.Join(simtest.RepoRoot(t), "backend", "voxilian", "queries")
 	entries, err := os.ReadDir(queries)
@@ -43,6 +59,12 @@ func TestNoMutableRootQueries(t *testing.T) {
 		}
 		if m := auditMutateRe.FindString(string(raw)); m != "" {
 			t.Errorf("%s contains forbidden audit mutation %q (ledger/kills are append-only)", name, m)
+		}
+		if name == "catalogs.sql" {
+			continue
+		}
+		if m := catalogAccessRe.FindString(stripSQLComments(string(raw))); m != "" {
+			t.Errorf("%s touches catalog tables %q (only catalogs.sql may; M1-T6d)", name, m)
 		}
 	}
 }
