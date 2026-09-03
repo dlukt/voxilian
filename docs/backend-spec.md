@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.2 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.3 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -263,7 +263,14 @@ account simultaneous play/multiboxing and self-trading are therefore
 impossible by construction. `enter_world` arbitration MUST be serialized
 per account (mutex/actor-owned registry op in the single process) so two
 simultaneous `enter_world` requests cannot both transiently reach
-`IN_WORLD`.
+`IN_WORLD`. The same account lifecycle guard serializes `enter_world`,
+`leave_world`, forced takeover, AND character deletion: deleting the
+currently `IN_WORLD` character returns `202 error{character_in_use}`;
+on forced takeover of the same character the old actor is
+quiesced/flushed (or its session directly rebound) BEFORE the
+replacement finishes its baseline and receives `world_ready` — a new
+connection MUST NOT load stale PG state while the old connection still
+holds dirty in-memory state.
 
 ### 6.2 Connect / re-auth
 
@@ -386,7 +393,11 @@ registries (guarded maps / `sync.Map`; single process, no cross-instance sync).
   violation.
 - Same principle internally: sim→gateway channels are bounded with
   defined overload behavior (shed newest movement first, never critical
-  events; count + log). Unbounded queues are a spec violation.
+  events; count + log). Cell-owner goroutines MUST NOT block indefinitely
+  on gateway delivery; critical-lane saturation fails closed by
+  disconnecting/resyncing the affected sessions rather than dropping the
+  event or stalling the simulation. Unbounded queues are a spec
+  violation.
 
 ## 8. PostgreSQL schema (authoritative; migrations via goose, queries via sqlc)
 
@@ -423,21 +434,27 @@ Tables (D4; M59 property names in parens where ported):
   vault_region TEXT NULLABLE, pos_x/pos_y/pos_z NULLABLE BIGINT mm,
   slot TEXT NULLABLE,
   CHECK (
-    (kind=0 AND character_id NOT NULL AND slot NOT NULL
-      AND corpse_id NULL AND container_item_id NULL AND vault_region NULL
-      AND pos_x NULL AND pos_y NULL AND pos_z NULL) OR
-    (kind=1 AND pos_x NOT NULL AND pos_y NOT NULL AND pos_z NOT NULL
-      AND character_id NULL AND corpse_id NULL
-      AND container_item_id NULL AND vault_region NULL AND slot NULL) OR
-    (kind=2 AND corpse_id NOT NULL AND character_id NULL
-      AND container_item_id NULL AND vault_region NULL AND slot NULL
-      AND pos_x NULL AND pos_y NULL AND pos_z NULL) OR
-    (kind=3 AND character_id NOT NULL AND vault_region NOT NULL
-      AND slot NOT NULL AND corpse_id NULL AND container_item_id NULL
-      AND pos_x NULL AND pos_y NULL AND pos_z NULL) OR
-    (kind=4 AND container_item_id NOT NULL AND slot NOT NULL
-      AND character_id NULL AND corpse_id NULL AND vault_region NULL
-      AND pos_x NULL AND pos_y NULL AND pos_z NULL)
+    (kind=0 AND character_id IS NOT NULL AND slot IS NOT NULL
+      AND corpse_id IS NULL AND container_item_id IS NULL
+      AND vault_region IS NULL
+      AND pos_x IS NULL AND pos_y IS NULL AND pos_z IS NULL) OR
+    (kind=1 AND pos_x IS NOT NULL AND pos_y IS NOT NULL
+      AND pos_z IS NOT NULL
+      AND character_id IS NULL AND corpse_id IS NULL
+      AND container_item_id IS NULL AND vault_region IS NULL
+      AND slot IS NULL) OR
+    (kind=2 AND corpse_id IS NOT NULL AND character_id IS NULL
+      AND container_item_id IS NULL AND vault_region IS NULL
+      AND slot IS NULL
+      AND pos_x IS NULL AND pos_y IS NULL AND pos_z IS NULL) OR
+    (kind=3 AND character_id IS NOT NULL AND vault_region IS NOT NULL
+      AND slot IS NOT NULL AND corpse_id IS NULL
+      AND container_item_id IS NULL
+      AND pos_x IS NULL AND pos_y IS NULL AND pos_z IS NULL) OR
+    (kind=4 AND container_item_id IS NOT NULL AND slot IS NOT NULL
+      AND character_id IS NULL AND corpse_id IS NULL
+      AND vault_region IS NULL
+      AND pos_x IS NULL AND pos_y IS NULL AND pos_z IS NULL)
   ),
   CHECK (container_item_id IS NULL OR container_item_id <> item_id)
   -- no immediate self-containment. Deeper ancestry cycles (A→B→A) are
@@ -450,9 +467,10 @@ Tables (D4; M59 property names in parens where ported):
   PK(character_id, system))` (two systems like M59: Tos/Jasper-shared vs
   Kocatan — rename to world regions later).
 - `ledger(id BIGINT, kind SMALLINT, actor_account_id NULLABLE FK,
-  actor_character_id NULLABLE FK, CHECK exactly one NOT NULL,
+  actor_character_id NULLABLE FK,
+  CHECK (num_nonnulls(actor_account_id, actor_character_id) = 1),
   cpty_account_id/cpty_character_id NULLABLE FK (both NULL = system/mint,
-  CHECK at most one NOT NULL),
+  CHECK (num_nonnulls(cpty_account_id, cpty_character_id) <= 1)),
   amount BIGINT NULLABLE, qty INT NULLABLE, item_id NULLABLE FK,
   created_at)` — append-only money/item movements (trade/bank/vault/loot).
 - `kills(id BIGINT, killer_kind SMALLINT (0=character,1=mob),
@@ -479,9 +497,11 @@ ledger is never replayed.
 
 - Critical operations (death, trade accept, char create/delete, logout
   flush, +1 HP / +1% milestones, guild/faction phase-2 changes) update
-  materialized state **and** append ledger rows **atomically in one PG
-  transaction**. A crash between the two MUST be impossible by
-  construction, not by cleanup.
+  materialized state transactionally; whenever the operation produces
+  ledger/audit rows, those rows commit in the SAME transaction — there
+  are no meaningless ledger entries for pure-state ops like logout, and
+  a crash between state and audit MUST be impossible by construction,
+  not by cleanup.
 - Every mutable persisted **aggregate root** carries a monotonic
   `revision BIGINT` (characters, item_instances, banks — NOT child rows
   like `character_spells`/`character_skills`/`item_locations`, which are
@@ -497,10 +517,10 @@ ledger is never replayed.
 
   Invariant: expected revision matches → this write owns the aggregate;
   anything else → stale/conflicting write, abort the txn, log + count a
-  metric. An async 60 s snapshot holding stale state therefore affects 0
-  rows and can never overwrite a newer critical write. The saver works
-  off a per-entity dirty queue carrying the exact revision it read; it
-  never re-reads-and-blind-writes.
+  metric. `revision` is the PERSISTED CAS generation: it increments only
+  when a PG write commits, NOT on every in-memory sim mutation. The saver
+  works off a per-entity dirty queue carrying the exact revision it read;
+  it never re-reads-and-blind-writes.
 - Restart recovery: load newest materialized rows (any revision), rebuild
   sim, resume timers from stored due-times. Crash/panic is assumed to
   bypass ALL cleanup — survival comes from the txn + revision rules
@@ -666,8 +686,8 @@ ledger is never replayed.
 3. **Characters/account limits**: DECIDED — **2/account** (slots 0/1,
    partial unique index — transactional, §8) **and one `IN_WORLD` session
    per account** (second `enter_world` kicks the old world session, §6.1:
-   no same-account multiboxing/self-trade by construction — vetoable, say
-   so if you want it). Deleted names reusable via partial unique index.
+   no same-account multiboxing/self-trade by construction — reviewed and
+   locked). Deleted names reusable via partial unique index.
    Still open: display-name rules (charset/length/profanity).
 4. **Auth**: DECIDED — **external Keycloak IdP, Authorization Code + PKCE
    via system browser** (no Godot OIDC package needed: `OS.shell_open` +
@@ -704,6 +724,10 @@ ledger is never replayed.
 
 ## 14. Version history
 
+- v0.3.3: spec-cleanup freeze — real SQL CHECK syntax (`IS [NOT] NULL`,
+  `num_nonnulls()`), account lifecycle guard + takeover ordering (§6.1),
+  cell-owner non-blocking rule (§7.1), ledger-commit wording + revision-
+  as-persisted-generation (§8.1). Architecture phase closed after this.
 - v0.3.2: correctness pass — chunks to reliable lane + `world_ready`
   barrier (§7.1, §6.1), CAS-only aggregate revisions (§8.1, D7), XYZ +
   self-containment CHECKs (§8), post-commit reload rule + bounded opID
