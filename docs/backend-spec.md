@@ -641,6 +641,32 @@ ledger is never replayed.
   the partial indexes), and cannot win a revision race against a
   concurrent save/delete on the same expected revision.
 
+- Normal item snapshot CAS. The saver may update `qty`, `hits`,
+  `enchants`, `revision`, plus the complete `item_locations` row — and
+  nothing else (`id`, `proto`, `created_at` are creation identity; a
+  future proto change would need its own explicit root-CAS operation). A
+  successful save always leaves exactly one persisted location row.
+  Order: root CAS → (if container destination) containment serialization
+  + ancestry validation → upsert complete location → commit; any failure
+  rolls everything back.
+
+- Container-cycle rule: an item's `container_item_id` ancestry MUST be
+  acyclic. A placement is rejected if the destination is the moving item
+  itself, if destination ancestry reaches the moving item, or if the
+  destination ancestry is already cyclic. The SQL self-containment CHECK
+  stays as defense-in-depth.
+
+- Containment concurrency rule (MVP): all saves creating/replacing a
+  containment edge (`kind = 4`) serialize ancestry-check + location-write
+  through ONE transaction-scoped PostgreSQL advisory lock shared by the
+  item-containment graph. Order stays root-CAS FIRST, then lock, then
+  check, then write — under plain READ COMMITTED, so a waiter sees edges
+  committed by the previous holder. Without this, two roots racing
+  `A → B` / `B → A` could both pass root CAS (different rows) against
+  the same acyclic pre-state. Non-container moves need no lock (they
+  remove edges). No triggers, no recursive SQL constraints, no
+  distributed locks, no migration.
+
 ## 9. Gameplay services (what sim MUST enforce; numbers in `meridian59.md`)
 
 - Creation: `122 character_create` validates slot 0/1 (+ transactional
