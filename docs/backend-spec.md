@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.1 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.2 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -154,6 +154,15 @@ normative NOW so sharding later is a transport change, not a rewrite:
     time + worker + counter); all receivers idempotent. This preserves
     the single-writer invariant while actually allowing HP and
     inventories to change across boundaries.
+  - Post-commit delivery failure: if the PG transaction committed but an
+    in-memory commit notification never reaches/applies on an owning
+    cell, that aggregate MUST be reloaded/reconciled from PG before it
+    accepts further mutating intents. PG is authoritative — recovery is
+    reload, never "make the notification transactional".
+  - `opID` dedupe is bounded, not infinite: per-entity/cell recent-`opID`
+    cache covering at least the maximum internal retry/handoff window;
+    entity handoff carries the recent dedupe state so a retry across a
+    handoff cannot double-apply.
 
 ## 6. WebSocket protocol (binary, versioned — DECISION §13.8)
 
@@ -251,9 +260,10 @@ Duplicate login / multibox (LOCKED): **one `IN_WORLD` session per
 account.** A second `enter_world` (same or other character) kicks the
 old world session (`202 error{kicked}`) and binds the new one. Same-
 account simultaneous play/multiboxing and self-trading are therefore
-impossible by construction. (Vetoable product call — flagged
-explicitly; the mechanism above is what would also enforce the
-alternative.)
+impossible by construction. `enter_world` arbitration MUST be serialized
+per account (mutex/actor-owned registry op in the single process) so two
+simultaneous `enter_world` requests cannot both transiently reach
+`IN_WORLD`.
 
 ### 6.2 Connect / re-auth
 
@@ -272,12 +282,14 @@ alternative.)
 
 - C→S gameplay intents (`102–120`, `126`, `IN_WORLD` only except `126`):
   `102 move {inputSeq u32, heldDirs u8 bitmask, runFlag u8, yaw u16}`
-  (intents only — client-sent positions rejected; `inputSeq` is the
-  client's monotonic input counter; `yaw` carries facing/heading since
-  `angle` in `205` would otherwise have no C→S source; header `tick` =
-  sampling tick, §6 framing), `103 attack {target u32 NetEntityID}`,
-  `104 cast {spell u16 stable, target u32}`, `105 use {kind u8
-  (0=skill→stable u16 ID, 1=item→NetEntityID u32), id u32}`,
+  (`inputSeq` uses the same modulo-2³² serial arithmetic as header `seq`;
+  intents only — client-sent positions rejected; `yaw` carries
+  facing/heading since `angle` in `205` would otherwise have no C→S
+  source; header `tick` = sampling tick, §6 framing), `103 attack
+  {target u32 NetEntityID}`, `104 cast {spell u16 stable, target u32}`,
+  `105 use {kind u8, id u32}` (fixed `u32` union payload: `kind=0 skill`
+  → `id` MUST fit `u16` stable skill ID; `kind=1 item` → `id` is
+  NetEntityID),
   `106 get {entity u32, item u32}`, `107 drop {item u32}`,
   `108 put {item u32, container u32}`, `109 give {target u32, item u32,
   qty u16}`, `110 offer {target u32, items {count u16 + u32[..]}}`,
@@ -293,15 +305,17 @@ alternative.)
   where `entityEntry = {entity u32 NetEntityID, kind u8, pos, angle u16,
   speed u8}`, `204 entity_create {entityEntry}`, `205 entity_move
   {entity u32, pos, angle u16, speed u8, lastProcessedInputSeq u32}`
-  (the client's own character entry carries the newest input the server
-  has integrated — the reconciliation anchor), `206 entity_remove
+  (the reconciliation anchor for the client's OWN character only; for
+  entities not controlled by this session it MUST be 0 and MUST be
+  ignored by the client), `206 entity_remove
   {entity u32}`, `207 stat {entity u32, statId u8, value/min/max/curmax
   i32}` (M59 shape — reuse for HUD), `208 stat_group {entity u32, count
   u16 + [[u16 entryLen]{statId u8, value/min/max/curmax i32}]...}`,
   `209 said {from u32, channel u8, text string}`, `210 effect {id u16,
-  target u32, pos}`, `211 inventory_delta {count u16 + [[u16
-  entryLen]{item u32 NetEntityID, proto u16 stable, qty u16, slotLen…
-  }…]}` (full entry layout fixed at implementation; entry-framed),
+  target u32, pos}`,   `211 inventory_delta {count u16 + [[u16
+  entryLen]{item u32 NetEntityID, proto u16 stable, qty u16, ...}]...}`
+  (full entry layout frozen at implementation per §13 entry-schema task;
+  entry-framed so the protocol is unaffected),
   `212 offer_update {with u32, state u8, count u16 + [[u16 entryLen]{item
   u32, qty u16}]...}`, `213 trade_result {ok u8}`, `214 death {victim
   u32}`, `215 respawn {pos}`, `218 chunk_fragment {cell, chunkIdx u32,
@@ -356,11 +370,20 @@ registries (guarded maps / `sync.Map`; single process, no cross-instance sync).
   reconnect performs a full resync (§6.1). Saturation is a first-class
   metric (`vox_session_drops_total`, queue-depth histograms).
 - Lanes: the outbound path is TWO lanes — a coalescible-state lane
-  (movement, `entity_move`, chunk fragments: newest wins) and a
-  control/critical lane (everything else, ordered, never dropped). If the
-  critical lane itself fills, the affected sessions are disconnected
-  rather than stalling the sim — blocking a cell worker on a slow client
-  is a spec violation.
+  (`entity_move` and other absolute/latest-state deltas: newest wins) and
+  a control/critical lane (everything else, ordered, never dropped).
+  `218 chunk_fragment` is in the RELIABLE lane, never coalescible: a
+  fragment is not replaceable state, dropping one corrupts the chunk with
+  no replay protocol. Pace PRODUCTION instead — if the reliable queue
+  cannot accept another fragment, stop producing chunk data for that
+  session until it drains; past the configured limit/deadline, disconnect
+  and let reconnect/full-resync recover. `219 world_ready` is a barrier:
+  all baseline snapshots and required classic-mode fragments MUST have
+  been written to the socket before `world_ready`. (WS order + reliability
+  then needs no fragment ACK/retransmission for MVP.) If the critical
+  lane itself fills, the affected sessions are disconnected rather than
+  stalling the sim — blocking a cell worker on a slow client is a spec
+  violation.
 - Same principle internally: sim→gateway channels are bounded with
   defined overload behavior (shed newest movement first, never critical
   events; count + log). Unbounded queues are a spec violation.
@@ -402,18 +425,23 @@ Tables (D4; M59 property names in parens where ported):
   CHECK (
     (kind=0 AND character_id NOT NULL AND slot NOT NULL
       AND corpse_id NULL AND container_item_id NULL AND vault_region NULL
-      AND pos_x NULL) OR
-    (kind=1 AND pos_x NOT NULL AND character_id NULL AND corpse_id NULL
+      AND pos_x NULL AND pos_y NULL AND pos_z NULL) OR
+    (kind=1 AND pos_x NOT NULL AND pos_y NOT NULL AND pos_z NOT NULL
+      AND character_id NULL AND corpse_id NULL
       AND container_item_id NULL AND vault_region NULL AND slot NULL) OR
     (kind=2 AND corpse_id NOT NULL AND character_id NULL
-      AND container_item_id NULL AND vault_region NULL AND slot NULL) OR
+      AND container_item_id NULL AND vault_region NULL AND slot NULL
+      AND pos_x NULL AND pos_y NULL AND pos_z NULL) OR
     (kind=3 AND character_id NOT NULL AND vault_region NOT NULL
       AND slot NOT NULL AND corpse_id NULL AND container_item_id NULL
-      AND pos_x NULL) OR
+      AND pos_x NULL AND pos_y NULL AND pos_z NULL) OR
     (kind=4 AND container_item_id NOT NULL AND slot NOT NULL
       AND character_id NULL AND corpse_id NULL AND vault_region NULL
-      AND pos_x NULL)
-  ))`. One row in `item_locations` = one location: SQL itself makes
+      AND pos_x NULL AND pos_y NULL AND pos_z NULL)
+  ),
+  CHECK (container_item_id IS NULL OR container_item_id <> item_id)
+  -- no immediate self-containment. Deeper ancestry cycles (A→B→A) are
+  -- rejected by the sim/store transaction at move time, not by SQL.)`. One row in `item_locations` = one location: SQL itself makes
   “item simultaneously in inventory and corpse” impossible. No separate
   `corpse_items`/`vaults-item` tables.
 - `corpses(id BIGINT, character_id FK, pos_x/pos_y/pos_z BIGINT mm,
@@ -454,14 +482,25 @@ ledger is never replayed.
   materialized state **and** append ledger rows **atomically in one PG
   transaction**. A crash between the two MUST be impossible by
   construction, not by cleanup.
-- Every persisted entity row carries `revision BIGINT` (monotonic,
-  incremented on each write). All snapshot writes are conditional:
-  `UPDATE ... SET ... revision = $new WHERE id = $id AND revision <
-  $new` (equivalently `revision = $expected`). An async 60 s snapshot
-  holding stale state can therefore never overwrite a newer critical
-  write — the stale write affects 0 rows and is logged + counted as a
-  metric. The saver works off a per-entity dirty queue carrying the exact
-  revision it read; it never re-reads-and-blind-writes.
+- Every mutable persisted **aggregate root** carries a monotonic
+  `revision BIGINT` (characters, item_instances, banks — NOT child rows
+  like `character_spells`/`character_skills`/`item_locations`, which are
+  guarded by their root per the aggregate rule below). All snapshot
+  writes are compare-and-swap, exactly one form (no alternatives):
+
+  ```sql
+  UPDATE characters
+  SET ..., revision = $expected + 1
+  WHERE id = $id
+    AND revision = $expected;
+  ```
+
+  Invariant: expected revision matches → this write owns the aggregate;
+  anything else → stale/conflicting write, abort the txn, log + count a
+  metric. An async 60 s snapshot holding stale state therefore affects 0
+  rows and can never overwrite a newer critical write. The saver works
+  off a per-entity dirty queue carrying the exact revision it read; it
+  never re-reads-and-blind-writes.
 - Restart recovery: load newest materialized rows (any revision), rebuild
   sim, resume timers from stored due-times. Crash/panic is assumed to
   bypass ALL cleanup — survival comes from the txn + revision rules
@@ -665,6 +704,11 @@ ledger is never replayed.
 
 ## 14. Version history
 
+- v0.3.2: correctness pass — chunks to reliable lane + `world_ready`
+  barrier (§7.1, §6.1), CAS-only aggregate revisions (§8.1, D7), XYZ +
+  self-containment CHECKs (§8), post-commit reload rule + bounded opID
+  dedupe (§5.1), `inputSeq` arithmetic + `205` zero rule + fixed-`u32`
+  `105 use` (§6.3), serialized `enter_world` arbitration (§6.1).
 - v0.3.1: correctness pass — reconciliation via `inputSeq`/`yaw`/
   `lastProcessedInputSeq` (§6.3, §13.2), aggregate revisions (§8.1, D7),
   cross-cell `DamageIntent`/`opID`/idempotency (§5.1), item-location
