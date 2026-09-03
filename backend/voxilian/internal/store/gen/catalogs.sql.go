@@ -671,6 +671,8 @@ type SpellProtoExactMatchParams struct {
 	Version  int32  `json:"version"`
 }
 
+// Exact-match params for the ::jsonb casts surface as Column10/Column11
+// in generated Go (positional casts have no inferable name); stable.
 func (q *Queries) SpellProtoExactMatch(ctx context.Context, arg SpellProtoExactMatchParams) (pgtype.Bool, error) {
 	row := q.db.QueryRow(ctx, spellProtoExactMatch,
 		arg.ID,
