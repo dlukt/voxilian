@@ -3,6 +3,7 @@ package store_test
 import (
 	"database/sql"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -180,27 +181,289 @@ func TestMigration0001(t *testing.T) {
 	}
 }
 
-// uitoa formats non-negative and negative ints without importing more.
+// newItem inserts a bare item_instances row and returns its generated id.
+func newItem(t *testing.T, db *sql.DB, proto int) int64 {
+	t.Helper()
+	var id int64
+	err := db.QueryRow(`INSERT INTO item_instances (proto, qty, hits, enchants) VALUES ($1, 1, 100, '{}') RETURNING id`, proto).Scan(&id)
+	if err != nil {
+		t.Fatalf("insert item: %v", err)
+	}
+	return id
+}
+
+func indexExists(t *testing.T, db *sql.DB, name string) bool {
+	t.Helper()
+	var found bool
+	if err := db.QueryRow(`SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = $1 AND relkind = 'i')`, name).Scan(&found); err != nil {
+		t.Fatalf("pg_class: %v", err)
+	}
+	return found
+}
+
+// TestMigration0004 proves the M1-T4 item/corpse/bank/location schema
+// against real PostgreSQL 18. Pinned to version 4.
+func TestMigration0004(t *testing.T) {
+	pg := simtest.StartPostgres18(t)
+	db := openMigratedTo(t, pg.DSN, 4)
+
+	// 1-5: version and tables.
+	var ver int64
+	if err := db.QueryRow(`SELECT version_id FROM goose_db_version ORDER BY version_id DESC LIMIT 1`).Scan(&ver); err != nil {
+		t.Fatalf("goose version: %v", err)
+	}
+	if ver != 4 {
+		t.Fatalf("goose version = %d, want 4", ver)
+	}
+	for _, tbl := range []string{"item_instances", "item_locations", "corpses", "banks"} {
+		if !tableExists(t, db, tbl) {
+			t.Fatalf("table %s missing", tbl)
+		}
+	}
+
+	// Fixtures: account, two characters, one item proto.
+	var acct int64
+	if err := db.QueryRow(`INSERT INTO accounts (keycloak_sub) VALUES ('sub-m4') RETURNING id`).Scan(&acct); err != nil {
+		t.Fatal(err)
+	}
+	char := func(slot int, name string) int64 {
+		var id int64
+		err := db.QueryRow(`INSERT INTO characters
+			(account_id, slot, name, gender, face, might, intellect, stamina, agility, mysticism, aim,
+			 karma, hometown, pos_x, pos_y, pos_z, vitals, advancement, flags, updated_at)
+			VALUES ($1,$2,$3,0,'{}',10,10,10,10,10,10,0,'tos',0,0,0,'{}','{}',0,now()) RETURNING id`,
+			acct, slot, name).Scan(&id)
+		if err != nil {
+			t.Fatalf("insert character %s: %v", name, err)
+		}
+		return id
+	}
+	c1, c2 := char(0, "Holder"), char(1, "Holderb")
+	mustExec(t, db, `INSERT INTO item_protos (id,kind,slot,base,version) VALUES (500,0,NULL,'{}',1)`)
+
+	// 6-9: instances insert, identity id, revision default, proto FK.
+	i1 := newItem(t, db, 500)
+	if i1 <= 0 {
+		t.Fatalf("identity id = %d, want generated positive", i1)
+	}
+	i2 := newItem(t, db, 500)
+	if i2 == i1 {
+		t.Fatal("identity ids not unique")
+	}
+	var rev int64
+	if err := db.QueryRow(`SELECT revision FROM item_instances WHERE id = $1`, i1).Scan(&rev); err != nil || rev != 0 {
+		t.Fatalf("revision = %d, %v; want 0", rev, err)
+	}
+	if _, err := db.Exec(`INSERT INTO item_instances (proto,qty,hits,enchants) VALUES (9999,1,1,'{}')`); err == nil {
+		t.Fatal("bad proto accepted")
+	}
+
+	// 11: proto is integer, not smallint.
+	var ptyp string
+	if err := db.QueryRow(`SELECT data_type FROM information_schema.columns WHERE table_name='item_instances' AND column_name='proto'`).Scan(&ptyp); err != nil || ptyp != "integer" {
+		t.Fatalf("item_instances.proto = %q, %v; want integer", ptyp, err)
+	}
+
+	// 12: no position columns on item_instances.
+	var npos int
+	q := `SELECT count(*) FROM information_schema.columns WHERE table_name='item_instances' AND column_name IN ('pos_x','pos_y','pos_z')`
+	if err := db.QueryRow(q).Scan(&npos); err != nil || npos != 0 {
+		t.Fatalf("position columns on item_instances: %d, %v", npos, err)
+	}
+
+	// 13: BIGINT identity round-trips as int64 (distinct generated ids).
+	var got int64
+	if err := db.QueryRow(`SELECT id FROM item_instances WHERE id = $1`, i2).Scan(&got); err != nil || got != i2 {
+		t.Fatalf("id round-trip = %d, %v", got, err)
+	}
+
+	// 14: corpse for existing character; 16: coords beyond int32.
+	var corpse int64
+	err := db.QueryRow(`INSERT INTO corpses (character_id,pos_x,pos_y,pos_z,expires_at) VALUES ($1,5000000000,-5000000000,0,now() + interval '1 hour') RETURNING id`, c1).Scan(&corpse)
+	if err != nil {
+		t.Fatalf("insert corpse: %v", err)
+	}
+	var cx, cy, cz int64
+	if err := db.QueryRow(`SELECT pos_x,pos_y,pos_z FROM corpses WHERE id=$1`, corpse).Scan(&cx, &cy, &cz); err != nil || cx != 5000000000 || cy != -5000000000 || cz != 0 {
+		t.Fatalf("corpse pos = (%d,%d,%d), %v", cx, cy, cz, err)
+	}
+
+	// 15: bad character FK rejected.
+	if _, err := db.Exec(`INSERT INTO corpses (character_id,pos_x,pos_y,pos_z,expires_at) VALUES (999999,0,0,0,now())`); err == nil {
+		t.Fatal("bad corpse character accepted")
+	}
+
+	// 17: expires_at required.
+	if _, err := db.Exec(`INSERT INTO corpses (character_id,pos_x,pos_y,pos_z) VALUES ($1,0,0,0)`, c1); err == nil {
+		t.Fatal("missing expires_at accepted")
+	}
+
+	// 18: expires index exists (catalog inspection, not inference).
+	if !indexExists(t, db, "corpses_expires_at_idx") {
+		t.Fatal("corpses_expires_at_idx missing")
+	}
+
+	// 19-20: bank row + revision default.
+	mustExec(t, db, `INSERT INTO banks (character_id,system,balance) VALUES ($1,'tos',100)`, c1)
+	if err := db.QueryRow(`SELECT revision FROM banks WHERE character_id=$1 AND system='tos'`, c1).Scan(&rev); err != nil || rev != 0 {
+		t.Fatalf("bank revision = %d, %v; want 0", rev, err)
+	}
+
+	// 21: duplicate (character, system) rejected.
+	if _, err := db.Exec(`INSERT INTO banks (character_id,system,balance) VALUES ($1,'tos',1)`, c1); err == nil ||
+		!strings.Contains(err.Error(), "banks_pkey") {
+		t.Fatalf("dup bank err = %v, want banks_pkey", err)
+	}
+
+	// 22-23: other system same char OK; same system other char OK.
+	mustExec(t, db, `INSERT INTO banks (character_id,system,balance) VALUES ($1,'koc',0)`, c1)
+	mustExec(t, db, `INSERT INTO banks (character_id,system,balance) VALUES ($1,'tos',0)`, c2)
+
+	// 24: bad character FK rejected.
+	if _, err := db.Exec(`INSERT INTO banks (character_id,system,balance) VALUES (999999,'tos',0)`); err == nil {
+		t.Fatal("bad bank character accepted")
+	}
+
+	// 25: BIGINT balance beyond int32 (and negatives permitted by design).
+	mustExec(t, db, `UPDATE banks SET balance = 5000000000 WHERE character_id=$1 AND system='tos'`, c1)
+	var bal int64
+	if err := db.QueryRow(`SELECT balance FROM banks WHERE character_id=$1 AND system='tos'`, c1).Scan(&bal); err != nil || bal != 5000000000 {
+		t.Fatalf("balance = %d, %v", bal, err)
+	}
+	mustExec(t, db, `UPDATE banks SET balance = -250 WHERE character_id=$1 AND system='tos'`, c1)
+
+	// All five valid location states.
+	loc := func(item int64, q string) {
+		t.Helper()
+		if _, err := db.Exec(q, item); err != nil {
+			t.Fatalf("valid location: %v\n%s", err, q)
+		}
+	}
+	iv := newItem(t, db, 500)
+	loc(iv, `INSERT INTO item_locations (item_id,kind,character_id,slot) VALUES ($1,0,`+itoa64(c1)+`,'mainhand')`)
+	gr := newItem(t, db, 500)
+	loc(gr, `INSERT INTO item_locations (item_id,kind,pos_x,pos_y,pos_z) VALUES ($1,1,5000000000,-5000000000,0)`)
+	co := newItem(t, db, 500)
+	loc(co, `INSERT INTO item_locations (item_id,kind,corpse_id) VALUES ($1,2,`+itoa64(corpse)+`)`)
+	va := newItem(t, db, 500)
+	loc(va, `INSERT INTO item_locations (item_id,kind,character_id,vault_region,slot) VALUES ($1,3,`+itoa64(c1)+`,'barloque','slot1')`)
+	bag := newItem(t, db, 500)
+	loc(bag, `INSERT INTO item_locations (item_id,kind,character_id,slot) VALUES ($1,0,`+itoa64(c1)+`,'back')`)
+	in := newItem(t, db, 500)
+	loc(in, `INSERT INTO item_locations (item_id,kind,container_item_id,slot) VALUES ($1,4,`+itoa64(bag)+`,'pocket')`)
+	// location index exists (catalog inspection).
+	if !indexExists(t, db, "item_locations_character_corpse_idx") {
+		t.Fatal("item_locations_character_corpse_idx missing")
+	}
+
+	// Invalid-state matrix: every case must fail kind_state_check.
+	// Each case gets a fresh item (one location row per item).
+	bad := []struct{ name, sql string }{
+		{"inv-no-char", `INSERT INTO item_locations (item_id,kind,slot) VALUES ($1,0,'s')`},
+		{"inv-no-slot", `INSERT INTO item_locations (item_id,kind,character_id) VALUES ($1,0,` + itoa64(c1) + `)`},
+		{"inv-with-pos", `INSERT INTO item_locations (item_id,kind,character_id,slot,pos_x) VALUES ($1,0,` + itoa64(c1) + `,'s',1)`},
+		{"inv-with-corpse", `INSERT INTO item_locations (item_id,kind,character_id,slot,corpse_id) VALUES ($1,0,` + itoa64(c1) + `,'s',` + itoa64(corpse) + `)`},
+		{"inv-with-container", `INSERT INTO item_locations (item_id,kind,character_id,slot,container_item_id) VALUES ($1,0,` + itoa64(c1) + `,'s',` + itoa64(bag) + `)`},
+		{"inv-with-vault", `INSERT INTO item_locations (item_id,kind,character_id,slot,vault_region) VALUES ($1,0,` + itoa64(c1) + `,'s','r')`},
+		{"ground-missing-y", `INSERT INTO item_locations (item_id,kind,pos_x,pos_z) VALUES ($1,1,1,1)`},
+		{"ground-with-char", `INSERT INTO item_locations (item_id,kind,character_id,pos_x,pos_y,pos_z) VALUES ($1,1,` + itoa64(c1) + `,1,2,3)`},
+		{"ground-with-slot", `INSERT INTO item_locations (item_id,kind,pos_x,pos_y,pos_z,slot) VALUES ($1,1,1,2,3,'s')`},
+		{"ground-with-corpse", `INSERT INTO item_locations (item_id,kind,corpse_id,pos_x,pos_y,pos_z) VALUES ($1,1,` + itoa64(corpse) + `,1,2,3)`},
+		{"ground-with-container", `INSERT INTO item_locations (item_id,kind,container_item_id,pos_x,pos_y,pos_z) VALUES ($1,1,` + itoa64(bag) + `,1,2,3)`},
+		{"ground-with-vault", `INSERT INTO item_locations (item_id,kind,vault_region,pos_x,pos_y,pos_z) VALUES ($1,1,'r',1,2,3)`},
+		{"corpse-missing", `INSERT INTO item_locations (item_id,kind) VALUES ($1,2)`},
+		{"corpse-with-char", `INSERT INTO item_locations (item_id,kind,character_id,corpse_id) VALUES ($1,2,` + itoa64(c1) + `,` + itoa64(corpse) + `)`},
+		{"corpse-with-pos", `INSERT INTO item_locations (item_id,kind,corpse_id,pos_x) VALUES ($1,2,` + itoa64(corpse) + `,1)`},
+		{"corpse-with-slot", `INSERT INTO item_locations (item_id,kind,corpse_id,slot) VALUES ($1,2,` + itoa64(corpse) + `,'s')`},
+		{"corpse-with-vault", `INSERT INTO item_locations (item_id,kind,corpse_id,vault_region) VALUES ($1,2,` + itoa64(corpse) + `,'r')`},
+		{"vault-no-char", `INSERT INTO item_locations (item_id,kind,vault_region,slot) VALUES ($1,3,'r','s')`},
+		{"vault-no-region", `INSERT INTO item_locations (item_id,kind,character_id,slot) VALUES ($1,3,` + itoa64(c1) + `,'s')`},
+		{"vault-no-slot", `INSERT INTO item_locations (item_id,kind,character_id,vault_region) VALUES ($1,3,` + itoa64(c1) + `,'r')`},
+		{"vault-with-corpse", `INSERT INTO item_locations (item_id,kind,character_id,vault_region,slot,corpse_id) VALUES ($1,3,` + itoa64(c1) + `,'r','s',` + itoa64(corpse) + `)`},
+		{"vault-with-container", `INSERT INTO item_locations (item_id,kind,character_id,vault_region,slot,container_item_id) VALUES ($1,3,` + itoa64(c1) + `,'r','s',` + itoa64(bag) + `)`},
+		{"vault-with-pos", `INSERT INTO item_locations (item_id,kind,character_id,vault_region,slot,pos_x) VALUES ($1,3,` + itoa64(c1) + `,'r','s',1)`},
+		{"container-missing", `INSERT INTO item_locations (item_id,kind,slot) VALUES ($1,4,'s')`},
+		{"container-no-slot", `INSERT INTO item_locations (item_id,kind,container_item_id) VALUES ($1,4,` + itoa64(bag) + `)`},
+		{"container-with-char", `INSERT INTO item_locations (item_id,kind,character_id,container_item_id,slot) VALUES ($1,4,` + itoa64(c1) + `,` + itoa64(bag) + `,'s')`},
+		{"container-with-corpse", `INSERT INTO item_locations (item_id,kind,corpse_id,container_item_id,slot) VALUES ($1,4,` + itoa64(corpse) + `,` + itoa64(bag) + `,'s')`},
+		{"container-with-vault", `INSERT INTO item_locations (item_id,kind,vault_region,container_item_id,slot) VALUES ($1,4,'r',` + itoa64(bag) + `,'s')`},
+		{"container-with-pos", `INSERT INTO item_locations (item_id,kind,container_item_id,slot,pos_x) VALUES ($1,4,` + itoa64(bag) + `,'s',1)`},
+		{"kind-neg", `INSERT INTO item_locations (item_id,kind,character_id,slot) VALUES ($1,-1,` + itoa64(c1) + `,'s')`},
+		{"kind-5", `INSERT INTO item_locations (item_id,kind,character_id,slot) VALUES ($1,5,` + itoa64(c1) + `,'s')`},
+	}
+	for _, tc := range bad {
+		item := newItem(t, db, 500)
+		if _, err := db.Exec(strings.Replace(tc.sql, "$1", itoa64(item), 1)); err == nil ||
+			!strings.Contains(err.Error(), "item_locations_kind_state_check") {
+			t.Fatalf("%s err = %v, want item_locations_kind_state_check", tc.name, err)
+		}
+	}
+
+	// Exactly one location row per item.
+	dup := newItem(t, db, 500)
+	mustExec(t, db, `INSERT INTO item_locations (item_id,kind,character_id,slot) VALUES ($1,0,`+itoa64(c1)+`,'s')`, dup)
+	if _, err := db.Exec(`INSERT INTO item_locations (item_id,kind,corpse_id) VALUES ($1,2,`+itoa64(corpse)+`)`, dup); err == nil ||
+		!strings.Contains(err.Error(), "item_locations_pkey") {
+		t.Fatalf("second location err = %v, want item_locations_pkey", err)
+	}
+
+	// Location FKs: bad item, bad character, bad corpse, bad container.
+	// Each attempt uses a fresh item (one location row per item).
+	if _, err := db.Exec(`INSERT INTO item_locations (item_id,kind,character_id,slot) VALUES (999999,0,` + itoa64(c1) + `,'s')`); err == nil ||
+		!strings.Contains(err.Error(), "violates foreign key constraint") {
+		t.Fatalf("bad location item err = %v", err)
+	}
+	for _, q := range []string{
+		`INSERT INTO item_locations (item_id,kind,character_id,slot) VALUES ($1,0,999999,'s')`,
+		`INSERT INTO item_locations (item_id,kind,corpse_id) VALUES ($1,2,999999)`,
+		`INSERT INTO item_locations (item_id,kind,container_item_id,slot) VALUES ($1,4,999999,'s')`,
+	} {
+		fkItem := newItem(t, db, 500)
+		if _, err := db.Exec(strings.Replace(q, "$1", itoa64(fkItem), 1)); err == nil ||
+			!strings.Contains(err.Error(), "violates foreign key constraint") {
+			t.Fatalf("location FK err = %v for %s", err, q)
+		}
+	}
+
+	// Self-containment rejected; A-in-B fine. A→B→A deeper cycles are
+	// deliberately ALLOWED here — sim/store txn logic owns them (M1-T7b).
+	self := newItem(t, db, 500)
+	if _, err := db.Exec(`INSERT INTO item_locations (item_id,kind,container_item_id,slot) VALUES ($1,4,$1,'s')`, self); err == nil ||
+		!strings.Contains(err.Error(), "item_locations_no_self_container_check") {
+		t.Fatalf("self-container err = %v, want no_self_container_check", err)
+	}
+	a, b := newItem(t, db, 500), newItem(t, db, 500)
+	mustExec(t, db, `INSERT INTO item_locations (item_id,kind,container_item_id,slot) VALUES ($1,4,`+itoa64(b)+`,'s')`, a)
+	mustExec(t, db, `INSERT INTO item_locations (item_id,kind,container_item_id,slot) VALUES ($1,4,`+itoa64(a)+`,'s')`, b)
+
+	// Rollback 4 → 3.
+	if err := goose.DownTo(db, migrationsDir(t), 3); err != nil {
+		t.Fatalf("goose down to 3: %v", err)
+	}
+	for _, tbl := range []string{"item_locations", "item_instances", "corpses", "banks"} {
+		if tableExists(t, db, tbl) {
+			t.Fatalf("table %s survives down-to-3", tbl)
+		}
+	}
+	if err := db.QueryRow(`SELECT version_id FROM goose_db_version ORDER BY version_id DESC LIMIT 1`).Scan(&ver); err != nil || ver != 3 {
+		t.Fatalf("version after down = %d, %v; want 3", ver, err)
+	}
+	for _, tbl := range []string{"accounts", "characters", "item_protos", "spell_protos", "character_spells", "character_skills"} {
+		if !tableExists(t, db, tbl) {
+			t.Fatalf("table %s lost by down-to-3", tbl)
+		}
+	}
+	if !constraintExists(t, db, "characters_might_check") {
+		t.Fatal("characters_might_check lost by down-to-3")
+	}
+}
+
+func itoa64(n int64) string {
+	return strconv.FormatInt(n, 10)
+}
+
 func uitoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var b [20]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		b[i] = '-'
-	}
-	return string(b[i:])
+	return strconv.Itoa(n)
 }
 
 // TestMigration0002 proves the M1-T2 catalog schema against real
