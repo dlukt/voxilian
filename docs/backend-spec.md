@@ -260,5 +260,14 @@ Tables (D4; M59 property names in parens where ported):
    (Tiled/custom → `world.toml`?); who owns the map pipeline.
 6. **Prod target**: single VPS + compose vs managed PG vs k8s; TLS
    termination; backups/PITR for PG.
-7. **E
-...[truncated 615 chars]
+7. **MVP content scope**: which spell schools / skills / mobs ship first
+   (proposal in §9: 2 schools × 4 spells, 4 weapon skills + dodge/block/parry,
+   6 mobs) — confirm or cut further.
+8. **Protocol encoding**: stay JSON for all of MVP, or define the binary frame
+   format now for movement deltas?
+
+## 14. Version history
+
+- v0.2: drop Redis; sessions/presence/rate-limits in memory; PG-only stack.
+- v0.1: initial spec (seamless + embedded interiors, WebSocket, single
+  process, snapshot + write-through, PG 18 + Redis 8).
