@@ -98,15 +98,52 @@ func (e *ClientError) Error() string {
 	return fmt.Sprintf("client error %d: %s", e.Code, e.Message)
 }
 
-// wsConnection adapts *websocket.Conn to the session-level connection
-// handle the registry retains for later forced takeover/kick.
+// wsConnection adapts *websocket.Conn to session.Connection. It owns
+// the connection's ONE application-writer serialization: a buffered
+// channel used as a context-aware semaphore rather than a naked mutex,
+// so a takeover kick write can bound its wait behind a stuck writer
+// instead of blocking forever.
 type wsConnection struct {
-	conn *websocket.Conn
+	conn      *websocket.Conn
+	writeGate chan struct{}
 }
 
-// Close implements session.Connection.
+// newWSConnection wraps an accepted WebSocket connection; the writer
+// gate is always initialized here so no construction path can share an
+// uninitialized channel.
+func newWSConnection(conn *websocket.Conn) *wsConnection {
+	return &wsConnection{conn: conn, writeGate: make(chan struct{}, 1)}
+}
+
+// WriteBinary implements session.Connection: acquire the writer gate
+// (context-aware, never a blind lock), invoke build exactly once
+// inside the slot, write the returned frame as one binary message,
+// release the gate.
+func (w *wsConnection) WriteBinary(ctx context.Context, build session.BinaryFrameBuilder) error {
+	select {
+	case w.writeGate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-w.writeGate }()
+	frame, err := build()
+	if err != nil {
+		return err
+	}
+	return w.conn.Write(ctx, websocket.MessageBinary, frame)
+}
+
+// Close implements session.Connection (graceful close handshake).
 func (w *wsConnection) Close(reason string) error {
 	return w.conn.Close(websocket.StatusNormalClosure, reason)
+}
+
+// CloseNow implements session.Connection: immediate transport close
+// that deliberately does NOT acquire the writer gate — a forced
+// takeover must be able to interrupt a stuck writer, a broken client,
+// or a blocked old session.
+func (w *wsConnection) CloseNow() error {
+	return w.conn.CloseNow()
 }
 
 // ServerDeps wires a gateway. Registry is required; every nil seam gets
@@ -190,14 +227,15 @@ func prodSchedule(at time.Time, fn func()) CancelFunc {
 	return func() { t.Stop() }
 }
 
-// connAuth is the per-connection authorization-deadline controller. The
-// scheduled callback only ever terminates the connection whose
-// generation and TokenExp it still matches: a successful reauth
-// supersedes the old timer, and a late-firing stale callback can never
-// disconnect the reauthenticated session.
+// connAuth is the per-connection authorization-deadline controller. It
+// owns ONLY deadline state: timer generation, cancellation, and the
+// done flag. Application-write serialization lives on the connection
+// adapter, never here. The scheduled callback only ever terminates the
+// connection whose generation and TokenExp it still matches: a
+// successful reauth supersedes the old timer, and a late-firing stale
+// callback can never disconnect the reauthenticated session.
 type connAuth struct {
 	mu       sync.Mutex
-	wmu      sync.Mutex
 	cancel   CancelFunc
 	gen      uint64
 	deadline time.Time
@@ -214,8 +252,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("gateway: websocket accept failed", "err", err)
 		return
 	}
+	wsConn := newWSConnection(conn)
 	defer func() {
-		_ = conn.Close(websocket.StatusNormalClosure, "closing")
+		_ = wsConn.Close("closing")
 	}()
 	// Bounded-memory transport rule (spec v0.3.8 §6): the application
 	// frame ceiling is exactly 64 KiB. Oversized messages are terminated
@@ -223,7 +262,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(proto.MaxFrameSize)
 
 	ctx := r.Context()
-	sid := s.Registry.Create(&wsConnection{conn: conn})
+	sid := s.Registry.Create(wsConn)
 	ca := &connAuth{}
 	defer func() {
 		s.cancelDeadline(ca)
@@ -246,13 +285,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if msgType != websocket.MessageBinary {
 			// Text (or any non-binary) application message: protocol
 			// error on the first offense, session continues.
-			if err := s.sendError(ctx, ca, conn, sid,
+			if err := s.sendError(ctx, sid,
 				proto.ErrorCodeProtocol, "text websocket messages are not supported"); err != nil {
 				return
 			}
 			continue
 		}
-		if err := s.handleBinary(ctx, ca, conn, sid, data); err != nil {
+		if err := s.handleBinary(ctx, ca, sid, data); err != nil {
 			return
 		}
 	}
@@ -264,7 +303,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleBinary(
 	ctx context.Context,
 	ca *connAuth,
-	conn *websocket.Conn,
 	sid session.ID,
 	data []byte,
 ) error {
@@ -276,12 +314,12 @@ func (s *Server) handleBinary(
 		} else if errors.Is(err, proto.ErrFrameTooLarge) {
 			msg = "binary frame exceeds the 64 KiB ceiling"
 		}
-		return s.replyError(ctx, ca, conn, sid, proto.ErrorCodeProtocol, msg)
+		return s.replyError(ctx, sid, proto.ErrorCodeProtocol, msg)
 	}
 	// Unknown opcodes and client-sent S→C opcodes are protocol errors,
 	// never bad_state, and never disconnect on the first offense.
 	if !session.IsClientOpcode(header.Opcode) {
-		return s.replyError(ctx, ca, conn, sid,
+		return s.replyError(ctx, sid,
 			proto.ErrorCodeProtocol,
 			fmt.Sprintf("unsupported client opcode %d", header.Opcode))
 	}
@@ -292,7 +330,7 @@ func (s *Server) handleBinary(
 	// Incoming C→S seq/tick are opaque: no ordering, wrap, or
 	// future-tick enforcement here (M3-T5/M4 own those).
 	if !session.Allowed(snap.State, header.Opcode) {
-		return s.replyError(ctx, ca, conn, sid,
+		return s.replyError(ctx, sid,
 			proto.ErrorCodeBadState,
 			fmt.Sprintf("opcode %d is not allowed in %s", header.Opcode, snap.State))
 	}
@@ -301,17 +339,17 @@ func (s *Server) handleBinary(
 	// no established token and is exempt.
 	if snap.State != session.StateConnected &&
 		!s.now().Before(snap.TokenExp.Add(ReauthGrace)) {
-		_ = s.sendError(ctx, ca, conn, sid,
+		_ = s.sendError(ctx, sid,
 			proto.ErrorCodeSessionExpired, "reauth deadline exceeded")
 		return errAuthDeadline
 	}
 	switch header.Opcode {
 	case proto.OpcodeHello:
-		return s.finishStep(ctx, ca, conn, sid, s.handleHello(ctx, ca, conn, sid, payload))
+		return s.finishStep(ctx, sid, s.handleHello(ctx, ca, sid, payload))
 	case proto.OpcodeReauth:
-		return s.finishStep(ctx, ca, conn, sid, s.handleReauth(ctx, ca, conn, sid, snap, payload))
+		return s.finishStep(ctx, sid, s.handleReauth(ctx, ca, sid, snap, payload))
 	default:
-		return s.dispatch(ctx, ca, conn, sid, header, payload)
+		return s.dispatch(ctx, sid, header, payload)
 	}
 }
 
@@ -319,13 +357,11 @@ func (s *Server) handleBinary(
 // ends the connection.
 func (s *Server) replyError(
 	ctx context.Context,
-	ca *connAuth,
-	conn *websocket.Conn,
 	sid session.ID,
 	code uint16,
 	msg string,
 ) error {
-	if err := s.sendError(ctx, ca, conn, sid, code, msg); err != nil {
+	if err := s.sendError(ctx, sid, code, msg); err != nil {
 		return err
 	}
 	return nil
@@ -336,8 +372,6 @@ func (s *Server) replyError(
 // is an internal failure that ends the connection.
 func (s *Server) finishStep(
 	ctx context.Context,
-	ca *connAuth,
-	conn *websocket.Conn,
 	sid session.ID,
 	err error,
 ) error {
@@ -346,7 +380,7 @@ func (s *Server) finishStep(
 	}
 	var cerr *ClientError
 	if errors.As(err, &cerr) {
-		return s.replyError(ctx, ca, conn, sid, cerr.Code, cerr.Message)
+		return s.replyError(ctx, sid, cerr.Code, cerr.Message)
 	}
 	return err
 }
@@ -361,7 +395,6 @@ func (s *Server) finishStep(
 func (s *Server) handleHello(
 	ctx context.Context,
 	ca *connAuth,
-	conn *websocket.Conn,
 	sid session.ID,
 	payload *proto.Decoder,
 ) error {
@@ -390,9 +423,9 @@ func (s *Server) handleHello(
 		}
 		return err
 	}
-	s.armDeadline(ca, conn, sid, id.ExpiresAt)
+	s.armDeadline(ca, sid, id.ExpiresAt)
 	welcome := s.welcome(ctx)
-	return s.send(ctx, ca, conn, sid, proto.OpcodeWelcome, proto.MessageVersion1, func(e *proto.Encoder) error {
+	return s.send(ctx, sid, proto.OpcodeWelcome, proto.MessageVersion1, func(e *proto.Encoder) error {
 		welcome.Encode(e)
 		return nil
 	})
@@ -408,7 +441,6 @@ func (s *Server) handleHello(
 func (s *Server) handleReauth(
 	ctx context.Context,
 	ca *connAuth,
-	conn *websocket.Conn,
 	sid session.ID,
 	snap session.Snapshot,
 	payload *proto.Decoder,
@@ -429,8 +461,8 @@ func (s *Server) handleReauth(
 		}
 		return err
 	}
-	s.armDeadline(ca, conn, sid, id.ExpiresAt)
-	return s.send(ctx, ca, conn, sid, proto.OpcodeReauthOK, proto.MessageVersion1, func(e *proto.Encoder) error {
+	s.armDeadline(ca, sid, id.ExpiresAt)
+	return s.send(ctx, sid, proto.OpcodeReauthOK, proto.MessageVersion1, func(e *proto.Encoder) error {
 		proto.ReauthOK{}.Encode(e)
 		return nil
 	})
@@ -442,8 +474,6 @@ func (s *Server) handleReauth(
 // and ends the connection.
 func (s *Server) dispatch(
 	ctx context.Context,
-	ca *connAuth,
-	conn *websocket.Conn,
 	sid session.ID,
 	header proto.Header,
 	payload *proto.Decoder,
@@ -452,12 +482,12 @@ func (s *Server) dispatch(
 		return nil
 	}
 	send := func(opcode uint16, msgVersion uint16, encode func(*proto.Encoder) error) error {
-		return s.send(ctx, ca, conn, sid, opcode, msgVersion, encode)
+		return s.send(ctx, sid, opcode, msgVersion, encode)
 	}
 	if err := s.handler.Handle(ctx, sid, header, payload, send); err != nil {
 		var cerr *ClientError
 		if errors.As(err, &cerr) {
-			return s.replyError(ctx, ca, conn, sid, cerr.Code, cerr.Message)
+			return s.replyError(ctx, sid, cerr.Code, cerr.Message)
 		}
 		slog.Error("gateway: handler internal failure", "session", uint64(sid),
 			"opcode", header.Opcode, "err", err)
@@ -470,7 +500,7 @@ func (s *Server) dispatch(
 // cancelling/superseding any previous timer. The callback only fires
 // for its own generation and TokenExp, so a stale timer can never
 // disconnect a reauthenticated session.
-func (s *Server) armDeadline(ca *connAuth, conn *websocket.Conn, sid session.ID, tokenExp time.Time) {
+func (s *Server) armDeadline(ca *connAuth, sid session.ID, tokenExp time.Time) {
 	ca.mu.Lock()
 	defer ca.mu.Unlock()
 	if ca.cancel != nil {
@@ -484,7 +514,7 @@ func (s *Server) armDeadline(ca *connAuth, conn *websocket.Conn, sid session.ID,
 	gen := ca.gen
 	dl := tokenExp.Add(ReauthGrace)
 	ca.deadline = dl
-	ca.cancel = s.schedule(dl, func() { s.onDeadline(ca, conn, sid, gen, dl) })
+	ca.cancel = s.schedule(dl, func() { s.onDeadline(ca, sid, gen, dl) })
 }
 
 // cancelDeadline releases the connection's timer at teardown so no
@@ -504,7 +534,7 @@ func (s *Server) cancelDeadline(ca *connAuth) {
 // close (which unblocks the read loop into cleanup). Stale callbacks —
 // superseded generation, changed TokenExp, vanished session, or an
 // early fire — return without effect.
-func (s *Server) onDeadline(ca *connAuth, conn *websocket.Conn, sid session.ID, gen uint64, dl time.Time) {
+func (s *Server) onDeadline(ca *connAuth, sid session.ID, gen uint64, dl time.Time) {
 	ca.mu.Lock()
 	stale := ca.done || gen != ca.gen || !dl.Equal(ca.deadline)
 	ca.mu.Unlock()
@@ -523,14 +553,18 @@ func (s *Server) onDeadline(ca *connAuth, conn *websocket.Conn, sid session.ID, 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_ = s.sendError(ctx, ca, conn, sid, proto.ErrorCodeSessionExpired, "reauth deadline exceeded")
+	_ = s.sendError(ctx, sid, proto.ErrorCodeSessionExpired, "reauth deadline exceeded")
 	// Close asynchronously: the close handshake waits for the peer's
 	// response, which must never block this timer callback (an idle or
 	// dead peer would stall it up to the library's handshake timeout).
 	// The goroutine is bounded by that same timeout, not a leak, and a
 	// concurrent deferred Close elsewhere is a harmless no-op.
+	conn := snap.Conn
+	if conn == nil {
+		return
+	}
 	go func() {
-		_ = conn.Close(websocket.StatusNormalClosure, "reauth deadline exceeded")
+		_ = conn.Close("reauth deadline exceeded")
 	}()
 }
 
@@ -539,45 +573,77 @@ func (s *Server) onDeadline(ca *connAuth, conn *websocket.Conn, sid session.ID, 
 // diagnostic message clients must not parse for control flow.
 func (s *Server) sendError(
 	ctx context.Context,
-	ca *connAuth,
-	conn *websocket.Conn,
 	sid session.ID,
 	code uint16,
 	msg string,
 ) error {
-	return s.send(ctx, ca, conn, sid, proto.OpcodeError, proto.MessageVersion1, func(e *proto.Encoder) error {
+	return s.send(ctx, sid, proto.OpcodeError, proto.MessageVersion1, func(e *proto.Encoder) error {
 		proto.ErrorMessage{Code: code, Message: msg}.Encode(e)
 		return nil
 	})
 }
 
-// send allocates the session S→C sequence, encodes one frame, and
-// writes it as a single binary WebSocket message. Writes serialize on
-// the connection mutex because the deadline callback may write while
-// the read loop is dispatching.
+// send writes one frame through the shared session-frame path: the
+// ONLY way the gateway puts an application binary message on the wire.
 func (s *Server) send(
 	ctx context.Context,
-	ca *connAuth,
-	conn *websocket.Conn,
 	sid session.ID,
 	opcode uint16,
 	msgVersion uint16,
 	encode func(*proto.Encoder) error,
 ) error {
-	seq, err := s.Registry.NextServerSeq(sid)
-	if err != nil {
-		return err
+	return sendSessionFrame(ctx, s.Registry, s.tick, sid, opcode, msgVersion, encode)
+}
+
+// sendSessionFrame is the one frame-writing path shared by normal
+// current-session replies and cross-session writes (duplicate-login
+// takeover): snapshot the session's connection, acquire that
+// connection's writer serialization, and only then allocate the S→C
+// sequence and encode the frame. Because allocation happens inside the
+// writer slot, the order frames are physically written is exactly the
+// order their sequence numbers are allocated — never N+1 before N.
+func sendSessionFrame(
+	ctx context.Context,
+	registry *session.Registry,
+	tick TickFunc,
+	sid session.ID,
+	opcode uint16,
+	msgVersion uint16,
+	encode func(*proto.Encoder) error,
+) error {
+	snap, ok := registry.Get(sid)
+	if !ok {
+		return fmt.Errorf("gateway: send for vanished session %d", uint64(sid))
 	}
-	frame, err := proto.EncodeFrame(proto.Header{
-		Opcode:     opcode,
-		MsgVersion: msgVersion,
-		Seq:        seq,
-		Tick:       s.tick(),
-	}, encode)
-	if err != nil {
-		return err
+	if snap.Conn == nil {
+		return fmt.Errorf("gateway: session %d has no connection", uint64(sid))
 	}
-	ca.wmu.Lock()
-	defer ca.wmu.Unlock()
-	return conn.Write(ctx, websocket.MessageBinary, frame)
+	return snap.Conn.WriteBinary(ctx, buildSessionFrame(registry, tick, sid, opcode, msgVersion, encode))
+}
+
+// buildSessionFrame returns the BinaryFrameBuilder for one frame: it
+// allocates the session's next S→C sequence and encodes the frame. It
+// must only ever run inside the connection's writer slot (its caller
+// holds serialization), which is what keeps sequence order and wire
+// order identical.
+func buildSessionFrame(
+	registry *session.Registry,
+	tick TickFunc,
+	sid session.ID,
+	opcode uint16,
+	msgVersion uint16,
+	encode func(*proto.Encoder) error,
+) session.BinaryFrameBuilder {
+	return func() ([]byte, error) {
+		seq, err := registry.NextServerSeq(sid)
+		if err != nil {
+			return nil, err
+		}
+		return proto.EncodeFrame(proto.Header{
+			Opcode:     opcode,
+			MsgVersion: msgVersion,
+			Seq:        seq,
+			Tick:       tick(),
+		}, encode)
+	}
 }

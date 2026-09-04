@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -82,12 +83,33 @@ func Allowed(s State, opcode uint16) bool {
 	}
 }
 
-// Connection is the narrow session-level handle the registry retains so
-// later tasks can force-takeover/kick a session. The gateway adapts its
-// WebSocket connection to this interface; this package never imports a
-// WebSocket implementation.
+// BinaryFrameBuilder constructs exactly one complete binary frame. It
+// runs only while its caller owns the connection's writer slot, so it
+// is where per-connection S→C sequence allocation and frame encoding
+// belong: the order builders execute is exactly the order their frames
+// are physically written. It returns raw bytes only — never proto
+// types — so this package stays transport- and protocol-agnostic.
+type BinaryFrameBuilder func() ([]byte, error)
+
+// Connection is the transport-neutral session-level handle the registry
+// retains so the gateway can deliver frames to — and forcibly retire —
+// a session from any goroutine, including another session's handler
+// (duplicate-login takeover). Implementations own ONE
+// application-writer serialization per connection:
+//
+// WriteBinary acquires that serialization, invokes build exactly once
+// (only after ownership is obtained), writes the returned bytes as one
+// binary message, then releases the serialization. If ctx is cancelled
+// before serialization is obtained, build is never invoked.
+//
+// CloseNow closes the transport immediately WITHOUT waiting for the
+// writer serialization, so a stuck or blocked application write can
+// never prevent a forced takeover; the graceful Close keeps its close
+// handshake. This package never imports a WebSocket implementation.
 type Connection interface {
+	WriteBinary(ctx context.Context, build BinaryFrameBuilder) error
 	Close(reason string) error
+	CloseNow() error
 }
 
 // ID is a process-local monotonic session identifier. IDs are

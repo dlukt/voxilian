@@ -1338,16 +1338,26 @@ func newCharFixture(t *testing.T, nextMarker bool, baseline gateway.BaselineProv
 	if err != nil {
 		t.Fatalf("NewCharacterHandler: %v", err)
 	}
-	// T4a chain when a baseline provider is supplied: CharacterHandler
+	// T4 chain when a baseline provider is supplied: CharacterHandler
 	// owns 121/122/123/126 and delegates 124 to EnterWorldHandler,
-	// which delegates the rest to the recording Next.
+	// which delegates the rest to the recording Next. Both handlers
+	// share ONE WorldExit instance: normal leave_world and forced
+	// takeover are the same world-side quiesce/flush contract.
 	var top gateway.MessageHandler = chars
 	if baseline != nil {
-		enter, err := gateway.NewEnterWorldHandler(svc, f.reg, baseline, f.next)
+		exit := gateway.WorldExitFunc(f.exit.ExitWorld)
+		enter, err := gateway.NewEnterWorldHandler(gateway.EnterWorldHandlerDeps{
+			Characters: svc,
+			Registry:   f.reg,
+			Baseline:   baseline,
+			WorldExit:  exit,
+			Tick:       func() uint32 { return testTick },
+			Next:       f.next,
+		})
 		if err != nil {
 			t.Fatalf("NewEnterWorldHandler: %v", err)
 		}
-		top, err = gateway.NewCharacterHandler(svc, f.reg, gateway.WorldExitFunc(f.exit.ExitWorld), enter)
+		top, err = gateway.NewCharacterHandler(svc, f.reg, exit, enter)
 		if err != nil {
 			t.Fatalf("NewCharacterHandler: %v", err)
 		}
@@ -2190,23 +2200,25 @@ func TestEnterWorldOperationalFailureWS(t *testing.T) {
 	}
 }
 
-// TestEnterWorldSameAccountSerializationWS: A enters and blocks
-// mid-baseline; B's enter cannot overlap it, then receives the staged
-// retry once A is IN_WORLD.
-func TestEnterWorldSameAccountSerializationWS(t *testing.T) {
+// TestEnterWorldSimultaneousTakeoverWS: A enters and blocks
+// mid-baseline; B's enter cannot overlap it; once A completes to
+// IN_WORLD, B takes it over — A is kicked/retired, B becomes the one
+// IN_WORLD session, and the two baselines never overlapped.
+func TestEnterWorldSimultaneousTakeoverWS(t *testing.T) {
 	provider := newWsBaselineFake()
 	provider.setEvents([]wsBaselineEvent{
 		{kind: proto.OpcodeCellSnapshot, snap: intSnap(0, 11)},
+		{kind: proto.OpcodeCellSnapshot, snap: intSnap(1, 12)},
 	})
 	f := newCharFixture(t, false, provider)
 	cA := f.dial(t)
 	accountID := f.helloChar(t, cA)
 	charID := f.enterChar(t, cA, accountID, 2)
+	sidA := f.reg.SessionsBySub("test-sub")[0] // deterministic: A is the only session so far
 
 	cB := f.dial(t)
 	f.helloChar(t, cB)
-	ids := f.reg.SessionsBySub("test-sub")
-	if len(ids) != 2 {
+	if ids := f.reg.SessionsBySub("test-sub"); len(ids) != 2 {
 		t.Fatalf("sessions = %d, want 2", len(ids))
 	}
 
@@ -2216,38 +2228,254 @@ func TestEnterWorldSameAccountSerializationWS(t *testing.T) {
 		t.Fatalf("A 217 = %+v", op)
 	}
 	if h, _ := readFrame(t, cA); h.Opcode != proto.OpcodeCellSnapshot {
-		t.Fatalf("A opcode = %d", h.Opcode)
+		t.Fatalf("A opcode = %d, want 203", h.Opcode)
 	}
-	<-provider.entered
+	<-provider.entered // A holds the account guard mid-baseline
 
-	// B enters while A holds the guard mid-baseline.
+	// B enters while A holds the guard; B's baseline cannot overlap A's.
 	sendEnterWorld(t, cB, 3, 0)
-	// Release A: it completes to IN_WORLD.
 	provider.closeBlock()
+	// A completes: second 203, then 219 -> IN_WORLD.
+	if h, _ := readFrame(t, cA); h.Opcode != proto.OpcodeCellSnapshot {
+		t.Fatalf("A opcode = %d, want second 203", h.Opcode)
+	}
 	if h, _ := readFrame(t, cA); h.Opcode != proto.OpcodeWorldReady {
 		t.Fatalf("A opcode = %d, want 219", h.Opcode)
 	}
-	// B now receives the staged retry; A is untouched.
-	if _, msg := readError(t, cB); msg.Code != proto.ErrorCodeRetry {
-		t.Fatalf("B code = %d, want staged retry", msg.Code)
+	// B's takeover kicks A, then runs B's own baseline.
+	if _, msg := readError(t, cA); msg.Code != proto.ErrorCodeKicked {
+		t.Fatalf("A code = %d, want kicked", msg.Code)
 	}
-	if n := provider.callCount(); n != 1 {
-		t.Errorf("provider calls = %d, want 1 (B never streamed)", n)
+	readClosed(t, cA)
+	if _, op := readCharOp(t, cB); op.OK != proto.CharacterOpOK {
+		t.Fatalf("B 217 = %+v", op)
 	}
-	// A is IN_WORLD and bound; exactly one session is.
+	for i := 0; i < 2; i++ {
+		if h, _ := readFrame(t, cB); h.Opcode != proto.OpcodeCellSnapshot {
+			t.Fatalf("B opcode = %d, want 203", h.Opcode)
+		}
+	}
+	if h, _ := readFrame(t, cB); h.Opcode != proto.OpcodeWorldReady {
+		t.Fatalf("B opcode = %d, want 219", h.Opcode)
+	}
+
+	waitFor(t, "old session cleanup", func() bool { return f.reg.Len() == 1 })
+	if _, ok := f.reg.Get(sidA); ok {
+		t.Error("winner A still registered after takeover")
+	}
 	inWorld := 0
 	for _, id := range f.reg.SessionsBySub("test-sub") {
-		if s, _ := f.reg.Get(id); s.State == session.StateInWorld {
+		s, _ := f.reg.Get(id)
+		if s.State == session.StateInWorld {
 			inWorld++
 			if !s.HasCharacter || s.CharacterID != charID {
-				t.Errorf("A = %+v", s)
+				t.Errorf("B = %+v, want IN_WORLD bound to %d", s, charID)
 			}
-		} else if s.State != session.StateAuthenticated || s.HasCharacter {
-			t.Errorf("B = %+v, want AUTHENTICATED unbound", s)
 		}
 	}
 	if inWorld != 1 {
 		t.Errorf("IN_WORLD sessions = %d, want 1", inWorld)
+	}
+	if n := f.exit.callCount(); n != 1 {
+		t.Errorf("WorldExit calls = %d, want 1 (A flushed once)", n)
+	}
+	if n := provider.callCount(); n != 2 {
+		t.Errorf("provider calls = %d, want 2 (A then B, never overlapping)", n)
+	}
+}
+
+// TestTakeoverKicksOldSameCharacterWS is the healthy duplicate-login
+// proof over real sockets: c1 holds the character IN_WORLD, c2 enters
+// the same character, c1 receives a decodable 202 kicked consuming its
+// OWN sequence (never c2's) with the injected tick, then its
+// connection becomes unusable — while c2 completes 217/baseline/219
+// and becomes the only IN_WORLD session.
+func TestTakeoverKicksOldSameCharacterWS(t *testing.T) {
+	provider := newWsBaselineFake()
+	provider.setEvents([]wsBaselineEvent{
+		{kind: proto.OpcodeCellSnapshot, snap: intSnap(0, 11)},
+	})
+	f := newCharFixture(t, false, provider)
+	c1 := f.dial(t)
+	accountID := f.helloChar(t, c1)            // 200 seq 1
+	charID := f.enterChar(t, c1, accountID, 2) // 217 create seq 2
+
+	sendEnterWorld(t, c1, 3, 0) // 217(3), 203(4), 219(5)
+	if _, op := readCharOp(t, c1); op.OK != proto.CharacterOpOK {
+		t.Fatalf("c1 217 = %+v", op)
+	}
+	if h, _ := readFrame(t, c1); h.Opcode != proto.OpcodeCellSnapshot {
+		t.Fatalf("c1 opcode = %d, want 203", h.Opcode)
+	}
+	if h, _ := readFrame(t, c1); h.Opcode != proto.OpcodeWorldReady {
+		t.Fatalf("c1 opcode = %d, want 219", h.Opcode)
+	}
+	sid1 := f.reg.SessionsBySub("test-sub")[0] // deterministic: c1 is the only session
+	if s := mustGetSession(t, f.reg, sid1); s.State != session.StateInWorld {
+		t.Fatalf("c1 = %+v, want IN_WORLD before takeover", s)
+	}
+
+	// Diverge the two sessions' sequence counters.
+	sendCharList(t, c1, 6) // 216 seq 6 on c1
+	if h, _ := readCharList(t, c1); h.Seq != 6 {
+		t.Fatalf("c1 216 seq = %d, want 6", h.Seq)
+	}
+	c2 := f.dial(t)
+	f.helloChar(t, c2)     // 200 seq 1 on c2
+	sendCharList(t, c2, 2) // 216 seq 2 on c2
+	if h, _ := readCharList(t, c2); h.Seq != 2 {
+		t.Fatalf("c2 216 seq = %d, want 2", h.Seq)
+	}
+
+	sendEnterWorld(t, c2, 3, 0)
+	// c1: decodable kicked 202 with c1's OWN next seq (7) and the
+	// injected tick — no shared account sequence, no reset for c2.
+	header, msg := readError(t, c1)
+	if msg.Code != proto.ErrorCodeKicked {
+		t.Fatalf("c1 code = %d, want kicked", msg.Code)
+	}
+	if header.Seq != 7 {
+		t.Errorf("kicked seq = %d, want 7 (old session's own counter)", header.Seq)
+	}
+	if header.MsgVersion != proto.MessageVersion1 {
+		t.Errorf("kicked msg_version = %d, want 1", header.MsgVersion)
+	}
+	if header.Tick != testTick {
+		t.Errorf("kicked tick = %d, want injected %d", header.Tick, testTick)
+	}
+	// The connection is force-closed; no particular close status is
+	// promised (CloseNow performs no handshake).
+	readClosed(t, c1)
+
+	// c2: its baseline continues ITS counter — 217(3), 203(4), 219(5).
+	h217, op := readCharOp(t, c2)
+	if op.OK != proto.CharacterOpOK {
+		t.Fatalf("c2 217 = %+v", op)
+	}
+	if h217.Seq != 3 {
+		t.Errorf("c2 217 seq = %d, want 3", h217.Seq)
+	}
+	if h, _ := readFrame(t, c2); h.Opcode != proto.OpcodeCellSnapshot || h.Seq != 4 {
+		t.Errorf("c2 203 = opcode %d seq %d, want 203/4", h.Opcode, h.Seq)
+	}
+	h219, p := readFrame(t, c2)
+	if h219.Opcode != proto.OpcodeWorldReady || h219.Seq != 5 {
+		t.Fatalf("c2 219 = opcode %d seq %d, want 219/5", h219.Opcode, h219.Seq)
+	}
+	if _, err := proto.DecodeWorldReady(p); err != nil {
+		t.Fatalf("219 decode: %v", err)
+	}
+
+	// Registry: old fully retired, new indexed, exactly one IN_WORLD.
+	waitFor(t, "old session cleanup", func() bool { return f.reg.Len() == 1 })
+	if _, ok := f.reg.Get(sid1); ok {
+		t.Error("old session still registered")
+	}
+	if got := len(f.reg.SessionsBySub("test-sub")); got != 1 {
+		t.Fatalf("sessions by sub = %d, want 1", got)
+	}
+	sid2 := f.reg.SessionsBySub("test-sub")[0]
+	s2 := mustGetSession(t, f.reg, sid2)
+	if s2.State != session.StateInWorld || !s2.HasCharacter || s2.CharacterID != charID {
+		t.Errorf("new session = %+v, want IN_WORLD bound to %d", s2, charID)
+	}
+	if owner, ok := f.reg.SessionByCharacter(charID); !ok || owner != sid2 {
+		t.Errorf("character index = %d,%v, want the new session", owner, ok)
+	}
+	if n := f.exit.callCount(); n != 1 {
+		t.Errorf("WorldExit calls = %d, want 1", n)
+	}
+	if n := provider.callCount(); n != 2 {
+		t.Errorf("provider calls = %d, want 2", n)
+	}
+}
+
+// TestTakeoverDifferentCharacterWS proves one-world-session-per-account
+// (not merely one-per-character): c1 is IN_WORLD on X, c2 enters the
+// same account's Y — X is flushed and released, c2 baselines Y.
+func TestTakeoverDifferentCharacterWS(t *testing.T) {
+	provider := newWsBaselineFake()
+	provider.setEvents([]wsBaselineEvent{
+		{kind: proto.OpcodeCellSnapshot, snap: intSnap(0, 11)},
+	})
+	f := newCharFixture(t, false, provider)
+	c1 := f.dial(t)
+	accountID := f.helloChar(t, c1)
+	sendCreate(t, c1, 2, validCharCreate(0, "Aria"))
+	if _, op := readCharOp(t, c1); op.OK != proto.CharacterOpOK {
+		t.Fatalf("create Aria = %+v", op)
+	}
+	sendCreate(t, c1, 3, validCharCreate(1, "Bram"))
+	if _, op := readCharOp(t, c1); op.OK != proto.CharacterOpOK {
+		t.Fatalf("create Bram = %+v", op)
+	}
+	rows, err := f.st.ListLiveCharacters(context.Background(), accountID)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("live characters = %+v, %v", rows, err)
+	}
+	var charX, charY int64 // X = slot 0 (Aria, old), Y = slot 1 (Bram, new)
+	for _, r := range rows {
+		if r.Slot == 0 {
+			charX = r.ID
+		} else {
+			charY = r.ID
+		}
+	}
+	sendEnterWorld(t, c1, 4, 0) // 217(4), 203(5), 219(6): IN_WORLD on X
+	if _, op := readCharOp(t, c1); op.OK != proto.CharacterOpOK {
+		t.Fatalf("c1 217 = %+v", op)
+	}
+	if h, _ := readFrame(t, c1); h.Opcode != proto.OpcodeCellSnapshot {
+		t.Fatalf("c1 opcode = %d", h.Opcode)
+	}
+	if h, _ := readFrame(t, c1); h.Opcode != proto.OpcodeWorldReady {
+		t.Fatalf("c1 opcode = %d, want 219", h.Opcode)
+	}
+	sid1 := f.reg.SessionsBySub("test-sub")[0]
+
+	c2 := f.dial(t)
+	f.helloChar(t, c2)
+	sendEnterWorld(t, c2, 2, 1) // slot 1 = Bram
+
+	if _, msg := readError(t, c1); msg.Code != proto.ErrorCodeKicked {
+		t.Fatalf("c1 code = %d, want kicked", msg.Code)
+	}
+	readClosed(t, c1)
+	if _, op := readCharOp(t, c2); op.OK != proto.CharacterOpOK {
+		t.Fatalf("c2 217 = %+v", op)
+	}
+	if h, _ := readFrame(t, c2); h.Opcode != proto.OpcodeCellSnapshot {
+		t.Fatalf("c2 opcode = %d, want 203", h.Opcode)
+	}
+	if h, _ := readFrame(t, c2); h.Opcode != proto.OpcodeWorldReady {
+		t.Fatalf("c2 opcode = %d, want 219", h.Opcode)
+	}
+
+	// WorldExit flushed the OLD character X; the baseline served Y.
+	if n := f.exit.callCount(); n != 1 {
+		t.Fatalf("WorldExit calls = %d, want 1", n)
+	}
+	if ob := f.exit.observedCopy(); len(ob) != 1 || ob[0].CharacterID != charX {
+		t.Errorf("WorldExit observed = %+v, want the old character %d", ob, charX)
+	}
+	provider.mu.Lock()
+	sawChar := provider.sawChar
+	provider.mu.Unlock()
+	if sawChar != charY {
+		t.Errorf("baseline character = %d, want requested %d", sawChar, charY)
+	}
+
+	waitFor(t, "old session cleanup", func() bool { return f.reg.Len() == 1 })
+	if _, ok := f.reg.Get(sid1); ok {
+		t.Error("old session still registered")
+	}
+	if _, ok := f.reg.SessionByCharacter(charX); ok {
+		t.Error("old character X still indexed")
+	}
+	sid2 := f.reg.SessionsBySub("test-sub")[0]
+	s2 := mustGetSession(t, f.reg, sid2)
+	if s2.State != session.StateInWorld || !s2.HasCharacter || s2.CharacterID != charY {
+		t.Errorf("new session = %+v, want IN_WORLD bound to %d", s2, charY)
 	}
 }
 

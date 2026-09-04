@@ -145,9 +145,19 @@ func (n *recordingNext) Handle(
 	})
 }
 
+// exitCall records one ExitWorld invocation's full argument tuple so
+// takeover tests can prove the OLD session's sid/account/character
+// were flushed — never the requested new character.
+type exitCall struct {
+	sid  session.ID
+	acct int64
+	char int64
+}
+
 type recordingExit struct {
 	mu       sync.Mutex
 	calls    int
+	args     []exitCall
 	block    chan struct{} // when non-nil, ExitWorld waits for close
 	entered  chan struct{}
 	err      error
@@ -171,8 +181,7 @@ func (w *recordingExit) ExitWorld(
 			w.observed = append(w.observed, snap)
 		}
 	}
-	_ = sid
-	_ = accountID
+	w.args = append(w.args, exitCall{sid: sid, acct: accountID, char: characterID})
 	block := w.block
 	err := w.err
 	w.calls++
@@ -224,6 +233,13 @@ func (w *recordingExit) callCount() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.calls
+}
+
+// lastArgs returns a copy of the recorded ExitWorld argument tuples.
+func (w *recordingExit) argCopy() []exitCall {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]exitCall(nil), w.args...)
 }
 
 // ---------------------------------------------------------------------------

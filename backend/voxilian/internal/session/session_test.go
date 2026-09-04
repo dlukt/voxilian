@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -10,10 +11,42 @@ import (
 	"time"
 )
 
-type stubConn struct{ closed []string }
+// stubConn is the minimal test Connection: it mimics the production
+// writer contract (build runs only while the slot is held) and records
+// frames plus Close/CloseNow.
+type stubConn struct {
+	mu        sync.Mutex
+	frames    [][]byte
+	buildErr  error
+	closed    []string
+	closeNows int
+}
+
+func (c *stubConn) WriteBinary(_ context.Context, build BinaryFrameBuilder) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.buildErr != nil {
+		return c.buildErr
+	}
+	frame, err := build()
+	if err != nil {
+		return err
+	}
+	c.frames = append(c.frames, frame)
+	return nil
+}
 
 func (c *stubConn) Close(reason string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.closed = append(c.closed, reason)
+	return nil
+}
+
+func (c *stubConn) CloseNow() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closeNows++
 	return nil
 }
 
