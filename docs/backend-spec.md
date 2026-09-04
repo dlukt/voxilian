@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.9 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.10 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -251,7 +251,10 @@ permissions (anything else → `202 error{bad_state}`):
 ```
 
 - `121 character_list {}` → `216 character_list {count u16 +
-  [[u16 entryLen]{slot u8, charName string, level u16}]...}`.
+  [[u16 entryLen]{slot u8, charName string, level u16}]...}`. `level`
+  means `characters.vitals.base_max` (HP/BaseMaxHP is the character's
+  level, so fresh characters list as 20). Malformed persisted vitals
+  are a server-side invariant failure — never silently emit level 0.
 - `122 character_create {slot u8 (0/1), name string, gender u8,
   face {hairStyle u8, hairColor u8, skinTone u8, parts u8[5]},
   stats u8[6], spells {count u16 + u16[..]}, skills {count u16 +
@@ -260,7 +263,14 @@ permissions (anything else → `202 error{bad_state}`):
   `bad_budget`). Slot + stats + budget validated server-side per §9; row
   created in the same PG txn (§8.1).
 - `123 character_delete {slot u8}` → `217 character_op` (soft-delete;
-  name becomes reusable, §8).
+  name becomes reusable, §8). Invalid or empty slot → `217
+  {op=delete, ok=0}`. Deletion runs under the same per-account
+  lifecycle guard as `enter_world`/`leave_world`/takeover, and a target
+  character bound to ANY live session in `CHARACTER_SELECTED` or
+  `IN_WORLD` (i.e. being streamed/loaded, not only fully in-world) is
+  rejected with `202 error{character_in_use}`. The store performs the
+  revision-CAS soft-delete; a stale CAS / transient persistence
+  conflict surfaces as `202 error{retry}` at the WS layer.
 - `124 enter_world {slot u8}` → loads character, binds session to it
   (`AUTHENTICATED → CHARACTER_SELECTED`), then streams the baseline:
   `217 character_op{enter,ok}`, then `203 cell_snapshot` (+ `218
@@ -270,7 +280,14 @@ permissions (anything else → `202 error{bad_state}`):
   first snapshot is NOT the boundary; `world_ready` is.
 - `126 leave_world {}` → unbinds the character (AOI cleared, presence
   dropped, dirty state flushed), session back to `AUTHENTICATED`. This
-  is how characters are switched WITHOUT reconnecting.
+  is how characters are switched WITHOUT reconnecting. Required
+  ordering: hold the per-account lifecycle guard → quiesce/clear
+  AOI/drop presence/flush dirty character through the world seam →
+  only after successful flush, unbind the character and transition
+  `IN_WORLD → AUTHENTICATED`. A failed flush yields `202
+  error{retry}` with the session still `IN_WORLD` and the character
+  still bound — no partial leave. No response opcode is defined for a
+  successful leave.
 - `125 ack {ackSeq u32}` — client acknowledges highest applied S→C
   `seq`. ACKs drive flow control only (§7); the server keeps NO replay
   buffer. Reconnect (new WS + `hello`) ALWAYS performs a full resync
@@ -291,6 +308,36 @@ quiesced/flushed (or its session directly rebound) BEFORE the
 replacement finishes its baseline and receives `world_ready` — a new
 connection MUST NOT load stale PG state while the old connection still
 holds dirty in-memory state.
+
+#### 6.1.1 `217 character_op` numeric registry (frozen, v0.3.10)
+
+The wire layout is unchanged: `217 character_op {op u8, ok u8}`.
+
+```text
+op:
+    1 = create
+    2 = delete
+    3 = enter_world
+
+ok:
+    0 = rejected / operation did not happen
+    1 = success
+```
+
+Values outside these remain reserved for future additive semantics;
+adding named values does not change the layout or require a
+`msg_version` bump. Current server semantics: create success →
+`217 {op=1, ok=1}`; delete success → `217 {op=2, ok=1}`; enter_world
+success → `217 {op=3, ok=1}`. `ok=0` is used only for simple request
+rejection where no more specific machine-readable `202` code exists
+(e.g. invalid slot, missing character in the requested slot,
+syntactically invalid display name). `ok=0` MUST NOT stand in for
+`name_taken`, `slot_occupied`, `bad_stats`, `bad_budget`,
+`character_in_use`, or `retry` — those keep their `202` numeric codes.
+Name rejection splits accordingly: invalid syntax → `217
+{op=create, ok=0}`; blocklisted/reserved/live-name conflict → `202
+error{name_taken}` (deliberately revealing only "unavailable", never
+which list matched). No new wire error code is added for names.
 
 ### 6.2 Connect / re-auth
 
@@ -687,6 +734,12 @@ read protos/listing IDs from an IMMUTABLE IN-MEMORY REGISTRY loaded
 from PG at startup/world load — gameplay hot paths MUST NOT query PG
 for prototype data (this also keeps combat/loot working under the §10
 PG-outage grace). A reseed swaps a validated registry atomically.
+The seed/runtime registry MUST also carry enough creation metadata to
+back the M3 creation seam (§9): new-character eligibility, initial
+ability value/rule, the free default spell stable ID, starter
+Mace/Coins stable item protos, starter spawn/hometown, and the
+blocklist/reserved-name policy. M9 decides the final source-file
+schema; T3a stays independent from M9 by interface.
 
 Wire-visible stable IDs are `u16` on the wire but MUST be `INTEGER NOT
 NULL CHECK (id BETWEEN 1 AND 65535)` in PG — never `SMALLINT` (signed,
@@ -845,14 +898,49 @@ ledger is never replayed.
 ## 9. Gameplay services (what sim MUST enforce; numbers in `meridian59.md`)
 
 - Creation: `122 character_create` validates slot 0/1 (+ transactional
-  uniqueness, §8), name — Unicode letters/marks/numbers plus space,
-  apostrophe, hyphen; NFC-normalized FIRST, then length counted as 3–16
-  Unicode CODE POINTS (not grapheme clusters, not bytes);
-  case-insensitive global-live-unique (CITEXT partial index); blocklist
-  (`seed/blocklist.yaml`) matched EXACT-NAME after normalization +
-  case-folding (no substring matching); reserved names likewise — 6×(1–50) + sum ≤ 200, 45-pt
-  ability budget (L2=25 else 10); grant Blink + Mace + 500
-  (+leaving-newbie-zone package); karma seed. All in one PG txn (§8.1).
+  uniqueness, §8). Name handling (frozen): NFC-normalize FIRST and
+  persist the NFC form; count Unicode CODE POINTS after normalization
+  (3–16 inclusive; not grapheme clusters, not bytes); permit only
+  Unicode Letter/Mark/Number plus ASCII space (U+0020), apostrophe
+  (U+0027), hyphen-minus (U+002D) — reject everything else (no
+  trimming, collapsing, lowercasing, accent-stripping, or any silent
+  rewrite besides NFC); blocklist/reserved matched EXACT-NAME on the
+  NFC + Unicode case-folded key (no substring matching, nothing extra
+  persisted); live names stay case-insensitive global-live-unique via
+  the CITEXT partial index as the final race authority. Name staging:
+  M3 validates against an injected immutable NamePolicy
+  (blocked + reserved exact-name sets); M9-T1 loads the production
+  blocklist/reserved data and supplies the runtime policy — M3 creates
+  no `seed/` content files. Stats order Might/Intellect/Stamina/Agility/
+  Mysticism/Aim, each 1–50, sum ≤ 200 (no joke-punishment characters;
+  invalid input is rejected with `bad_stats`). Ability budget: the wire
+  carries only stable IDs, resolved through injected creation metadata
+  (no per-ability PG SELECT in the hot path); each selected spell/skill
+  must be offered to new characters at level 1 (10 pts) or 2 (25 pts);
+  total ≤ 45; unknown/unoffered/bad-level/duplicate IDs, explicit
+  selection of a server-granted free spell, and over-budget totals are
+  `bad_budget` (spell and skill IDs are separate namespaces). Trusted
+  creation metadata also supplies: free default spell(s) (currently
+  Blink, server-added, uncharged), starter Mace + 500-Coins templates,
+  hometown, and spawn position — M3 implements the mechanism, M9
+  supplies the real content IDs/metadata; no canonical IDs are
+  hard-coded in M3. Resolved initial abilities must be 1–99 with
+  `atrophy_flag = false`; broken trusted metadata is an internal
+  content error, never `bad_budget`. Karma from the final starting
+  spell set by school: Qor-only −20, Shalille-only +20, both or
+  neither 0 (literal integers, no hidden scaling). Initial vitals JSON:
+  `hp/base_max/max = 20`, `mana/max_mana = 15 + Mysticism/5` (integer
+  division), `vigor = 100`, `threshold = 80`, `stomach = 0`;
+  `advancement = {}`, `flags = 0` (progression machinery belongs to
+  later milestones). `face` persists as
+  `{"hair_style","hair_color","skin_tone","parts":[5×u8]}` (no cosmetic
+  range validation); `gender` persists as the raw wire integer (no
+  numeric sex semantics invented here). Creation is ONE PG transaction:
+  character root + selected spell/skill rows + free spell + starter
+  Mace/Coins instances with inventory locations (starter enchants `{}`
+  unless the trusted template says otherwise); any child/item failure
+  rolls back the root too. The leaving-newbie-zone package (+1000,
+  reagents, apples, uptime bonus) is NOT part of initial creation.
 - Vitals/regen: HP=level (20 start, cap `100+Stam`/150); mana `15+Myst/5`
   + nodes; vigor/exertion/rest thresholds; hunger decay; exact M59 formulas,
   constants server-side (`world.toml`/flags, not client).
@@ -1032,6 +1120,11 @@ ledger is never replayed.
 
 ## 14. Version history
 
+- v0.3.10: freeze character CRUD semantics — character_op numeric values,
+  NFC/name-policy handling, creation-content staging, transactional starter
+  state, character-list level source, safe delete semantics, and split the
+  oversized M3-T3 into persistence/domain T3a plus WS T3b; opcode 124 is
+  owned wholly by T4.
 - v0.3.9: freeze M3-T2 auth staging — jwx v4 baseline, immutable
   startup JWKS for M3 with rotation/cache hardening deferred to M11,
   race-safe account auto-provisioning, and exact token-expiry + 90 s

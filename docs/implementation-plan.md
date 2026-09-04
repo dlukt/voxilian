@@ -1,6 +1,6 @@
 # Voxilian Backend — Implementation Plan (v1.2)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.9).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.10).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -88,8 +88,9 @@ Exit: full §6.1 state machine live over real WS; char CRUD end-to-end against P
 
 - [x] **M3-T1** WS server + session registry (`sessionID → {sub,accountID,charID?,conn,state,tokenExp}`, indexed by sub+character; per-account lifecycle guard mutex). States + per-opcode permission table enforced; `bad_state` errors. Tests: illegal-state matrix. Spec: §6.1, §7.
 - [x] **M3-T2** Auth hookup (JWT validation behind interface; startup-JWKS baseline: one fetch at construction, immutable key set, no cache/rotation yet): `100 hello` → JWKS check → account auto-provision → `200 welcome`; `101 reauth`; 90 s hard deadline (intents rejected post-grace, then disconnect). Tests with forged/expired tokens. Spec: §6.2, §11.
-- [ ] **M3-T3** Character CRUD over WS: `121–124` + `217` results + error codes (`name_taken/slot_occupied/bad_stats/bad_budget/character_in_use`); display-name rules per spec §9 (charset/NFC/length/blocklist — decided, no ambiguity left); `126 leave_world` (AOI clear, flush, →AUTHENTICATED); single-txn create per §8.1. Testcontainers tests incl. concurrent double-create race (one wins). Spec: §6.1, §8, §9.
-- [ ] **M3-T4** `enter_world` baseline against a fake `BaselineProvider`/`WorldStream` interface (NOT the real world): `CHARACTER_SELECTED` → snapshots + paced `218`s + `220`s → `219 world_ready` barrier verified. Duplicate-login/takeover: kick-old, quiesce/flush-before-baseline, per-account serialization test. M10-T4 swaps the fake for real cells/chunks/vendors. Spec: §6.1.
+- [ ] **M3-T3a** Character creation/domain + PostgreSQL persistence: name/NFC/policy validation; stats + 45-point ability validation behind an injected creation-content seam; transactional root + abilities + starter inventory; list/find/delete persistence primitives; Testcontainers including concurrent double-create race. No WS semantics. Spec: §6.1, §8, §9.
+- [ ] **M3-T3b** Character WS handler: 121 list, 122 create, 123 delete + 216/217/202 mappings; per-account deletion/in-use serialization; 126 leave_world via fake WorldExit seam with flush-before-unbind; real WebSocket integration tests. Opcode 124 belongs wholly to M3-T4. Spec: §6.1, §8, §9.
+- [ ] **M3-T4** `enter_world` (opcode 124, wholly owned here) against a fake `BaselineProvider`/`WorldStream` interface (NOT the real world): decode slot, lookup character, account lifecycle arbitration, bind character, `AUTHENTICATED → CHARACTER_SELECTED`, `217 {enter_world,1}`, snapshots + paced `218`s + `220`s → `219 world_ready` barrier, `CHARACTER_SELECTED → IN_WORLD`. Duplicate-login/takeover: kick-old, quiesce/flush-before-baseline, per-account serialization test. M10-T4 swaps the fake for real cells/chunks/vendors. Spec: §6.1.
 - [ ] **M3-T5** Backpressure: two-lane bounded outbound queues (coalescible vs critical), `125 ack` flow control, slow-client disconnect + full-resync test, saturation metrics, cell-owner non-blocking rule (no indefinite block; fail-closed disconnect). Load-ish test with fake slow peer. Spec: §7.1.
 - [ ] **M3 exit criteria met** (lifecycle fuzz/property test: random opcode sequences never violate state table).
 
@@ -151,7 +152,7 @@ Exit: atomic player trade + bank/vault with ledger audit; race tests green.
 
 Exit: every school/skill/mob/weapon/armor in versioned seed files, `voxilian seed` idempotent into catalog tables.
 
-- [ ] **M9-T1** Seed pipeline: file format + validator (CHECK-mirroring) + `voxilian seed` built ON the M1-T6d registry API (no direct pgx outside `store`) + idempotent version-ruled upsert. One sample school to prove it. Spec: §8.2 (new), §10 seed bullet.
+- [ ] **M9-T1** Seed pipeline: file format + validator (CHECK-mirroring) + `voxilian seed` built ON the M1-T6d registry API (no direct pgx outside `store`) + idempotent version-ruled upsert. One sample school to prove it. The pipeline/registry must also carry the M3 creation metadata (new-character eligibility, initial ability values, free default spell, starter Mace/Coins protos, starter spawn/hometown, blocklist/reserved-name policy). Spec: §8.2 (new), §10 seed bullet.
 - [ ] **M9-T2** School Shal'ille (all spells: costs/effects/reqs). Spec: meridian59 §5.
 - [ ] **M9-T3** School Qor. Spec: meridian59 §5.
 - [ ] **M9-T4** School Kraanan. Spec: meridian59 §5.
@@ -208,8 +209,9 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M1-T6a…c, T7a…c, T8 | per-table predecessor migrations | `backend/voxilian/queries/`, `internal/store` |
 | M2-T1, T2, T3a…c, T4, T5 | M0 | `backend/voxilian/internal/proto`, repo-root `testdata/protocol/` |
 | M3-T1, T2, T5 | M1-T8 (migrate CLI), M2-T1, M2-T2 | `backend/voxilian/internal/{auth,gateway,session,store}` |
-| M3-T3 | M1-T7a (character CAS), M2-T2 | `backend/voxilian/internal/{gateway,session}` |
-| M3-T4 | M1-T7a, M2-T3b, M2-T3c, M3-T3 | fake baseline + barrier (real world in M10-T4) |
+| M3-T3a | M1-T7a (character CAS), M2-T2 | `backend/voxilian/internal/character`, `internal/store` |
+| M3-T3b | M3-T3a | `backend/voxilian/internal/{gateway,session,character}` |
+| M3-T4 | M1-T7a, M2-T3b, M2-T3c, M3-T3b | complete opcode 124 + fake baseline/world seams (real world in M10-T4) |
 | M4-T1, T2, T5 | M2-T3a/b, M3-T1 | `backend/voxilian/internal/sim` |
 | M4-T3a…c, T4 | M1-T7a…c (CAS), M3-T1 | `backend/voxilian/internal/sim`, `internal/store` |
 | M5-T1…T6 | M4-T1, M4-T2 | `backend/voxilian/internal/sim` (combat/vitals/intents) |
@@ -237,7 +239,8 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 110–113 offer/counter/accept/cancel | M8-T1 | trade machine |
 | 114 buy | M8-T2 | vendor listings |
 | 120 respawn_ack | M5-T5 | death pipeline |
-| 121–124 char CRUD, 126 leave | M3-T3/M3-T4 | lifecycle |
+| 121–123 char CRUD, 126 leave | M3-T3b | lifecycle |
+| 124 enter_world | M3-T4 (wholly) | lifecycle |
 | 125 ack | M3-T5 | flow control |
 
 ## Plan history
