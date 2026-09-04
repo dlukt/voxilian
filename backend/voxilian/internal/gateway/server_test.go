@@ -2068,8 +2068,8 @@ func TestEnterWorldBaselineWS(t *testing.T) {
 	}
 	// Registry is IN_WORLD and bound; provider got internal IDs only.
 	ids := f.reg.SessionsBySub("test-sub")
-	snap, _ := f.reg.Get(ids[0])
-	if snap.State != session.StateInWorld || !snap.HasCharacter || snap.CharacterID != charID {
+	snap := waitForSessionState(t, f.reg, ids[0], session.StateInWorld)
+	if !snap.HasCharacter || snap.CharacterID != charID {
 		t.Errorf("after enter: %+v, want IN_WORLD bound to %d", snap, charID)
 	}
 	if owner, ok := f.reg.SessionByCharacter(charID); !ok || owner != ids[0] {
@@ -2129,9 +2129,7 @@ func TestEnterWorldBarrierWS(t *testing.T) {
 	if _, err := proto.DecodeWorldReady(p); err != nil {
 		t.Fatalf("219 decode: %v", err)
 	}
-	if s := mustGetSession(t, f.reg, sid); s.State != session.StateInWorld {
-		t.Errorf("final = %+v, want IN_WORLD", s)
-	}
+	waitForSessionState(t, f.reg, sid, session.StateInWorld)
 }
 
 func mustGetSession(t *testing.T, r *session.Registry, id session.ID) session.Snapshot {
@@ -2140,6 +2138,25 @@ func mustGetSession(t *testing.T, r *session.Registry, id session.ID) session.Sn
 	if !ok {
 		t.Fatalf("session %d vanished", uint64(id))
 	}
+	return snap
+}
+
+// waitForSessionState polls until the session reaches want. Reading the
+// 219 world_ready frame from the client proves the PHYSICAL WRITE; the
+// registry's CHARACTER_SELECTED→IN_WORLD completion runs on the handler
+// goroutine immediately after its send returns, so the two observations
+// race. The poll is bounded and fails loudly — completion that never
+// happens still fails the test.
+func waitForSessionState(t *testing.T, r *session.Registry, id session.ID, want session.State) session.Snapshot {
+	t.Helper()
+	var snap session.Snapshot
+	waitFor(t, fmt.Sprintf("session %d to reach %s", uint64(id), want), func() bool {
+		s, ok := r.Get(id)
+		if ok {
+			snap = s
+		}
+		return ok && s.State == want
+	})
 	return snap
 }
 
@@ -2195,9 +2212,7 @@ func TestEnterWorldOperationalFailureWS(t *testing.T) {
 	if h, _ := readFrame(t, c); h.Opcode != proto.OpcodeWorldReady {
 		t.Fatalf("opcode = %d, want 219", h.Opcode)
 	}
-	if s := mustGetSession(t, f.reg, sid); s.State != session.StateInWorld {
-		t.Errorf("final = %+v", s)
-	}
+	waitForSessionState(t, f.reg, sid, session.StateInWorld)
 }
 
 // TestEnterWorldSimultaneousTakeoverWS: A enters and blocks
@@ -2311,9 +2326,7 @@ func TestTakeoverKicksOldSameCharacterWS(t *testing.T) {
 		t.Fatalf("c1 opcode = %d, want 219", h.Opcode)
 	}
 	sid1 := f.reg.SessionsBySub("test-sub")[0] // deterministic: c1 is the only session
-	if s := mustGetSession(t, f.reg, sid1); s.State != session.StateInWorld {
-		t.Fatalf("c1 = %+v, want IN_WORLD before takeover", s)
-	}
+	waitForSessionState(t, f.reg, sid1, session.StateInWorld)
 
 	// Diverge the two sessions' sequence counters.
 	sendCharList(t, c1, 6) // 216 seq 6 on c1
@@ -2375,8 +2388,8 @@ func TestTakeoverKicksOldSameCharacterWS(t *testing.T) {
 		t.Fatalf("sessions by sub = %d, want 1", got)
 	}
 	sid2 := f.reg.SessionsBySub("test-sub")[0]
-	s2 := mustGetSession(t, f.reg, sid2)
-	if s2.State != session.StateInWorld || !s2.HasCharacter || s2.CharacterID != charID {
+	s2 := waitForSessionState(t, f.reg, sid2, session.StateInWorld)
+	if !s2.HasCharacter || s2.CharacterID != charID {
 		t.Errorf("new session = %+v, want IN_WORLD bound to %d", s2, charID)
 	}
 	if owner, ok := f.reg.SessionByCharacter(charID); !ok || owner != sid2 {
@@ -2473,8 +2486,8 @@ func TestTakeoverDifferentCharacterWS(t *testing.T) {
 		t.Error("old character X still indexed")
 	}
 	sid2 := f.reg.SessionsBySub("test-sub")[0]
-	s2 := mustGetSession(t, f.reg, sid2)
-	if s2.State != session.StateInWorld || !s2.HasCharacter || s2.CharacterID != charY {
+	s2 := waitForSessionState(t, f.reg, sid2, session.StateInWorld)
+	if !s2.HasCharacter || s2.CharacterID != charY {
 		t.Errorf("new session = %+v, want IN_WORLD bound to %d", s2, charY)
 	}
 }
@@ -2552,7 +2565,5 @@ func TestEnterWorldSlotMappingWS(t *testing.T) {
 		t.Fatalf("opcode = %d, want 219 (empty baseline)", h.Opcode)
 	}
 	ids := f.reg.SessionsBySub("test-sub")
-	if s, _ := f.reg.Get(ids[0]); s.State != session.StateInWorld {
-		t.Errorf("final = %+v", s)
-	}
+	waitForSessionState(t, f.reg, ids[0], session.StateInWorld)
 }

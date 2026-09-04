@@ -160,6 +160,12 @@ type ServerDeps struct {
 	Now      NowFunc
 	Schedule ScheduleFunc
 
+	// Outbound is the per-session outbound queue policy (spec §7.1.1);
+	// the zero value uses DefaultOutboundPolicy. OutboundObserver is
+	// the no-op-by-default observation seam (spec §7.1.12).
+	Outbound         OutboundPolicy
+	OutboundObserver OutboundObserver
+
 	Handler MessageHandler
 }
 
@@ -177,6 +183,8 @@ type Server struct {
 	tick      TickFunc
 	now       NowFunc
 	schedule  ScheduleFunc
+	outbound  OutboundPolicy
+	observer  OutboundObserver
 	handler   MessageHandler
 }
 
@@ -190,7 +198,15 @@ func NewServer(deps ServerDeps) *Server {
 		tick:      deps.Tick,
 		now:       deps.Now,
 		schedule:  deps.Schedule,
+		outbound:  deps.Outbound,
+		observer:  deps.OutboundObserver,
 		handler:   deps.Handler,
+	}
+	if s.outbound.MaxMessages <= 0 {
+		s.outbound = DefaultOutboundPolicy()
+	}
+	if s.observer == nil {
+		s.observer = noopOutboundObserver{}
 	}
 	if s.validator == nil {
 		s.validator = auth.ValidatorFunc(func(context.Context, string) (auth.Identity, error) {
@@ -243,9 +259,10 @@ type connAuth struct {
 }
 
 // ServeHTTP accepts one WebSocket connection and serves it until it
-// terminates, then cancels its deadline timer and removes its session
-// from the registry (idempotent cleanup of sub/character indexes and
-// connection references).
+// terminates, then stops its outbound queue (failing any pending
+// synchronous waiters and ending the writer pump), cancels its deadline
+// timer, and removes its session from the registry (idempotent cleanup
+// of sub/character indexes and connection references).
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, nil)
 	if err != nil {
@@ -253,6 +270,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wsConn := newWSConnection(conn)
+	// T5a (spec §7.1): every session's normal traffic flows through its
+	// bounded two-lane outbound queue; the low-level wsConnection gate
+	// stays the one physical serialization for queued AND terminal
+	// (kicked / deadline) writes.
+	out := newOutboundConn(OutboundDeps{
+		Conn:     wsConn,
+		Registry: s.Registry,
+		Tick:     s.tick,
+		Policy:   s.outbound,
+		Observer: s.observer,
+	})
 	defer func() {
 		_ = wsConn.Close("closing")
 	}()
@@ -262,9 +290,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(proto.MaxFrameSize)
 
 	ctx := r.Context()
-	sid := s.Registry.Create(wsConn)
+	sid := s.Registry.Create(out)
 	ca := &connAuth{}
 	defer func() {
+		out.StopOutbound("client disconnected")
 		s.cancelDeadline(ca)
 		s.Registry.Remove(sid)
 	}()
@@ -336,10 +365,12 @@ func (s *Server) handleBinary(
 	}
 	// Hard authorization deadline, enforced synchronously before any
 	// dispatch — handler, gameplay, or reauth. A CONNECTED session has
-	// no established token and is exempt.
+	// no established token and is exempt. The 202 goes out through the
+	// DIRECT low-level writer: terminal control never waits behind a
+	// saturated outbound queue (spec §7.1.9).
 	if snap.State != session.StateConnected &&
 		!s.now().Before(snap.TokenExp.Add(ReauthGrace)) {
-		_ = s.sendError(ctx, sid,
+		_ = s.sendDirectError(ctx, sid,
 			proto.ErrorCodeSessionExpired, "reauth deadline exceeded")
 		return errAuthDeadline
 	}
@@ -529,6 +560,13 @@ func (s *Server) cancelDeadline(ca *connAuth) {
 	}
 }
 
+// deadlineWriteBudget bounds the best-effort DIRECT session_expired
+// write (spec §7.1.9): a saturated outbound queue or a busy physical
+// writer must never stall the deadline callback behind normal traffic.
+// Like the T4b kick budget it is an M3 control-write budget, not a wire
+// contract.
+var deadlineWriteBudget = 2 * time.Second
+
 // onDeadline terminates a connection whose hard deadline passed, even
 // when idle: best-effort 202 session_expired on a bounded context, then
 // close (which unblocks the read loop into cleanup). Stale callbacks —
@@ -551,9 +589,9 @@ func (s *Server) onDeadline(ca *connAuth, sid session.ID, gen uint64, dl time.Ti
 	if s.now().Before(dl) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), deadlineWriteBudget)
 	defer cancel()
-	_ = s.sendError(ctx, sid, proto.ErrorCodeSessionExpired, "reauth deadline exceeded")
+	_ = s.sendDirectError(ctx, sid, proto.ErrorCodeSessionExpired, "reauth deadline exceeded")
 	// Close asynchronously: the close handshake waits for the peer's
 	// response, which must never block this timer callback (an idle or
 	// dead peer would stall it up to the library's handshake timeout).
@@ -570,7 +608,8 @@ func (s *Server) onDeadline(ca *connAuth, sid session.ID, gen uint64, dl time.Ti
 
 // sendError writes one 202 error frame: MessageVersion1, the next S→C
 // session sequence, the injected tick, and the numeric code plus a
-// diagnostic message clients must not parse for control flow.
+// diagnostic message clients must not parse for control flow. Ordinary
+// 202s are critical queued traffic (spec §7.1.3).
 func (s *Server) sendError(
 	ctx context.Context,
 	sid session.ID,
@@ -583,8 +622,26 @@ func (s *Server) sendError(
 	})
 }
 
+// sendDirectError writes one 202 through the DIRECT low-level writer:
+// terminal control traffic (the hard authorization deadline, spec
+// §7.1.9) never enters — never waits behind — the normal outbound
+// queue. Best-effort; the connection closes right after.
+func (s *Server) sendDirectError(
+	ctx context.Context,
+	sid session.ID,
+	code uint16,
+	msg string,
+) error {
+	return sendDirectSessionFrame(ctx, s.Registry, s.tick, sid, proto.OpcodeError, proto.MessageVersion1,
+		func(e *proto.Encoder) error {
+			proto.ErrorMessage{Code: code, Message: msg}.Encode(e)
+			return nil
+		})
+}
+
 // send writes one frame through the shared session-frame path: the
-// ONLY way the gateway puts an application binary message on the wire.
+// ONLY way the gateway puts a normal application binary message on the
+// wire.
 func (s *Server) send(
 	ctx context.Context,
 	sid session.ID,
@@ -595,13 +652,24 @@ func (s *Server) send(
 	return sendSessionFrame(ctx, s.Registry, s.tick, sid, opcode, msgVersion, encode)
 }
 
-// sendSessionFrame is the one frame-writing path shared by normal
-// current-session replies and cross-session writes (duplicate-login
-// takeover): snapshot the session's connection, acquire that
-// connection's writer serialization, and only then allocate the S→C
-// sequence and encode the frame. Because allocation happens inside the
-// writer slot, the order frames are physically written is exactly the
-// order their sequence numbers are allocated — never N+1 before N.
+// connForSend resolves the live connection for one send target.
+func connForSend(registry *session.Registry, sid session.ID) (session.Connection, error) {
+	snap, ok := registry.Get(sid)
+	if !ok {
+		return nil, fmt.Errorf("gateway: send for vanished session %d", uint64(sid))
+	}
+	if snap.Conn == nil {
+		return nil, fmt.Errorf("gateway: session %d has no connection", uint64(sid))
+	}
+	return snap.Conn, nil
+}
+
+// sendSessionFrame is the one NORMAL frame-writing path shared by
+// current-session replies and queued traffic: it resolves the session's
+// connection and, when that connection is queue-capable, admits the
+// frame as synchronous CRITICAL traffic whose return means a physical
+// write (spec §7.1.5). Non-queue connections (test doubles) keep the
+// direct writer-slot path unchanged.
 func sendSessionFrame(
 	ctx context.Context,
 	registry *session.Registry,
@@ -611,14 +679,36 @@ func sendSessionFrame(
 	msgVersion uint16,
 	encode func(*proto.Encoder) error,
 ) error {
-	snap, ok := registry.Get(sid)
-	if !ok {
-		return fmt.Errorf("gateway: send for vanished session %d", uint64(sid))
+	conn, err := connForSend(registry, sid)
+	if err != nil {
+		return err
 	}
-	if snap.Conn == nil {
-		return fmt.Errorf("gateway: session %d has no connection", uint64(sid))
+	if producer, ok := conn.(OutboundProducer); ok {
+		return producer.SendCritical(ctx, sid, opcode, msgVersion, encode)
 	}
-	return snap.Conn.WriteBinary(ctx, buildSessionFrame(registry, tick, sid, opcode, msgVersion, encode))
+	return conn.WriteBinary(ctx, buildSessionFrame(registry, tick, sid, opcode, msgVersion, encode))
+}
+
+// sendDirectSessionFrame bypasses the outbound queue entirely and is
+// used ONLY by terminal control traffic (spec §7.1.9): it acquires the
+// connection's writer serialization, and only then allocates the S→C
+// sequence and encodes the frame. Because allocation happens inside the
+// writer slot, the order frames are physically written is exactly the
+// order their sequence numbers are allocated — never N+1 before N.
+func sendDirectSessionFrame(
+	ctx context.Context,
+	registry *session.Registry,
+	tick TickFunc,
+	sid session.ID,
+	opcode uint16,
+	msgVersion uint16,
+	encode func(*proto.Encoder) error,
+) error {
+	conn, err := connForSend(registry, sid)
+	if err != nil {
+		return err
+	}
+	return conn.WriteBinary(ctx, buildSessionFrame(registry, tick, sid, opcode, msgVersion, encode))
 }
 
 // buildSessionFrame returns the BinaryFrameBuilder for one frame: it
