@@ -1,0 +1,516 @@
+package session
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"sort"
+	"sync"
+	"testing"
+	"time"
+)
+
+type stubConn struct{ closed []string }
+
+func (c *stubConn) Close(reason string) error {
+	c.closed = append(c.closed, reason)
+	return nil
+}
+
+func TestStateString(t *testing.T) {
+	cases := map[State]string{
+		StateConnected:         "CONNECTED",
+		StateAuthenticated:     "AUTHENTICATED",
+		StateCharacterSelected: "CHARACTER_SELECTED",
+		StateInWorld:           "IN_WORLD",
+	}
+	for s, want := range cases {
+		if got := s.String(); got != want {
+			t.Errorf("State(%d).String() = %q, want %q", uint8(s), got, want)
+		}
+	}
+}
+
+// specAllowed transcribes the exact §6.1 permission table: the set of
+// states each recognized C→S opcode is permitted in.
+func specAllowed() map[uint16]map[State]bool {
+	allow := func(states ...State) map[State]bool {
+		m := make(map[State]bool)
+		for _, s := range states {
+			m[s] = true
+		}
+		return m
+	}
+	authAndLater := allow(StateAuthenticated, StateCharacterSelected, StateInWorld)
+	inWorld := allow(StateInWorld)
+	m := map[uint16]map[State]bool{
+		100: allow(StateConnected), // hello
+		101: authAndLater,          // reauth
+		121: authAndLater,          // character_list
+		122: allow(StateAuthenticated),
+		123: allow(StateAuthenticated),
+		124: allow(StateAuthenticated),
+		125: allow(StateCharacterSelected, StateInWorld), // ack
+		126: inWorld,                                     // leave_world
+	}
+	for op := uint16(102); op <= 120; op++ {
+		m[op] = inWorld // gameplay
+	}
+	return m
+}
+
+func TestPermissionMatrixExhaustive(t *testing.T) {
+	want := specAllowed()
+	if len(want) != 27 {
+		t.Fatalf("spec table has %d opcodes, want 27 (100–126)", len(want))
+	}
+	states := []State{StateConnected, StateAuthenticated, StateCharacterSelected, StateInWorld}
+	checked := 0
+	for op := uint16(100); op <= 126; op++ {
+		allowedStates, ok := want[op]
+		if !ok {
+			t.Fatalf("opcode %d missing from spec table", op)
+		}
+		if !IsClientOpcode(op) {
+			t.Errorf("IsClientOpcode(%d) = false, want true", op)
+		}
+		for _, s := range states {
+			checked++
+			if got := Allowed(s, op); got != allowedStates[s] {
+				t.Errorf("Allowed(%s, %d) = %v, want %v", s, op, got, allowedStates[s])
+			}
+		}
+	}
+	if checked != 108 {
+		t.Errorf("checked %d combinations, want 108 (27 opcodes × 4 states)", checked)
+	}
+}
+
+func TestNotClientOpcodes(t *testing.T) {
+	nonClient := []uint16{0, 99, 127, 199, 200, 202, 220, 221, 65535}
+	states := []State{StateConnected, StateAuthenticated, StateCharacterSelected, StateInWorld}
+	for _, op := range nonClient {
+		if IsClientOpcode(op) {
+			t.Errorf("IsClientOpcode(%d) = true, want false", op)
+		}
+		for _, s := range states {
+			if Allowed(s, op) {
+				t.Errorf("Allowed(%s, %d) = true, want false", s, op)
+			}
+		}
+	}
+}
+
+func TestCreateGetRemove(t *testing.T) {
+	r := NewRegistry()
+	conn := &stubConn{}
+	id := r.Create(conn)
+	if id == 0 {
+		t.Fatal("first session ID must not be 0")
+	}
+	snap, ok := r.Get(id)
+	if !ok {
+		t.Fatal("Get(create) = false")
+	}
+	if snap.State != StateConnected {
+		t.Errorf("initial state = %s, want CONNECTED", snap.State)
+	}
+	if snap.Sub != "" || snap.AccountID != 0 || snap.Authenticated || snap.HasCharacter {
+		t.Errorf("initial identity not empty: %+v", snap)
+	}
+	if !snap.TokenExp.IsZero() {
+		t.Errorf("initial TokenExp not zero: %v", snap.TokenExp)
+	}
+	if r.Len() != 1 {
+		t.Errorf("Len() = %d, want 1", r.Len())
+	}
+	// IDs are never reused: a second session gets a distinct ID.
+	id2 := r.Create(nil)
+	if id2 == id {
+		t.Errorf("duplicate session ID %d", id)
+	}
+	r.Remove(id)
+	if _, ok := r.Get(id); ok {
+		t.Error("Get after Remove = true, want false")
+	}
+	if r.Len() != 1 {
+		t.Errorf("Len() after Remove = %d, want 1", r.Len())
+	}
+	// Remove is idempotent.
+	r.Remove(id)
+	r.Remove(99999)
+	if r.Len() != 1 {
+		t.Errorf("Len() after idempotent Removes = %d, want 1", r.Len())
+	}
+}
+
+func TestAuthenticate(t *testing.T) {
+	r := NewRegistry()
+	id := r.Create(nil)
+	exp := time.Now().Add(time.Hour).Truncate(time.Second)
+	if err := r.Authenticate(id, "test-sub", 42, exp); err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+	snap, _ := r.Get(id)
+	if snap.State != StateAuthenticated {
+		t.Errorf("state = %s, want AUTHENTICATED", snap.State)
+	}
+	if snap.Sub != "test-sub" || snap.AccountID != 42 || !snap.Authenticated {
+		t.Errorf("identity not established: %+v", snap)
+	}
+	if !snap.TokenExp.Equal(exp) {
+		t.Errorf("TokenExp = %v, want %v", snap.TokenExp, exp)
+	}
+	if got := r.SessionsBySub("test-sub"); len(got) != 1 || got[0] != id {
+		t.Errorf("SessionsBySub = %v, want [%d]", got, id)
+	}
+	// Second authenticate on the same session is rejected.
+	if err := r.Authenticate(id, "test-sub", 42, exp); !errors.Is(err, ErrBadState) {
+		t.Errorf("second Authenticate err = %v, want ErrBadState", err)
+	}
+	// Empty sub is rejected and leaves the session untouched.
+	id2 := r.Create(nil)
+	if err := r.Authenticate(id2, "", 7, exp); !errors.Is(err, ErrBadState) {
+		t.Errorf("empty-sub Authenticate err = %v, want ErrBadState", err)
+	}
+	if snap, _ := r.Get(id2); snap.State != StateConnected {
+		t.Errorf("state after failed auth = %s, want CONNECTED", snap.State)
+	}
+	if err := r.Authenticate(99999, "x", 1, exp); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown-ID Authenticate err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestMultipleSessionsOneSub(t *testing.T) {
+	r := NewRegistry()
+	exp := time.Now()
+	a := r.Create(nil)
+	b := r.Create(nil)
+	if err := r.Authenticate(a, "shared-sub", 1, exp); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Authenticate(b, "shared-sub", 1, exp); err != nil {
+		t.Fatal(err)
+	}
+	got := r.SessionsBySub("shared-sub")
+	sort.Slice(got, func(i, j int) bool { return got[i] < got[j] })
+	if len(got) != 2 || got[0] != a || got[1] != b {
+		t.Errorf("SessionsBySub = %v, want [%d %d]", got, a, b)
+	}
+	r.Remove(a)
+	if got := r.SessionsBySub("shared-sub"); len(got) != 1 || got[0] != b {
+		t.Errorf("SessionsBySub after one Remove = %v, want [%d]", got, b)
+	}
+	r.Remove(b)
+	if got := r.SessionsBySub("shared-sub"); len(got) != 0 {
+		t.Errorf("SessionsBySub after both Removed = %v, want []", got)
+	}
+}
+
+func TestReauthenticate(t *testing.T) {
+	r := NewRegistry()
+	id := r.Create(nil)
+	exp1 := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	exp2 := time.Date(2026, 9, 4, 13, 0, 0, 0, time.UTC)
+	if err := r.Authenticate(id, "sub-1", 42, exp1); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Reauthenticate(id, "sub-1", 42, exp2); err != nil {
+		t.Fatalf("Reauthenticate same identity: %v", err)
+	}
+	if snap, _ := r.Get(id); !snap.TokenExp.Equal(exp2) {
+		t.Errorf("TokenExp = %v, want %v", snap.TokenExp, exp2)
+	}
+	// Identity change via different sub is rejected; expiry untouched.
+	if err := r.Reauthenticate(id, "other-sub", 42, exp1); !errors.Is(err, ErrIdentityMismatch) {
+		t.Errorf("changed-sub Reauthenticate err = %v, want ErrIdentityMismatch", err)
+	}
+	// Identity change via different accountID is rejected too.
+	if err := r.Reauthenticate(id, "sub-1", 43, exp1); !errors.Is(err, ErrIdentityMismatch) {
+		t.Errorf("changed-account Reauthenticate err = %v, want ErrIdentityMismatch", err)
+	}
+	if snap, _ := r.Get(id); !snap.TokenExp.Equal(exp2) {
+		t.Errorf("TokenExp after rejected reauth = %v, want %v", snap.TokenExp, exp2)
+	}
+	if snap, _ := r.Get(id); snap.Sub != "sub-1" || snap.AccountID != 42 {
+		t.Errorf("identity changed by rejected reauth: %+v", snap)
+	}
+	// Reauthenticating a CONNECTED session is a state error.
+	connected := r.Create(nil)
+	if err := r.Reauthenticate(connected, "sub-1", 42, exp2); !errors.Is(err, ErrBadState) {
+		t.Errorf("CONNECTED Reauthenticate err = %v, want ErrBadState", err)
+	}
+	if err := r.Reauthenticate(99999, "sub-1", 42, exp2); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown-ID Reauthenticate err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestCharacterBinding(t *testing.T) {
+	r := NewRegistry()
+	a := r.Create(nil)
+	b := r.Create(nil)
+	if err := r.BindCharacter(a, 7); err != nil {
+		t.Fatalf("BindCharacter: %v", err)
+	}
+	if owner, ok := r.SessionByCharacter(7); !ok || owner != a {
+		t.Errorf("SessionByCharacter(7) = %d,%v want %d,true", owner, ok, a)
+	}
+	if snap, _ := r.Get(a); !snap.HasCharacter || snap.CharacterID != 7 {
+		t.Errorf("snapshot after bind: %+v", snap)
+	}
+	// Same character on a second session is rejected without overwrite.
+	if err := r.BindCharacter(b, 7); !errors.Is(err, ErrCharacterInUse) {
+		t.Errorf("duplicate bind err = %v, want ErrCharacterInUse", err)
+	}
+	if owner, _ := r.SessionByCharacter(7); owner != a {
+		t.Errorf("index overwritten by rejected bind: owner = %d", owner)
+	}
+	// Unbind releases the index for another session.
+	if err := r.UnbindCharacter(a); err != nil {
+		t.Fatalf("UnbindCharacter: %v", err)
+	}
+	if _, ok := r.SessionByCharacter(7); ok {
+		t.Error("character still indexed after unbind")
+	}
+	if err := r.BindCharacter(b, 7); err != nil {
+		t.Fatalf("bind after unbind: %v", err)
+	}
+	// Unbind is idempotent.
+	if err := r.UnbindCharacter(a); err != nil {
+		t.Errorf("idempotent UnbindCharacter: %v", err)
+	}
+	if err := r.BindCharacter(99999, 9); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown-ID bind err = %v, want ErrNotFound", err)
+	}
+	if err := r.UnbindCharacter(99999); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown-ID unbind err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRemoveCleansAllIndexes(t *testing.T) {
+	r := NewRegistry()
+	exp := time.Now()
+	id := r.Create(nil)
+	if err := r.Authenticate(id, "gone-sub", 11, exp); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.BindCharacter(id, 99); err != nil {
+		t.Fatal(err)
+	}
+	r.Remove(id)
+	if got := r.SessionsBySub("gone-sub"); len(got) != 0 {
+		t.Errorf("sub index not cleaned: %v", got)
+	}
+	if _, ok := r.SessionByCharacter(99); ok {
+		t.Error("character index not cleaned")
+	}
+	// A stale session's cleanup must not clobber a newer binding of the
+	// same character taken over by another session.
+	s1 := r.Create(nil)
+	s2 := r.Create(nil)
+	if err := r.BindCharacter(s1, 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.UnbindCharacter(s1); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.BindCharacter(s2, 5); err != nil {
+		t.Fatal(err)
+	}
+	r.Remove(s1)
+	if owner, ok := r.SessionByCharacter(5); !ok || owner != s2 {
+		t.Errorf("SessionByCharacter(5) = %d,%v after stale Remove, want %d,true", owner, ok, s2)
+	}
+}
+
+func TestCompareAndSetState(t *testing.T) {
+	r := NewRegistry()
+	id := r.Create(nil)
+	if err := r.CompareAndSetState(id, StateConnected, StateAuthenticated); err != nil {
+		t.Fatalf("CAS CONNECTED→AUTHENTICATED: %v", err)
+	}
+	if snap, _ := r.Get(id); snap.State != StateAuthenticated {
+		t.Errorf("state = %s, want AUTHENTICATED", snap.State)
+	}
+	// Mismatch leaves state untouched.
+	if err := r.CompareAndSetState(id, StateConnected, StateInWorld); !errors.Is(err, ErrBadState) {
+		t.Errorf("mismatched CAS err = %v, want ErrBadState", err)
+	}
+	if snap, _ := r.Get(id); snap.State != StateAuthenticated {
+		t.Errorf("state after failed CAS = %s, want AUTHENTICATED", snap.State)
+	}
+	if err := r.CompareAndSetState(99999, StateConnected, StateAuthenticated); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown-ID CAS err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestNextServerSeqDeterministic(t *testing.T) {
+	r := NewRegistry()
+	id := r.Create(nil)
+	for want := uint32(1); want <= 3; want++ {
+		got, err := r.NextServerSeq(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Errorf("NextServerSeq() = %d, want %d", got, want)
+		}
+	}
+	if _, err := r.NextServerSeq(99999); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown-ID seq err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestNextServerSeqWrap(t *testing.T) {
+	r := NewRegistry()
+	id := r.Create(nil)
+	r.mu.Lock()
+	r.byID[id].serverSeq.Store(math.MaxUint32 - 1)
+	r.mu.Unlock()
+	got, err := r.NextServerSeq(id)
+	if err != nil || got != math.MaxUint32 {
+		t.Fatalf("NextServerSeq() = %d,%v want %d,nil", got, err, uint32(math.MaxUint32))
+	}
+	got, err = r.NextServerSeq(id)
+	if err != nil || got != 0 {
+		t.Fatalf("wrap NextServerSeq() = %d,%v want 0,nil", got, err)
+	}
+	got, err = r.NextServerSeq(id)
+	if err != nil || got != 1 {
+		t.Fatalf("post-wrap NextServerSeq() = %d,%v want 1,nil", got, err)
+	}
+}
+
+func TestNextServerSeqConcurrent(t *testing.T) {
+	r := NewRegistry()
+	id := r.Create(nil)
+	const workers = 8
+	const perWorker = 250
+	var wg sync.WaitGroup
+	results := make(chan uint32, workers*perWorker)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				seq, err := r.NextServerSeq(id)
+				if err != nil {
+					t.Errorf("NextServerSeq: %v", err)
+					return
+				}
+				results <- seq
+			}
+		}()
+	}
+	wg.Wait()
+	close(results)
+	seen := make(map[uint32]bool, workers*perWorker)
+	for seq := range results {
+		if seen[seq] {
+			t.Fatalf("duplicate server seq %d", seq)
+		}
+		seen[seq] = true
+	}
+	if len(seen) != workers*perWorker {
+		t.Errorf("allocated %d seqs, want %d", len(seen), workers*perWorker)
+	}
+}
+
+func TestLockAccountSerializesSameAccount(t *testing.T) {
+	r := NewRegistry()
+	acquiredA := make(chan struct{})
+	startedB := make(chan struct{})
+	acquiredB := make(chan struct{})
+	doneB := make(chan struct{})
+
+	unlockA := r.LockAccount(42)
+	close(acquiredA)
+	go func() {
+		defer close(doneB)
+		close(startedB)
+		unlockB := r.LockAccount(42)
+		defer unlockB()
+		close(acquiredB)
+	}()
+
+	<-acquiredA
+	<-startedB
+	// While A holds the guard, B must not have acquired it. This holds
+	// regardless of how far B has been scheduled: acquired is only
+	// closed after LockAccount returns.
+	select {
+	case <-acquiredB:
+		t.Fatal("same-account guard acquired concurrently")
+	default:
+	}
+	unlockA()
+	<-doneB
+	select {
+	case <-acquiredB:
+	default:
+		t.Fatal("same-account waiter never acquired the guard")
+	}
+	if n := r.GuardCount(); n != 0 {
+		t.Errorf("GuardCount() = %d, want 0 (guard released)", n)
+	}
+}
+
+func TestLockAccountDifferentAccountsConcurrent(t *testing.T) {
+	r := NewRegistry()
+	releaseA := make(chan struct{})
+	acquiredA := make(chan struct{})
+	acquiredB := make(chan struct{})
+	releaseB := make(chan struct{})
+	doneA := make(chan struct{})
+	doneB := make(chan struct{})
+
+	go func() {
+		defer close(doneA)
+		unlock := r.LockAccount(1)
+		defer unlock()
+		close(acquiredA)
+		<-releaseA
+	}()
+	go func() {
+		defer close(doneB)
+		unlock := r.LockAccount(2)
+		defer unlock()
+		close(acquiredB)
+		<-releaseB
+	}()
+
+	<-acquiredA
+	<-acquiredB // B proceeded while A still holds its guard.
+	close(releaseA)
+	close(releaseB)
+	<-doneA
+	<-doneB
+	if n := r.GuardCount(); n != 0 {
+		t.Errorf("GuardCount() = %d, want 0", n)
+	}
+}
+
+func TestRegistryConcurrentSmoke(t *testing.T) {
+	r := NewRegistry()
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				id := r.Create(nil)
+				sub := fmt.Sprintf("sub-%d", w)
+				_ = r.Authenticate(id, sub, int64(w), time.Now())
+				_ = r.BindCharacter(id, int64(w*1000+i))
+				_, _ = r.NextServerSeq(id)
+				_ = r.CompareAndSetState(id, StateAuthenticated, StateCharacterSelected)
+				_ = r.UnbindCharacter(id)
+				r.Remove(id)
+			}
+		}(w)
+	}
+	wg.Wait()
+	if n := r.Len(); n != 0 {
+		t.Errorf("Len() = %d, want 0 after concurrent churn", n)
+	}
+}

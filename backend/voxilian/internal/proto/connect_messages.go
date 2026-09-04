@@ -163,10 +163,36 @@ func DecodeReauthOK(d *Decoder) (ReauthOK, error) {
 	return ReauthOK{}, nil
 }
 
+// MessageVersion1 is the runtime msg_version emitted by normal senders
+// for every currently frozen message layout in protoVersion 1
+// (spec v0.3.8 §6). An additive change to one opcode increments only
+// that opcode's msg_version; msg_version 0 is fixture-only test data
+// and is never emitted at runtime.
+const MessageVersion1 uint16 = 1
+
+// Stable 202 error-code registry (spec v0.3.8 §6.4). Code 0
+// (reserved/unspecified) has no named constant on purpose: it MUST NOT
+// be emitted for a currently defined error reason.
+const (
+	ErrorCodeBadState       uint16 = 1
+	ErrorCodeProtocol       uint16 = 2
+	ErrorCodeSessionExpired uint16 = 3
+	ErrorCodeKicked         uint16 = 4
+	ErrorCodeCharacterInUse uint16 = 5
+	ErrorCodeRetry          uint16 = 6
+	ErrorCodeNameTaken      uint16 = 7
+	ErrorCodeSlotOccupied   uint16 = 8
+	ErrorCodeBadStats       uint16 = 9
+	ErrorCodeBadBudget      uint16 = 10
+	ErrorCodeRateLimited    uint16 = 11
+	ErrorCodeInvalidHandle  uint16 = 12
+)
+
 // ErrorMessage is opcode 202 (S→C): {code u16, message string}.
-// Code is a raw wire value: the spec assigns no numeric error codes
-// here, so no named constants or string mappings are defined.
-// The message uses MaxStringBytes (this is not chat).
+// Code is machine-readable (one of the frozen ErrorCode* values above,
+// or a future additive code clients must tolerate). Message is
+// diagnostic/human-readable context and MUST NOT be parsed by clients
+// for control flow. The message uses MaxStringBytes (this is not chat).
 type ErrorMessage struct {
 	Code    uint16
 	Message string
