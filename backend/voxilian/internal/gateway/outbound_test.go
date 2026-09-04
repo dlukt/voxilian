@@ -51,6 +51,15 @@ func (t *fakeOutTransport) setHold(ch chan struct{}) {
 	t.hold = ch
 }
 
+// setWriteErr installs a physical-write failure applied AFTER the frame
+// builder ran (sequence already allocated), proving post-reservation
+// write failures.
+func (t *fakeOutTransport) setWriteErr(err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.writeErr = err
+}
+
 func (t *fakeOutTransport) WriteBinary(ctx context.Context, build session.BinaryFrameBuilder) error {
 	select {
 	case t.gate <- struct{}{}:
@@ -141,6 +150,7 @@ type recordingObserver struct {
 	stateDrops   []string
 	coalesced    int
 	sessionDrops []string
+	ackLags      []int
 }
 
 func (o *recordingObserver) QueueDepth(lane OutboundLane, messages, bytes int) {
@@ -167,11 +177,24 @@ func (o *recordingObserver) SessionDropped(reason string) {
 	o.sessionDrops = append(o.sessionDrops, reason)
 }
 
+func (o *recordingObserver) AckLag(messages int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.ackLags = append(o.ackLags, messages)
+}
+
 func (o *recordingObserver) snapshot() (drops []string, coalesced int, sessionDrops []string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return append([]string(nil), o.stateDrops...), o.coalesced,
 		append([]string(nil), o.sessionDrops...)
+}
+
+// ackLagSnapshot returns a copy of the recorded ACK-lag observations.
+func (o *recordingObserver) ackLagSnapshot() []int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]int(nil), o.ackLags...)
 }
 
 // ---------------------------------------------------------------------------
@@ -1375,7 +1398,8 @@ func TestOutboundDefaultPolicyAndNoopObserver(t *testing.T) {
 	p := DefaultOutboundPolicy()
 	if p.MaxMessages != 1024 || p.MaxBytes != 262144 ||
 		p.ReliableEnqueueTimeout != 1000*time.Millisecond ||
-		p.WriteTimeout != 5000*time.Millisecond {
+		p.WriteTimeout != 5000*time.Millisecond ||
+		p.MaxUnackedMessages != 1024 {
 		t.Fatalf("default policy = %+v, want the frozen §7.1.1 defaults", p)
 	}
 	if got := (OutboundPolicy{}).orDefaults(); got != p {
@@ -1388,5 +1412,455 @@ func TestOutboundDefaultPolicyAndNoopObserver(t *testing.T) {
 	}
 	if n := f.tr.recordedCount(); n != 1 {
 		t.Fatalf("frames = %d, want 1", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T5b: ACK flow control at the queue layer (spec §7.1.11)
+// ---------------------------------------------------------------------------
+
+// flowPolicy builds a tiny policy with an explicit ACK window.
+func flowPolicy(maxMsgs, maxBytes int, enqueue, write time.Duration, maxUnacked int) OutboundPolicy {
+	return OutboundPolicy{
+		MaxMessages:            maxMsgs,
+		MaxBytes:               maxBytes,
+		ReliableEnqueueTimeout: enqueue,
+		WriteTimeout:           write,
+		MaxUnackedMessages:     maxUnacked,
+	}
+}
+
+// enterWorld drives the fixture session through the REAL lifecycle
+// primitives into IN_WORLD, initializing its flow epoch (the only legal
+// production path), and returns the epoch baseline sequence.
+func (f *outboundFixture) enterWorld(t *testing.T) uint32 {
+	t.Helper()
+	if err := f.reg.Authenticate(f.sid, "sub", 7, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if err := f.reg.BeginEnterWorld(f.sid, 500); err != nil {
+		t.Fatalf("begin enter: %v", err)
+	}
+	if err := f.reg.CompleteEnterWorld(f.sid, 500); err != nil {
+		t.Fatalf("complete enter: %v", err)
+	}
+	fs, err := f.reg.FlowState(f.sid)
+	if err != nil || !fs.Active {
+		t.Fatalf("flow after enter = %+v, %v want active", fs, err)
+	}
+	return fs.LastFlowSent
+}
+
+// flowLag reads the session's current unacked lag.
+func flowLag(t *testing.T, reg *session.Registry, sid session.ID) int {
+	t.Helper()
+	fs, err := reg.FlowState(sid)
+	if err != nil {
+		t.Fatalf("FlowState: %v", err)
+	}
+	return int(uint32(fs.LastFlowSent - fs.LastAck))
+}
+
+// TestOutboundPolicyPerFieldDefaults proves per-field defaulting: a
+// policy overriding ONLY the ACK window keeps that override and still
+// receives defaults for every other bound (and vice versa) — the whole
+// policy is never discarded because one field is unset.
+func TestOutboundPolicyPerFieldDefaults(t *testing.T) {
+	p := OutboundPolicy{MaxUnackedMessages: 2}.orDefaults()
+	if p.MaxUnackedMessages != 2 || p.MaxMessages != 1024 || p.MaxBytes != 262144 ||
+		p.ReliableEnqueueTimeout != 1000*time.Millisecond || p.WriteTimeout != 5000*time.Millisecond {
+		t.Fatalf("ack-only override = %+v", p)
+	}
+	q := OutboundPolicy{MaxMessages: 5, WriteTimeout: time.Second}.orDefaults()
+	if q.MaxMessages != 5 || q.WriteTimeout != time.Second || q.MaxUnackedMessages != 1024 ||
+		q.MaxBytes != 262144 || q.ReliableEnqueueTimeout != 1000*time.Millisecond {
+		t.Fatalf("partial override = %+v", q)
+	}
+}
+
+// TestOutboundAckLagDisconnect proves the max-unacked window at the
+// real queue layer with max=1 (spec §7.1.11): the first IN_WORLD frame
+// writes, the second is rejected before any sequence exists, the
+// session fails closed as ack_lag (slow classification + force close),
+// and the rejected frame consumed no sequence.
+func TestOutboundAckLagDisconnect(t *testing.T) {
+	f := newOutboundFixture(t, flowPolicy(8, 262144, 10*time.Second, 10*time.Second, 1))
+	base := f.enterWorld(t)
+	if base != 0 {
+		t.Fatalf("epoch baseline = %d, want 0 (no frames written yet)", base)
+	}
+	// Frame A: writes, lag 1.
+	a := f.sendAsync(t, 1, 64)
+	if err := <-a; err != nil {
+		t.Fatalf("first in-world frame: %v", err)
+	}
+	if lag := flowLag(t, f.reg, f.sid); lag != 1 {
+		t.Fatalf("lag after A = %d, want 1", lag)
+	}
+	// Frame B: the window is exhausted (lag 1 >= max 1) — rejected.
+	b := f.sendAsync(t, 2, 64)
+	err := <-b
+	if !errors.Is(err, ErrSlowClient) {
+		t.Fatalf("second in-world frame err = %v, want ErrSlowClient", err)
+	}
+	var slow *slowClientError
+	if !errors.As(err, &slow) || slow.reason != DropReasonAckLag {
+		t.Fatalf("slow reason = %+v, want %q", err, DropReasonAckLag)
+	}
+	waitUntil(t, "ack_lag force close", func() bool { return f.tr.closeNowCount() >= 1 })
+	waitUntil(t, "writer pump exit", f.pumpExited)
+	// The rejected frame was never written and consumed no sequence:
+	// exactly one physical frame, and the next seq is 2.
+	if n := f.tr.recordedCount(); n != 1 {
+		t.Fatalf("frames = %d, want 1 (rejected frame was written)", n)
+	}
+	if seq, err := f.reg.NextServerSeq(f.sid); err != nil || seq != 2 {
+		t.Fatalf("next seq = %d,%v want 2 — rejected frame consumed a sequence", seq, err)
+	}
+	waitUntil(t, "ack_lag session drop observation", func() bool {
+		_, _, drops := f.obs.snapshot()
+		return len(drops) == 1 && drops[0] == DropReasonAckLag
+	})
+	// No lag observation for the rejected frame: only A's lag 1 was
+	// ever reported (spec §7.1.12).
+	waitUntil(t, "one tracked lag observation", func() bool {
+		return len(f.obs.ackLagSnapshot()) == 1
+	})
+	if lags := f.obs.ackLagSnapshot(); lags[0] != 1 {
+		t.Fatalf("lag observations = %v, want [1]", lags)
+	}
+}
+
+// TestOutboundAckLoadHealthy is the load-ish healthy ACK run (spec
+// §7.1.11): several hundred synchronous IN_WORLD frames with a
+// periodic cumulative ACK every 32 frames, max window 64 — no
+// ErrAckLag, lag never exceeds the window, all sequences serially
+// ordered in wire order, final ACK reaches lag 0. No sleeps.
+func TestOutboundAckLoadHealthy(t *testing.T) {
+	const window, batches, per = 64, 20, 32
+	f := newOutboundFixture(t, flowPolicy(1024, 262144, 10*time.Second, 10*time.Second, window))
+	f.enterWorld(t)
+	var lastSeq uint32
+	for b := 0; b < batches; b++ {
+		for i := 0; i < per; i++ {
+			if err := f.oc.SendCritical(context.Background(), f.sid,
+				proto.OpcodeError, proto.MessageVersion1,
+				payloadOf(uint32(b*per+i+1), 64)); err != nil {
+				t.Fatalf("batch %d frame %d: %v", b, i, err)
+			}
+			if lag := flowLag(t, f.reg, f.sid); lag > window {
+				t.Fatalf("lag %d exceeded window %d", lag, window)
+			}
+			lastSeq = uint32(b*per + i + 1)
+		}
+		disp, lag, err := f.reg.ApplyAck(f.sid, lastSeq)
+		if disp != session.AckAdvanced || lag != 0 || err != nil {
+			t.Fatalf("batch %d ack = %v,%d,%v", b, disp, lag, err)
+		}
+	}
+	frames := f.tr.recorded()
+	if len(frames) != batches*per {
+		t.Fatalf("frames = %d, want %d", len(frames), batches*per)
+	}
+	for i, frame := range frames {
+		if s := headerOf(t, frame).Seq; s != uint32(i+1) {
+			t.Fatalf("wire position %d carries seq %d — order broke", i, s)
+		}
+	}
+	if lag := flowLag(t, f.reg, f.sid); lag != 0 {
+		t.Fatalf("final lag = %d, want 0", lag)
+	}
+	waitUntil(t, "all lag observations recorded", func() bool {
+		return len(f.obs.ackLagSnapshot()) == batches*per
+	})
+}
+
+// TestOutboundAckLoadSlowApplication is the load-ish slow-application
+// run (spec §7.1.11): a client that never ACKs exhausts the window
+// even on a fast physical transport — the next frame is rejected
+// BEFORE a sequence, the queue fails closed as ack_lag, the transport
+// is force-closed, and later traffic sees closure.
+func TestOutboundAckLoadSlowApplication(t *testing.T) {
+	const window = 64
+	f := newOutboundFixture(t, flowPolicy(1024, 262144, 10*time.Second, 10*time.Second, window))
+	f.enterWorld(t)
+	for i := 0; i < window; i++ {
+		if err := f.oc.SendCritical(context.Background(), f.sid,
+			proto.OpcodeError, proto.MessageVersion1, payloadOf(uint32(i+1), 64)); err != nil {
+			t.Fatalf("frame %d: %v", i, err)
+		}
+	}
+	if lag := flowLag(t, f.reg, f.sid); lag != window {
+		t.Fatalf("lag = %d, want %d", lag, window)
+	}
+	// Frame window+1: application-level slow client.
+	err := f.oc.SendCritical(context.Background(), f.sid,
+		proto.OpcodeError, proto.MessageVersion1, payloadOf(uint32(window+1), 64))
+	if !errors.Is(err, ErrSlowClient) {
+		t.Fatalf("frame %d err = %v, want ErrSlowClient", window+1, err)
+	}
+	// The rejected frame consumed no sequence.
+	if seq, err := f.reg.NextServerSeq(f.sid); err != nil || seq != window+1 {
+		t.Fatalf("next seq = %d,%v want %d", seq, err, window+1)
+	}
+	waitUntil(t, "ack_lag force close", func() bool { return f.tr.closeNowCount() >= 1 })
+	waitUntil(t, "writer pump exit", f.pumpExited)
+	if n := f.tr.recordedCount(); n != window {
+		t.Fatalf("frames = %d, want %d", n, window)
+	}
+	// Remaining queued traffic fails closed, not silently.
+	if err := f.oc.SendCritical(context.Background(), f.sid,
+		proto.OpcodeError, proto.MessageVersion1, payloadOf(999, 64)); !errors.Is(err, ErrSlowClient) {
+		t.Fatalf("post-close send err = %v, want the slow classification", err)
+	}
+	_, _, drops := f.obs.snapshot()
+	if len(drops) != 1 || drops[0] != DropReasonAckLag {
+		t.Fatalf("session drops = %v, want [%s]", drops, DropReasonAckLag)
+	}
+}
+
+// TestOutboundCoalescedStateNoAckDebt proves coalescing creates no ACK
+// debt (spec §7.1.11/§7.1.3): with max=2, three same-key state values
+// queued while the writer is held collapse to one; only the surviving
+// newest value receives a sequence and advances lastFlowSent by exactly
+// one unit — the two replaced values created none.
+func TestOutboundCoalescedStateNoAckDebt(t *testing.T) {
+	f := newOutboundFixture(t, flowPolicy(8, 262144, 10*time.Second, 10*time.Second, 2))
+	f.enterWorld(t)
+	f.hold()
+	a := f.sendAsync(t, 1, 64) // critical parked in the writer
+	f.waitParked(t, 1)
+
+	key := StateKey{Kind: 0, ID: 42}
+	for i, marker := range []uint32{10, 11, 12} {
+		want := StateQueued
+		if i > 0 {
+			want = StateCoalesced
+		}
+		res, err := f.oc.TryState(f.sid, key, proto.OpcodeEntityMove, proto.MessageVersion1, payloadOf(marker, 64))
+		if err != nil || res != want {
+			t.Fatalf("TryState %d = %v,%v want %v", marker, res, err, want)
+		}
+	}
+	// Nothing selected for writing yet: no debt at all.
+	if lag := flowLag(t, f.reg, f.sid); lag != 0 {
+		t.Fatalf("lag after admissions = %d, want 0", lag)
+	}
+	f.releaseAll()
+	if err := <-a; err != nil {
+		t.Fatalf("parked critical: %v", err)
+	}
+	waitUntil(t, "surviving state drained", func() bool { return f.tr.recordedCount() == 2 })
+	// Exactly two units: the critical (seq 1) and the ONE surviving
+	// state value (seq 2). The replaced values created no debt — with
+	// max=2 they would otherwise have evicted the survivor.
+	if lag := flowLag(t, f.reg, f.sid); lag != 2 {
+		t.Fatalf("lag after drain = %d, want 2 (one state unit)", lag)
+	}
+	fs, _ := f.reg.FlowState(f.sid)
+	if fs.LastFlowSent != 2 {
+		t.Fatalf("lastFlowSent = %d, want 2 — replaced values consumed flow", fs.LastFlowSent)
+	}
+}
+
+// TestOutboundDroppedStateNoAckDebt proves a saturated (dropped) state
+// update creates no ACK debt (spec §7.1.4/§7.1.11): the dropped update
+// never receives a sequence and never advances lastFlowSent.
+func TestOutboundDroppedStateNoAckDebt(t *testing.T) {
+	f := newOutboundFixture(t, flowPolicy(2, 262144, 20*time.Millisecond, 10*time.Second, 8))
+	f.enterWorld(t)
+	f.hold()
+	a := f.sendAsync(t, 1, 64) // writing
+	f.waitParked(t, 1)
+	if err := f.oc.TryCritical(f.sid, proto.OpcodeError, proto.MessageVersion1, payloadOf(2, 64)); err != nil {
+		t.Fatalf("fill: %v", err)
+	}
+	res, err := f.oc.TryState(f.sid, StateKey{Kind: 0, ID: 9},
+		proto.OpcodeEntityMove, proto.MessageVersion1, payloadOf(3, 64))
+	if err != nil || res != StateDropped {
+		t.Fatalf("saturated TryState = %v,%v want dropped", res, err)
+	}
+	if lag := flowLag(t, f.reg, f.sid); lag != 0 {
+		t.Fatalf("lag after dropped state = %d, want 0", lag)
+	}
+	fsBefore, _ := f.reg.FlowState(f.sid)
+	f.releaseAll()
+	if err := <-a; err != nil {
+		t.Fatalf("parked: %v", err)
+	}
+	waitUntil(t, "drain", func() bool { return f.tr.recordedCount() == 2 })
+	fsAfter, _ := f.reg.FlowState(f.sid)
+	if fsAfter.LastFlowSent != 2 || fsAfter.LastAck != fsBefore.LastAck {
+		t.Fatalf("flow after drain = %+v (before %+v) — dropped state created debt", fsAfter, fsBefore)
+	}
+	if lag := flowLag(t, f.reg, f.sid); lag != 2 {
+		t.Fatalf("lag = %d, want exactly the two written criticals", lag)
+	}
+}
+
+// TestOutboundEvictedStateNoAckDebt proves an evicted state value
+// creates no ACK debt while the evicting critical consumes exactly one
+// flow unit when written IN_WORLD (spec §7.1.4/§7.1.11).
+func TestOutboundEvictedStateNoAckDebt(t *testing.T) {
+	f := newOutboundFixture(t, flowPolicy(5, 262144, 20*time.Millisecond, 10*time.Second, 8))
+	f.enterWorld(t)
+	f.hold()
+	a := f.sendAsync(t, 1, 64)
+	f.waitParked(t, 1)
+	// Four state values: resident becomes 5 (writing + 4 queued), so the
+	// next critical must evict the OLDEST state (K1) to fit.
+	for id := uint64(1); id <= 4; id++ {
+		res, err := f.oc.TryState(f.sid, StateKey{Kind: 0, ID: id},
+			proto.OpcodeEntityMove, proto.MessageVersion1, payloadOf(uint32(20+id), 64))
+		if err != nil || res != StateQueued {
+			t.Fatalf("state %d = %v,%v", id, res, err)
+		}
+	}
+	if err := f.oc.TryCritical(f.sid, proto.OpcodeError, proto.MessageVersion1, payloadOf(50, 64)); err != nil {
+		t.Fatalf("evicting critical: %v", err)
+	}
+	drops, _, _ := f.obs.snapshot()
+	if len(drops) != 1 || drops[0] != stateDropEvicted {
+		t.Fatalf("state drops = %v, want one %q", drops, stateDropEvicted)
+	}
+	// Still nothing selected: no debt while queued/evicted.
+	if lag := flowLag(t, f.reg, f.sid); lag != 0 {
+		t.Fatalf("lag after eviction = %d, want 0", lag)
+	}
+	f.releaseAll()
+	if err := <-a; err != nil {
+		t.Fatalf("parked: %v", err)
+	}
+	waitUntil(t, "post-eviction drain", func() bool { return f.tr.recordedCount() == 5 })
+	// Five written frames (A, evicting critical, K2, K3, K4):
+	// lastFlowSent advanced exactly 5 — the EVICTED K1 created no unit.
+	fs, _ := f.reg.FlowState(f.sid)
+	if fs.LastFlowSent != 5 {
+		t.Fatalf("lastFlowSent = %d, want 5 — evicted state created debt", fs.LastFlowSent)
+	}
+	if lag := flowLag(t, f.reg, f.sid); lag != 5 {
+		t.Fatalf("lag = %d, want 5", lag)
+	}
+}
+
+// TestOutboundAdmissionNoDebtUntilSelection proves queue admission
+// alone creates no ACK debt (spec §7.1.11): with the physical writer
+// blocked, five frames are admitted while the window is only two — no
+// rejection can happen at admission time — and after release exactly
+// the two selected-and-written frames consume the window before the
+// third selection is rejected.
+func TestOutboundAdmissionNoDebtUntilSelection(t *testing.T) {
+	f := newOutboundFixture(t, flowPolicy(8, 262144, 10*time.Second, 10*time.Second, 2))
+	f.enterWorld(t)
+	f.hold()
+	a := f.sendAsync(t, 1, 64) // parked in the writer (not yet built)
+	f.waitParked(t, 1)
+	for i := 2; i <= 5; i++ {
+		if err := f.oc.TryCritical(f.sid, proto.OpcodeError, proto.MessageVersion1, payloadOf(uint32(i), 64)); err != nil {
+			t.Fatalf("queued critical %d: %v — admission must not be flow-gated", i, err)
+		}
+	}
+	// Six frames are now admitted/parked, far beyond the window of two,
+	// yet the flow epoch is untouched.
+	fs, _ := f.reg.FlowState(f.sid)
+	if fs.LastFlowSent != 0 || flowLag(t, f.reg, f.sid) != 0 {
+		t.Fatalf("flow after admissions = %+v — admission created debt", fs)
+	}
+	f.releaseAll()
+	// Selection consumes the window one written frame at a time: frames
+	// 1 and 2 write; frame 3's SELECTION is the first gated point.
+	if err := <-a; err != nil {
+		t.Fatalf("parked frame 1: %v", err)
+	}
+	waitUntil(t, "ack_lag disconnect at third selection", func() bool {
+		return f.tr.closeNowCount() >= 1
+	})
+	waitUntil(t, "exactly two frames written", func() bool { return f.tr.recordedCount() == 2 })
+	fs, _ = f.reg.FlowState(f.sid)
+	if fs.LastFlowSent != 2 {
+		t.Fatalf("lastFlowSent = %d, want exactly 2 written units", fs.LastFlowSent)
+	}
+	_, _, drops := f.obs.snapshot()
+	if len(drops) != 1 || drops[0] != DropReasonAckLag {
+		t.Fatalf("session drops = %v, want [%s]", drops, DropReasonAckLag)
+	}
+}
+
+// TestOutboundWriteFailureAfterFlowReservation proves a physical write
+// failure AFTER a passed flow check and sequence allocation terminates
+// the session with NO rollback of flow state (spec §7.1.11): recovery
+// is reconnect/full resync, never sequence rewinding.
+func TestOutboundWriteFailureAfterFlowReservation(t *testing.T) {
+	f := newOutboundFixture(t, flowPolicy(8, 262144, 10*time.Second, 10*time.Second, 8))
+	f.enterWorld(t)
+	sentinel := errors.New("socket exploded")
+	f.tr.setWriteErr(sentinel)
+
+	err := f.oc.SendCritical(context.Background(), f.sid,
+		proto.OpcodeError, proto.MessageVersion1, payloadOf(1, 64))
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("write-failure err = %v, want the transport sentinel", err)
+	}
+	if errors.Is(err, ErrSlowClient) {
+		t.Fatal("a broken socket is not a slow-client classification")
+	}
+	waitUntil(t, "force close after write failure", func() bool { return f.tr.closeNowCount() >= 1 })
+	waitUntil(t, "pump exit", f.pumpExited)
+	// The reserved sequence/flow state was NOT rolled back.
+	fs, err := f.reg.FlowState(f.sid)
+	if err != nil || !fs.Active || fs.LastFlowSent != 1 {
+		t.Fatalf("flow after failed write = %+v,%v — want lastFlowSent kept at 1 (no rollback)", fs, err)
+	}
+	if _, _, drops := f.obs.snapshot(); len(drops) != 0 {
+		t.Fatalf("session drops = %v, want none (not a backpressure drop)", drops)
+	}
+	// The failed frame's lag was never reported as delivered.
+	if lags := f.obs.ackLagSnapshot(); len(lags) != 0 {
+		t.Fatalf("lag observations = %v, want none — the write failed", lags)
+	}
+}
+
+// TestOutboundDirectTerminalIndependentOfFlow proves the direct
+// terminal writer path stays OUTSIDE the ACK window (spec §7.1.9/
+// §7.1.11): at exactly max lag, a direct terminal 202 still allocates
+// a sequence through the plain direct path and succeeds, while the
+// next NORMAL frame is ack_lag rejected; the direct write never
+// mutates the flow epoch.
+func TestOutboundDirectTerminalIndependentOfFlow(t *testing.T) {
+	f := newOutboundFixture(t, flowPolicy(8, 262144, 10*time.Second, 10*time.Second, 1))
+	f.enterWorld(t)
+	if err := f.oc.SendCritical(context.Background(), f.sid,
+		proto.OpcodeError, proto.MessageVersion1, payloadOf(1, 64)); err != nil {
+		t.Fatalf("first frame: %v", err)
+	}
+	if lag := flowLag(t, f.reg, f.sid); lag != 1 {
+		t.Fatalf("lag = %d, want 1 (window exhausted)", lag)
+	}
+	// Direct terminal frame (the kicked/deadline writer shape): NOT
+	// flow-gated, consumes the session's plain seq, and leaves the flow
+	// epoch untouched.
+	if err := sendDirectSessionFrame(context.Background(), f.reg,
+		func() uint32 { return 7 }, f.sid, proto.OpcodeError, proto.MessageVersion1,
+		func(e *proto.Encoder) error {
+			proto.ErrorMessage{Code: proto.ErrorCodeKicked, Message: "terminal"}.Encode(e)
+			return nil
+		}); err != nil {
+		t.Fatalf("direct terminal frame: %v — terminal writes must bypass the ACK window", err)
+	}
+	fs, _ := f.reg.FlowState(f.sid)
+	if fs.LastAck != 0 || fs.LastFlowSent != 1 {
+		t.Fatalf("direct write mutated flow: %+v", fs)
+	}
+	if n := f.tr.recordedCount(); n != 2 {
+		t.Fatalf("frames = %d, want 2", n)
+	}
+	if s := headerOf(t, f.tr.recorded()[1]).Seq; s != 2 {
+		t.Fatalf("direct frame seq = %d, want 2 (plain direct allocation)", s)
+	}
+	// The normal queue is still gated at max lag.
+	err := f.oc.SendCritical(context.Background(), f.sid,
+		proto.OpcodeError, proto.MessageVersion1, payloadOf(2, 64))
+	if !errors.Is(err, ErrSlowClient) {
+		t.Fatalf("normal frame at max lag err = %v, want ErrSlowClient", err)
 	}
 }

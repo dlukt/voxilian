@@ -13,10 +13,12 @@ import (
 )
 
 // OutboundPolicy carries the frozen per-session outbound budgets
-// (spec §7.1.1, v0.3.12) as durations for the gateway layer. Production
+// (spec §7.1.1, v0.3.13) as durations for the gateway layer. Production
 // derives it from the validated config.OutboundConfig; tests inject
-// tiny policies directly. A zero/negative field set falls back to
-// DefaultOutboundPolicy so no construction path can disable a bound.
+// tiny policies directly. Each zero/negative field independently falls
+// back to its DefaultOutboundPolicy value, so a policy overriding only
+// one bound never silently discards its other valid overrides and no
+// construction path can disable a bound.
 type OutboundPolicy struct {
 	// MaxMessages bounds total resident outbound messages per session.
 	MaxMessages int
@@ -27,26 +29,43 @@ type OutboundPolicy struct {
 	ReliableEnqueueTimeout time.Duration
 	// WriteTimeout bounds one normal queued physical WebSocket write.
 	WriteTimeout time.Duration
+	// MaxUnackedMessages is the T5b application-level ACK lag window
+	// enforced while IN_WORLD (spec §7.1.11).
+	MaxUnackedMessages int
 }
 
 // DefaultOutboundPolicy mirrors the spec §7.1.1 MVP defaults
-// (1024 messages / 256 KiB / 1 s enqueue / 5 s write). Max-unacked is
-// T5b concern and lives in config only.
+// (1024 messages / 256 KiB / 1 s enqueue / 5 s write / 1024 unacked).
 func DefaultOutboundPolicy() OutboundPolicy {
 	return OutboundPolicy{
 		MaxMessages:            1024,
 		MaxBytes:               262144,
 		ReliableEnqueueTimeout: 1000 * time.Millisecond,
 		WriteTimeout:           5000 * time.Millisecond,
+		MaxUnackedMessages:     1024,
 	}
 }
 
+// orDefaults fills each unset (zero/negative) field with its default
+// independently (per-field defaulting).
 func (p OutboundPolicy) orDefaults() OutboundPolicy {
-	if p.MaxMessages <= 0 || p.MaxBytes <= 0 ||
-		p.ReliableEnqueueTimeout <= 0 || p.WriteTimeout <= 0 {
-		return DefaultOutboundPolicy()
+	d := DefaultOutboundPolicy()
+	if p.MaxMessages > 0 {
+		d.MaxMessages = p.MaxMessages
 	}
-	return p
+	if p.MaxBytes > 0 {
+		d.MaxBytes = p.MaxBytes
+	}
+	if p.ReliableEnqueueTimeout > 0 {
+		d.ReliableEnqueueTimeout = p.ReliableEnqueueTimeout
+	}
+	if p.WriteTimeout > 0 {
+		d.WriteTimeout = p.WriteTimeout
+	}
+	if p.MaxUnackedMessages > 0 {
+		d.MaxUnackedMessages = p.MaxUnackedMessages
+	}
+	return d
 }
 
 // StateKey is the producer-supplied coalescing key (spec §7.1.3): a
@@ -60,8 +79,11 @@ type StateKey struct {
 }
 
 // OutboundLane names one outbound lane for observation (spec §7.1.12:
-// exactly "critical" and "state", no opcode/entity labels).
-type OutboundLane string
+// exactly "critical" and "state", no opcode/entity labels). It is a
+// type ALIAS of string so an out-of-package observer implementation
+// (e.g. internal/observe Prometheus adapter) can satisfy
+// OutboundObserver structurally without importing this package.
+type OutboundLane = string
 
 const (
 	LaneCritical OutboundLane = "critical"
@@ -69,11 +91,12 @@ const (
 )
 
 // Frozen slow-client session-drop reasons (spec §7.1.12). ack_lag is
-// reserved for M3-T5b and intentionally absent here.
+// the T5b application-level slow-client classification.
 const (
 	DropReasonCriticalSaturated = "critical_queue_saturated"
 	DropReasonEnqueueTimeout    = "reliable_enqueue_timeout"
 	DropReasonWriteTimeout      = "write_timeout"
+	DropReasonAckLag            = "ack_lag"
 )
 
 // Internal state-discard reasons (state-lane observations, not
@@ -135,7 +158,10 @@ func (r StateResult) String() string {
 // rewriting queue internals. The queue never calls an observer while
 // holding its mutex, so a metric implementation can never become part
 // of queue lock contention and observer bugs cannot corrupt queue
-// invariants.
+// invariants. Method signatures use only base types (string lane via
+// the OutboundLane alias) so an implementation in another package —
+// e.g. internal/observe — satisfies this interface structurally with
+// no import in either direction.
 type OutboundObserver interface {
 	// QueueDepth reports the queued (not in-flight) depth of one lane.
 	QueueDepth(lane OutboundLane, messages, bytes int)
@@ -145,6 +171,11 @@ type OutboundObserver interface {
 	StateCoalesced()
 	// SessionDropped reports one fail-closed slow-client disconnect.
 	SessionDropped(reason string)
+	// AckLag reports the current unacked IN_WORLD flow lag after a
+	// successful tracked sequence allocation, a valid/duplicate/stale
+	// ACK application, or flow-epoch initialization (0). Event-sampled;
+	// never a per-session gauge (spec §7.1.12).
+	AckLag(messages int)
 }
 
 // noopOutboundObserver is the default observer.
@@ -154,6 +185,7 @@ func (noopOutboundObserver) QueueDepth(OutboundLane, int, int) {}
 func (noopOutboundObserver) StateDropped(string)               {}
 func (noopOutboundObserver) StateCoalesced()                   {}
 func (noopOutboundObserver) SessionDropped(string)             {}
+func (noopOutboundObserver) AckLag(int)                        {}
 
 // outboundItem is one prepared queued frame (spec §7.1.8): the payload
 // is encoded exactly once BEFORE admission and frozen; the S→C sequence
@@ -513,18 +545,32 @@ func (q *outboundQueue) run() {
 		q.mu.Unlock()
 
 		ctx, cancel := context.WithTimeout(context.Background(), q.policy.WriteTimeout)
-		err := q.conn.WriteBinary(ctx, q.frameBuilder(item))
+		var flow flowObservation
+		err := q.conn.WriteBinary(ctx, q.frameBuilder(item, &flow))
 		cancel()
 
 		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
+			switch {
+			case errors.Is(err, session.ErrAckLag):
+				// The max-unacked flow window is exhausted: the frame was
+				// never written and consumed no sequence — an intentional
+				// slow-client classification, never a generic write error
+				// (spec §7.1.11).
+				q.failSlow(DropReasonAckLag)
+			case errors.Is(err, context.DeadlineExceeded):
 				// Physical write timeout: fail the session closed as a
 				// slow client (spec §7.1.5).
 				q.failSlow(DropReasonWriteTimeout)
-			} else {
+			default:
 				q.closeWriteError(err)
 			}
 			return
+		}
+		// The write physically succeeded, so the tracked flow unit is
+		// real delivered ACK debt: observe it now, outside every lock. A
+		// failed write never reports delivered lag (spec §7.1.12).
+		if flow.tracked {
+			q.observer.AckLag(flow.lag)
 		}
 		q.mu.Lock()
 		if q.closed {
@@ -539,15 +585,34 @@ func (q *outboundQueue) run() {
 	}
 }
 
-// frameBuilder returns the physical-write-time builder (spec §7.1.8):
-// it runs inside the connection's writer slot, allocates the next S→C
-// sequence, samples the tick, and appends the already-frozen payload —
-// so sequence allocation order is exactly physical wire order.
-func (q *outboundQueue) frameBuilder(item *outboundItem) session.BinaryFrameBuilder {
+// flowObservation carries the write-time ACK-flow result from the
+// frame builder (inside the physical writer slot) back to the writer
+// pump, so the lag is observed only after the physical write succeeds
+// (spec §7.1.12). A rejected (ErrAckLag) or failed write leaves it
+// zero-valued and nothing is reported.
+type flowObservation struct {
+	tracked bool
+	lag     int
+}
+
+// frameBuilder returns the physical-write-time builder (spec §7.1.8,
+// §7.1.11): it runs inside the connection's writer slot, allocates the
+// next S→C sequence through the FLOW-CONTROLLED allocator (max-unacked
+// is enforced strictly BEFORE the sequence exists, so a rejected frame
+// consumes no seq and is never written), samples the tick, and appends
+// the already-frozen payload — sequence allocation order remains
+// exactly physical wire order. Direct terminal traffic never passes
+// through here; it keeps the plain NextServerSeq direct path.
+func (q *outboundQueue) frameBuilder(item *outboundItem, flow *flowObservation) session.BinaryFrameBuilder {
 	return func() ([]byte, error) {
-		seq, err := q.registry.NextServerSeq(item.sid)
+		seq, tracked, lag, err := q.registry.NextFlowControlledServerSeq(
+			item.sid, q.policy.MaxUnackedMessages)
 		if err != nil {
 			return nil, err
+		}
+		if flow != nil {
+			flow.tracked = tracked
+			flow.lag = lag
 		}
 		return proto.EncodeFrame(proto.Header{
 			Opcode:     item.opcode,

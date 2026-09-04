@@ -1231,6 +1231,12 @@ type wsNextFake struct {
 	marker  bool // when true, reply 219 to prove delegation + SendFunc
 }
 
+func (n *wsNextFake) callCount() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.calls
+}
+
 func (n *wsNextFake) Handle(
 	_ context.Context,
 	sid session.ID,
@@ -1663,8 +1669,9 @@ func TestCharMalformedWS(t *testing.T) {
 }
 
 // TestCharDeleteInUseWS builds two sessions for one account, parks one
-// in CHARACTER_SELECTED then IN_WORLD via test-only registry moves,
-// and proves deletion from the other socket reports in-use both times.
+// in CHARACTER_SELECTED then IN_WORLD via the registry's real lifecycle
+// primitives, and proves deletion from the other socket reports in-use
+// both times.
 func TestCharDeleteInUseWS(t *testing.T) {
 	f := newCharFixture(t, false, nil)
 	c1 := f.dial(t)
@@ -1690,18 +1697,19 @@ func TestCharDeleteInUseWS(t *testing.T) {
 		t.Fatalf("sessions = %d, want 2", len(ids))
 	}
 	owner := sid1
-	if err := f.reg.BindCharacter(owner, charID); err != nil {
-		t.Fatalf("bind: %v", err)
+	if err := f.reg.BeginEnterWorld(owner, charID); err != nil {
+		t.Fatalf("begin enter: %v", err)
 	}
-	for _, want := range []session.State{session.StateCharacterSelected, session.StateInWorld} {
-		cur, _ := f.reg.Get(owner)
-		if err := f.reg.CompareAndSetState(owner, cur.State, want); err != nil {
-			t.Fatalf("cas to %s: %v", want, err)
-		}
-		sendDelete(t, c2, 3, 0)
-		if _, msg := readError(t, c2); msg.Code != proto.ErrorCodeCharacterInUse {
-			t.Fatalf("delete in %s: code = %d, want character_in_use", want, msg.Code)
-		}
+	sendDelete(t, c2, 3, 0)
+	if _, msg := readError(t, c2); msg.Code != proto.ErrorCodeCharacterInUse {
+		t.Fatalf("delete in CHARACTER_SELECTED: code = %d, want character_in_use", msg.Code)
+	}
+	if err := f.reg.CompleteEnterWorld(owner, charID); err != nil {
+		t.Fatalf("complete enter: %v", err)
+	}
+	sendDelete(t, c2, 4, 0)
+	if _, msg := readError(t, c2); msg.Code != proto.ErrorCodeCharacterInUse {
+		t.Fatalf("delete in IN_WORLD: code = %d, want character_in_use", msg.Code)
 	}
 }
 
@@ -1722,14 +1730,13 @@ func TestCharLeaveWorldWS(t *testing.T) {
 	charID := rows[0].ID
 	ids := f.reg.SessionsBySub("test-sub")
 	sid := ids[0]
-	if err := f.reg.BindCharacter(sid, charID); err != nil {
-		t.Fatalf("bind: %v", err)
+	// Real lifecycle primitives (the only legal IN_WORLD path — they
+	// also initialize the ACK-flow epoch atomically).
+	if err := f.reg.BeginEnterWorld(sid, charID); err != nil {
+		t.Fatalf("begin enter: %v", err)
 	}
-	for _, want := range []session.State{session.StateCharacterSelected, session.StateInWorld} {
-		cur, _ := f.reg.Get(sid)
-		if err := f.reg.CompareAndSetState(sid, cur.State, want); err != nil {
-			t.Fatalf("cas: %v", err)
-		}
+	if err := f.reg.CompleteEnterWorld(sid, charID); err != nil {
+		t.Fatalf("complete enter: %v", err)
 	}
 
 	sendLeave(t, c, 3)
@@ -1770,14 +1777,13 @@ func TestCharLeaveWorldFailureWS(t *testing.T) {
 	}
 	charID := rows[0].ID
 	sid := f.reg.SessionsBySub("test-sub")[0]
-	if err := f.reg.BindCharacter(sid, charID); err != nil {
-		t.Fatalf("bind: %v", err)
+	// Real lifecycle primitives (the only legal IN_WORLD path — they
+	// also initialize the ACK-flow epoch atomically).
+	if err := f.reg.BeginEnterWorld(sid, charID); err != nil {
+		t.Fatalf("begin enter: %v", err)
 	}
-	for _, want := range []session.State{session.StateCharacterSelected, session.StateInWorld} {
-		cur, _ := f.reg.Get(sid)
-		if err := f.reg.CompareAndSetState(sid, cur.State, want); err != nil {
-			t.Fatalf("cas: %v", err)
-		}
+	if err := f.reg.CompleteEnterWorld(sid, charID); err != nil {
+		t.Fatalf("complete enter: %v", err)
 	}
 
 	f.exit.setFail(true)

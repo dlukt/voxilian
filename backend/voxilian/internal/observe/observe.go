@@ -56,12 +56,14 @@ func (r *Readiness) Ready() bool {
 type Server struct {
 	readiness *Readiness
 	registry  *prometheus.Registry
+	outbound  *OutboundMetrics
 	mux       *http.ServeMux
 }
 
-// New builds the surface with a dedicated registry containing only the
-// build-info gauge. Gameplay metrics are registered by later milestones
-// on Server.Registry().
+// New builds the surface with a dedicated registry containing the
+// build-info gauge plus the frozen M3-T5b outbound collectors. Further
+// gameplay metrics are registered by later milestones on
+// Server.Registry().
 func New(readiness *Readiness) *Server {
 	s := &Server{
 		readiness: readiness,
@@ -77,6 +79,7 @@ func New(readiness *Readiness) *Server {
 	)
 	s.registry.MustRegister(build)
 	build.WithLabelValues(Version, Revision).Set(1)
+	s.outbound = NewOutboundMetrics(s.registry)
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
 	s.mux.HandleFunc("/readyz", s.handleReadyz)
 	s.mux.Handle("/metrics", promhttp.HandlerFor(s.registry, promhttp.HandlerOpts{}))
@@ -85,6 +88,13 @@ func New(readiness *Readiness) *Server {
 
 // Registry exposes the dedicated registry for later milestones.
 func (s *Server) Registry() *prometheus.Registry { return s.registry }
+
+// OutboundMetrics exposes the frozen outbound observer adapter
+// (spec §7.1.12). Future executable wiring passes it as
+// gateway.ServerDeps.OutboundObserver; it structurally satisfies the
+// gateway observer interface without either package importing the
+// other.
+func (s *Server) OutboundMetrics() *OutboundMetrics { return s.outbound }
 
 // Handler returns the mux for http.Serve.
 func (s *Server) Handler() http.Handler { return s.mux }

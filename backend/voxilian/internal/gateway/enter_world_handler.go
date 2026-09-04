@@ -130,8 +130,9 @@ func (s gatewayBaselineSink) ShopList(m proto.ShopList) error {
 
 // EnterWorldHandler owns exactly opcode 124 enter_world. All other
 // allowed opcodes delegate to Next unchanged (121/122/123/126 belong
-// to CharacterHandler upstream; gameplay/ack belong downstream). It
-// holds no WebSocket connection: current-session replies go through
+// to CharacterHandler upstream; gameplay belongs downstream; opcode
+// 125 ack is owned by the Server itself and never reaches any handler).
+// It holds no WebSocket connection: current-session replies go through
 // SendFunc, and the cross-session kicked frame goes through the old
 // session's own session.Connection.
 type EnterWorldHandler struct {
@@ -141,15 +142,18 @@ type EnterWorldHandler struct {
 	WorldExit  WorldExit
 	Tick       TickFunc
 	Next       MessageHandler
+	observer   OutboundObserver
 }
 
 // EnterWorldHandlerDeps wires an EnterWorldHandler without a growing
 // positional constructor. Characters, Registry, Baseline, WorldExit,
 // and Tick are required (no silent no-op defaults); Next may be nil,
 // in which case unowned allowed opcodes are consumed without a reply.
-// WorldExit must be the SAME instance the CharacterHandler chain uses:
-// normal leave_world and forced takeover share one world-side
-// quiesce/flush contract.
+// Observer may be nil (no-op default): when supplied it receives the
+// flow-epoch initialization observation (lag 0) after each successful
+// CompleteEnterWorld (spec §7.1.12). WorldExit must be the SAME
+// instance the CharacterHandler chain uses: normal leave_world and
+// forced takeover share one world-side quiesce/flush contract.
 type EnterWorldHandlerDeps struct {
 	Characters CharacterLookup
 	Registry   *session.Registry
@@ -157,6 +161,7 @@ type EnterWorldHandlerDeps struct {
 	WorldExit  WorldExit
 	Tick       TickFunc
 	Next       MessageHandler
+	Observer   OutboundObserver
 }
 
 // NewEnterWorldHandler wires an EnterWorldHandler from deps.
@@ -176,6 +181,10 @@ func NewEnterWorldHandler(deps EnterWorldHandlerDeps) (*EnterWorldHandler, error
 	if deps.Tick == nil {
 		return nil, errors.New("gateway: tick source is required")
 	}
+	observer := deps.Observer
+	if observer == nil {
+		observer = noopOutboundObserver{}
+	}
 	return &EnterWorldHandler{
 		Characters: deps.Characters,
 		Registry:   deps.Registry,
@@ -183,6 +192,7 @@ func NewEnterWorldHandler(deps EnterWorldHandlerDeps) (*EnterWorldHandler, error
 		WorldExit:  deps.WorldExit,
 		Tick:       deps.Tick,
 		Next:       deps.Next,
+		observer:   observer,
 	}, nil
 }
 
@@ -303,11 +313,14 @@ func (h *EnterWorldHandler) enter(
 	// Only after the 219 write succeeds does the registry complete, so
 	// no inbound gameplay can run before the client holds the barrier
 	// AND the registry is IN_WORLD. A failure here is an internal
-	// invariant failure: terminate, never claim success.
+	// invariant failure: terminate, never claim success. The completion
+	// also initializes the ACK-flow epoch at the written 219 sequence
+	// (spec §7.1.11) — observed as lag 0 (spec §7.1.12).
 	if err := h.Registry.CompleteEnterWorld(sid, desc.ID); err != nil {
 		unlock()
 		return fmt.Errorf("gateway: complete enter after world_ready: %w", err)
 	}
+	h.observer.AckLag(0)
 	unlock()
 	return nil
 }

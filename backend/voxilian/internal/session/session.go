@@ -149,9 +149,66 @@ var (
 	// fail closed (e.g. more than one world-active session for one
 	// account). It is never a client error mapping.
 	ErrInvariant = errors.New("invariant_violation")
+	// ErrAckLag reports the max-unacked flow window is exhausted: the
+	// session must fail closed as a slow client (spec §7.1.11). It is an
+	// INTERNAL classification consumed by the gateway outbound writer,
+	// never a wire error code.
+	ErrAckLag = errors.New("ack_lag")
+	// ErrFutureAck reports an ACK ahead of the sent-flow sequence (or at
+	// an exact half-range distance): invalid, no mutation. The gateway
+	// maps it to 202 protocol_error (spec §7.1.11).
+	ErrFutureAck = errors.New("future_ack")
 )
 
-// entry is the mutable registry record behind one Snapshot.
+// Ack flow window bounds (spec §7.1.1): max_unacked_messages is
+// validated to 1..1000000 by config; a direct allocator call outside
+// that range is an internal configuration failure, never a silent
+// disabled window.
+const (
+	MinUnackedWindow = 1
+	MaxUnackedWindow = 1000000
+)
+
+// AckDisposition classifies one applied opcode-125 ACK (spec §7.1.11).
+// A future ACK is an error (ErrFutureAck), not a disposition.
+type AckDisposition uint8
+
+const (
+	// AckAdvanced is a valid cumulative advance: lastAck moved forward.
+	AckAdvanced AckDisposition = iota
+	// AckDuplicate repeated the current lastAck: no-op.
+	AckDuplicate
+	// AckStale is serially before lastAck: no-op.
+	AckStale
+)
+
+// String returns the stable log/test representation.
+func (d AckDisposition) String() string {
+	switch d {
+	case AckAdvanced:
+		return "advanced"
+	case AckDuplicate:
+		return "duplicate"
+	case AckStale:
+		return "stale"
+	default:
+		return fmt.Sprintf("AckDisposition(%d)", uint8(d))
+	}
+}
+
+// FlowSnapshot is an immutable copy of one session's ephemeral ACK-flow
+// state (spec §7.1.11), for tests and diagnostics. Callers never
+// observe mutable entry fields.
+type FlowSnapshot struct {
+	Active       bool
+	LastAck      uint32
+	LastFlowSent uint32
+}
+
+// entry is the mutable registry record behind one Snapshot. The
+// flowActive/lastAck/lastFlowSent triple is the session-scoped ephemeral
+// ACK-flow epoch (spec §7.1.11): guarded by the registry lock, never
+// persisted, discarded with the session on Remove.
 type entry struct {
 	id            ID
 	sub           string
@@ -163,6 +220,9 @@ type entry struct {
 	state         State
 	tokenExp      time.Time
 	serverSeq     atomic.Uint32
+	flowActive    bool
+	lastAck       uint32
+	lastFlowSent  uint32
 }
 
 // accountGuard is one ref-counted per-account lifecycle mutex.
@@ -328,12 +388,14 @@ func (r *Registry) GetByCharacter(characterID int64) (Snapshot, bool) {
 // (spec §6.1): under ONE write lock it verifies the session exists,
 // is IN_WORLD, holds a character binding for exactly
 // expectedCharacterID, and still owns the character index — then
-// removes the index, clears the binding, and moves the session to
-// AUTHENTICATED. Identity (sub, accountID, tokenExp, connection,
-// server seq) is unchanged. No public snapshot can show an
-// intermediate AUTHENTICATED-yet-bound or IN_WORLD-yet-unbound state.
-// Any precondition failure returns ErrBadState/ErrNotFound and leaves
-// the registry untouched.
+// removes the index, clears the binding, moves the session to
+// AUTHENTICATED, and in the SAME mutation clears the ACK-flow epoch
+// (flowActive=false, lastAck=0, lastFlowSent=0, spec §7.1.11) so no
+// old ACK debt survives leave/re-enter or full resync. Identity (sub,
+// accountID, tokenExp, connection, server seq) is unchanged. No public
+// snapshot can show an intermediate AUTHENTICATED-yet-bound or
+// IN_WORLD-yet-unbound state. Any precondition failure returns
+// ErrBadState/ErrNotFound and leaves the registry untouched.
 func (r *Registry) CompleteLeaveWorld(id ID, expectedCharacterID int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -354,6 +416,9 @@ func (r *Registry) CompleteLeaveWorld(id ID, expectedCharacterID int64) error {
 	e.characterID = 0
 	e.hasCharacter = false
 	e.state = StateAuthenticated
+	e.flowActive = false
+	e.lastAck = 0
+	e.lastFlowSent = 0
 	return nil
 }
 
@@ -384,6 +449,13 @@ func (r *Registry) BeginEnterWorld(id ID, characterID int64) error {
 			return fmt.Errorf("session: begin enter inconsistent index: %w", ErrBadState)
 		}
 		return fmt.Errorf("session: character %d in use: %w", characterID, ErrCharacterInUse)
+	}
+	// A stale active flow epoch at begin time is an internal invariant
+	// failure (spec §7.1.11): the previous epoch must have cleared in
+	// CompleteLeaveWorld/Remove. Zero mutation — never carry old ACK
+	// debt into a new baseline.
+	if e.flowActive {
+		return fmt.Errorf("session: begin enter with active flow epoch: %w", ErrInvariant)
 	}
 	e.state = StateCharacterSelected
 	e.characterID = characterID
@@ -418,6 +490,11 @@ func (r *Registry) AbortEnterWorld(id ID, expectedCharacterID int64) error {
 	e.characterID = 0
 	e.hasCharacter = false
 	e.state = StateAuthenticated
+	// No partial epoch survives a failed baseline (spec §7.1.11): the
+	// flow state is inactive and cleared.
+	e.flowActive = false
+	e.lastAck = 0
+	e.lastFlowSent = 0
 	return nil
 }
 
@@ -425,8 +502,13 @@ func (r *Registry) AbortEnterWorld(id ID, expectedCharacterID int64) error {
 // after a successfully written 219 world_ready (spec §6.1.2): under
 // ONE write lock it requires CHARACTER_SELECTED with a matching
 // binding and matching index owner, then moves to IN_WORLD keeping the
-// same binding and index. Nothing else changes. Any failure mutates
-// nothing.
+// same binding and index — and in the SAME mutation initializes the
+// ACK-flow epoch (spec §7.1.11) from the current server S→C sequence,
+// which is the already physically-written 219 sequence because the
+// caller's synchronous 219 send returned before this call. The
+// baseline is captured as-is (never worldReadySeq+1; no sequence is
+// allocated here). There is never an observable IN_WORLD interval with
+// an uninitialized epoch. Any failure mutates nothing.
 func (r *Registry) CompleteEnterWorld(id ID, expectedCharacterID int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -443,7 +525,11 @@ func (r *Registry) CompleteEnterWorld(id ID, expectedCharacterID int64) error {
 	if owner, taken := r.byChar[e.characterID]; !taken || owner != id {
 		return fmt.Errorf("session: complete enter index mismatch: %w", ErrBadState)
 	}
+	worldReadySeq := e.serverSeq.Load()
 	e.state = StateInWorld
+	e.flowActive = true
+	e.lastAck = worldReadySeq
+	e.lastFlowSent = worldReadySeq
 	return nil
 }
 
@@ -580,6 +666,9 @@ func (r *Registry) CompareAndSetState(id ID, expected, next State) error {
 // number. Allocation is race-safe, starts deterministically at 1, and
 // wraps naturally: after math.MaxUint32 the next value is 0, which is
 // not an error. No ACK window, replay, or ordering logic lives here.
+// Direct terminal frames (kicked, hard-deadline session_expired) and
+// non-queue test connections keep using this path; the NORMAL queued
+// writer uses NextFlowControlledServerSeq instead (spec §7.1.11).
 func (r *Registry) NextServerSeq(id ID) (uint32, error) {
 	r.mu.RLock()
 	e, ok := r.byID[id]
@@ -588,6 +677,112 @@ func (r *Registry) NextServerSeq(id ID) (uint32, error) {
 		return 0, fmt.Errorf("session: seq for unknown session: %w", ErrNotFound)
 	}
 	return e.serverSeq.Add(1), nil
+}
+
+// NextFlowControlledServerSeq is the NORMAL queued writer's S→C
+// sequence allocator (spec §7.1.11). It runs inside the connection's
+// physical writer slot and is one atomic registry operation against ACK
+// application and lifecycle transitions:
+//
+//   - Not IN_WORLD (CONNECTED/AUTHENTICATED replies, the
+//     CHARACTER_SELECTED baseline, and the 219 itself): allocate the
+//     next seq normally, tracked=false, lag=0 — no ACK accounting.
+//   - IN_WORLD: require an initialized flow epoch (else internal
+//     invariant failure). If the current unacked lag already equals or
+//     exceeds maxUnacked, return ErrAckLag BEFORE any sequence is
+//     allocated — the rejected frame consumes no seq, is never
+//     written, and the session fails closed as a slow client.
+//     Otherwise allocate the next seq, advance lastFlowSent, and
+//     return tracked=true with the new lag (prior+1).
+//
+// maxUnacked must lie in MinUnackedWindow..MaxUnackedWindow; an
+// out-of-range direct call is an internal configuration error
+// (ErrInvariant), never a silently disabled window.
+func (r *Registry) NextFlowControlledServerSeq(id ID, maxUnacked int) (seq uint32, tracked bool, lag int, err error) {
+	if maxUnacked < MinUnackedWindow || maxUnacked > MaxUnackedWindow {
+		return 0, false, 0, fmt.Errorf(
+			"session: max_unacked %d out of %d..%d: %w",
+			maxUnacked, MinUnackedWindow, MaxUnackedWindow, ErrInvariant)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.byID[id]
+	if !ok {
+		return 0, false, 0, fmt.Errorf("session: flow seq for unknown session: %w", ErrNotFound)
+	}
+	if e.state != StateInWorld {
+		return e.serverSeq.Add(1), false, 0, nil
+	}
+	if !e.flowActive {
+		return 0, false, 0, fmt.Errorf(
+			"session: flow seq in IN_WORLD without flow epoch: %w", ErrInvariant)
+	}
+	current := int(uint32(e.lastFlowSent - e.lastAck)) // pure modulo distance
+	if current >= maxUnacked {
+		return 0, false, 0, fmt.Errorf(
+			"session: ack lag %d >= max %d: %w", current, maxUnacked, ErrAckLag)
+	}
+	seq = e.serverSeq.Add(1)
+	e.lastFlowSent = seq
+	return seq, true, current + 1, nil
+}
+
+// ApplyAck applies one cumulative opcode-125 ACK to the session's flow
+// epoch (spec §7.1.11). It requires the session to exist, be IN_WORLD,
+// and hold an active epoch; ordering uses ONLY the M2 serial helpers.
+// Classifications: ack == lastAck → AckDuplicate (no-op); ack serially
+// before lastAck → AckStale (no-op); lastAck < ack <= lastFlowSent →
+// AckAdvanced (lastAck = ack); ack serially after lastFlowSent, or at
+// an exact 2^31 (half-range) distance in either direction →
+// ErrFutureAck with zero mutation. The returned lag is the current
+// unacked window AFTER the classification. No payload is retained; no
+// replay exists.
+func (r *Registry) ApplyAck(id ID, ackSeq uint32) (AckDisposition, int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.byID[id]
+	if !ok {
+		return 0, 0, fmt.Errorf("session: ack for unknown session: %w", ErrNotFound)
+	}
+	if e.state != StateInWorld {
+		return 0, 0, fmt.Errorf("session: ack in %s: %w", e.state, ErrBadState)
+	}
+	if !e.flowActive {
+		return 0, 0, fmt.Errorf("session: ack without flow epoch: %w", ErrInvariant)
+	}
+	current := int(uint32(e.lastFlowSent - e.lastAck))
+	switch {
+	case ackSeq == e.lastAck:
+		return AckDuplicate, current, nil
+	case proto.Serial32Before(ackSeq, e.lastAck):
+		return AckStale, current, nil
+	case proto.Serial32After(ackSeq, e.lastFlowSent):
+		return 0, 0, fmt.Errorf(
+			"session: ack %d ahead of sent flow %d: %w", ackSeq, e.lastFlowSent, ErrFutureAck)
+	case proto.Serial32After(ackSeq, e.lastAck):
+		e.lastAck = ackSeq
+		return AckAdvanced, int(uint32(e.lastFlowSent - e.lastAck)), nil
+	default:
+		// Exact half-range distance: both serial directions are false —
+		// impossible during valid operation (the window is far below
+		// 2^31); treat as future/invalid, never as stale.
+		return 0, 0, fmt.Errorf(
+			"session: ack %d at half-range (lastAck %d, sent %d): %w",
+			ackSeq, e.lastAck, e.lastFlowSent, ErrFutureAck)
+	}
+}
+
+// FlowState returns an immutable copy of the session's ACK-flow epoch
+// (spec §7.1.11). It exists for tests and diagnostics; no mutable
+// entry state escapes.
+func (r *Registry) FlowState(id ID) (FlowSnapshot, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	e, ok := r.byID[id]
+	if !ok {
+		return FlowSnapshot{}, fmt.Errorf("session: flow state for unknown session: %w", ErrNotFound)
+	}
+	return FlowSnapshot{Active: e.flowActive, LastAck: e.lastAck, LastFlowSent: e.lastFlowSent}, nil
 }
 
 // LockAccount returns the unlock function for the per-account lifecycle

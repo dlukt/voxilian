@@ -73,7 +73,8 @@ func (f WorldExitFunc) ExitWorld(
 
 // CharacterHandler owns exactly opcodes 121, 122, 123, and 126. Every
 // other allowed opcode delegates to Next (124 enter_world belongs
-// wholly to M3-T4; gameplay/ack belong to later tasks). It holds no
+// wholly to M3-T4; gameplay belongs to later tasks; opcode 125 ack is
+// owned by the Server and never reaches this chain). It holds no
 // WebSocket connection: all replies go through SendFunc, and
 // machine-readable failures use ClientError.
 type CharacterHandler struct {
@@ -128,8 +129,9 @@ func (h *CharacterHandler) Handle(
 	case proto.OpcodeLeaveWorld:
 		return h.leave(ctx, sid, payload, send)
 	default:
-		// 124 enter_world is owned wholly by M3-T4; 102–120 and 125
-		// belong to later tasks. Delegate unchanged.
+		// 124 enter_world is owned wholly by M3-T4; 102–120 belong to
+		// later tasks. Opcode 125 ack is owned by the Server itself and
+		// never reaches this chain. Delegate unchanged.
 		if h.Next == nil {
 			return nil
 		}

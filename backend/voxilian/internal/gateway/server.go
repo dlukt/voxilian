@@ -202,9 +202,10 @@ func NewServer(deps ServerDeps) *Server {
 		observer:  deps.OutboundObserver,
 		handler:   deps.Handler,
 	}
-	if s.outbound.MaxMessages <= 0 {
-		s.outbound = DefaultOutboundPolicy()
-	}
+	// Per-field policy defaulting (spec §7.1.1): every unset bound
+	// independently receives its default, so a policy overriding only
+	// the ACK window never discards its other valid overrides.
+	s.outbound = s.outbound.orDefaults()
 	if s.observer == nil {
 		s.observer = noopOutboundObserver{}
 	}
@@ -366,12 +367,13 @@ func (s *Server) handleBinary(
 	// Hard authorization deadline, enforced synchronously before any
 	// dispatch — handler, gameplay, or reauth. A CONNECTED session has
 	// no established token and is exempt. The 202 goes out through the
-	// DIRECT low-level writer: terminal control never waits behind a
-	// saturated outbound queue (spec §7.1.9).
+	// DIRECT low-level writer on the same bounded budget the scheduled
+	// deadline callback uses (spec §7.1.9): terminal control never
+	// waits behind a saturated outbound queue and never inherits an
+	// effectively unbounded request context.
 	if snap.State != session.StateConnected &&
 		!s.now().Before(snap.TokenExp.Add(ReauthGrace)) {
-		_ = s.sendDirectError(ctx, sid,
-			proto.ErrorCodeSessionExpired, "reauth deadline exceeded")
+		s.terminateAuthDeadline(sid)
 		return errAuthDeadline
 	}
 	switch header.Opcode {
@@ -379,6 +381,12 @@ func (s *Server) handleBinary(
 		return s.finishStep(ctx, sid, s.handleHello(ctx, ca, sid, payload))
 	case proto.OpcodeReauth:
 		return s.finishStep(ctx, sid, s.handleReauth(ctx, ca, sid, snap, payload))
+	case proto.OpcodeAck:
+		// Opcode 125 is gateway transport/flow-control behavior owned by
+		// the Server itself (spec §7.1.11): it never reaches the handler
+		// seam (CharacterHandler, EnterWorldHandler, or a future
+		// gameplay handler).
+		return s.finishStep(ctx, sid, s.handleAck(sid, payload))
 	default:
 		return s.dispatch(ctx, sid, header, payload)
 	}
@@ -499,6 +507,47 @@ func (s *Server) handleReauth(
 	})
 }
 
+// handleAck serves opcode 125 (spec §7.1.11) — cumulative ACK flow
+// control, owned by the Server itself. The lifecycle permission gate
+// already ran: only CHARACTER_SELECTED and IN_WORLD ACKs reach here
+// (e.g. AUTHENTICATED + 125 became 202 bad_state earlier). A malformed
+// payload is 202 protocol_error with the connection alive. A
+// structurally valid ACK in CHARACTER_SELECTED — before the flow epoch
+// exists — is a no-op with no reply and no flow mutation. In IN_WORLD
+// the registry classifies advanced/duplicate/stale (no reply, current
+// lag observed) and future/invalid (202 protocol_error; the 202 itself
+// is ordinary NORMAL IN_WORLD traffic and consumes one flow sequence).
+// No success reply is ever sent for a valid, stale, or duplicate ACK.
+func (s *Server) handleAck(
+	sid session.ID,
+	payload *proto.Decoder,
+) error {
+	ack, err := proto.DecodeAck(payload)
+	if err != nil {
+		return &ClientError{Code: proto.ErrorCodeProtocol, Message: "malformed ack"}
+	}
+	snap, ok := s.Registry.Get(sid)
+	if !ok {
+		return fmt.Errorf("gateway: ack for vanished session %d", uint64(sid))
+	}
+	if snap.State == session.StateCharacterSelected {
+		return nil
+	}
+	_, lag, err := s.Registry.ApplyAck(sid, ack.AckSeq)
+	if err != nil {
+		if errors.Is(err, session.ErrFutureAck) {
+			return &ClientError{Code: proto.ErrorCodeProtocol, Message: "ack ahead of sent flow"}
+		}
+		// ErrBadState / ErrInvariant / ErrNotFound: internal failure —
+		// the gate established IN_WORLD and an active epoch moments ago.
+		return err
+	}
+	// Observed after ApplyAck returned: no observer callback ever runs
+	// inside the registry lock (spec §7.1.12).
+	s.observer.AckLag(lag)
+	return nil
+}
+
 // dispatch passes an allowed non-connect opcode to the handler seam with
 // a responder that always allocates framing. A *ClientError becomes a
 // 202 with the connection alive; an unexpected internal error is logged
@@ -567,6 +616,17 @@ func (s *Server) cancelDeadline(ca *connAuth) {
 // contract.
 var deadlineWriteBudget = 2 * time.Second
 
+// terminateAuthDeadline performs the bounded best-effort DIRECT 202
+// session_expired terminal write shared by BOTH hard-expiry paths —
+// the synchronous on-message gate and the scheduled idle deadline
+// callback (spec §7.1.9): context.Background() plus deadlineWriteBudget,
+// never a caller request context.
+func (s *Server) terminateAuthDeadline(sid session.ID) {
+	ctx, cancel := context.WithTimeout(context.Background(), deadlineWriteBudget)
+	defer cancel()
+	_ = s.sendDirectError(ctx, sid, proto.ErrorCodeSessionExpired, "reauth deadline exceeded")
+}
+
 // onDeadline terminates a connection whose hard deadline passed, even
 // when idle: best-effort 202 session_expired on a bounded context, then
 // close (which unblocks the read loop into cleanup). Stale callbacks —
@@ -589,9 +649,7 @@ func (s *Server) onDeadline(ca *connAuth, sid session.ID, gen uint64, dl time.Ti
 	if s.now().Before(dl) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), deadlineWriteBudget)
-	defer cancel()
-	_ = s.sendDirectError(ctx, sid, proto.ErrorCodeSessionExpired, "reauth deadline exceeded")
+	s.terminateAuthDeadline(sid)
 	// Close asynchronously: the close handshake waits for the peer's
 	// response, which must never block this timer callback (an idle or
 	// dead peer would stall it up to the library's handshake timeout).

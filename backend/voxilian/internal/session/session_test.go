@@ -7,6 +7,7 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -638,6 +639,11 @@ func TestCompleteLeaveWorld(t *testing.T) {
 	if seq, err := r.NextServerSeq(id); err != nil || seq != 2 {
 		t.Errorf("server seq = %d, %v; want 2 (counter preserved)", seq, err)
 	}
+	// T5b: the same registry mutation cleared the flow epoch — no ACK
+	// debt survives leave (spec §7.1.11).
+	if fs := flowMust(t, r, id); fs.Active || fs.LastAck != 0 || fs.LastFlowSent != 0 {
+		t.Errorf("flow after leave = %+v, want inactive and cleared", fs)
+	}
 }
 
 func TestCompleteLeaveWorldNoMutationOnFailure(t *testing.T) {
@@ -777,6 +783,10 @@ func TestBeginEnterWorld(t *testing.T) {
 	if err := r.BeginEnterWorld(plain, 60); !errors.Is(err, ErrBadState) {
 		t.Errorf("connected begin err = %v, want ErrBadState", err)
 	}
+	// T5b: a begun (baseline-streaming) session has no flow epoch.
+	if fs := flowMust(t, r, id); fs.Active {
+		t.Errorf("flow after begin = %+v, want inactive", fs)
+	}
 }
 
 func TestAbortEnterWorld(t *testing.T) {
@@ -805,6 +815,10 @@ func TestAbortEnterWorld(t *testing.T) {
 	}
 	if seq, err := r.NextServerSeq(id); err != nil || seq != 2 {
 		t.Errorf("seq = %d,%v want 2", seq, err)
+	}
+	// T5b: a failed baseline leaves no partial epoch (spec §7.1.11).
+	if fs := flowMust(t, r, id); fs.Active || fs.LastAck != 0 || fs.LastFlowSent != 0 {
+		t.Errorf("flow after abort = %+v, want inactive and cleared", fs)
 	}
 
 	// Wrong state (already AUTHENTICATED): no mutation.
@@ -871,6 +885,13 @@ func TestCompleteEnterWorld(t *testing.T) {
 	}
 	if seq, err := r.NextServerSeq(id); err != nil || seq != 2 {
 		t.Errorf("seq = %d,%v want 2", seq, err)
+	}
+	// T5b: the completion initialized the flow epoch atomically at the
+	// current (already-written) server seq — one seq was allocated
+	// before completing, so the baseline is exactly 1, never 2, and no
+	// extra sequence was consumed here.
+	if fs := flowMust(t, r, id); !fs.Active || fs.LastAck != 1 || fs.LastFlowSent != 1 {
+		t.Errorf("flow after complete = %+v, want active at seq 1/1", fs)
 	}
 
 	// Wrong state (already IN_WORLD): no mutation.
@@ -955,5 +976,518 @@ func TestWorldSessionForAccount(t *testing.T) {
 		if _, _, err := r.WorldSessionForAccount(7, me); !errors.Is(err, ErrInvariant) {
 			t.Fatalf("iter %d err = %v, want ErrInvariant", i, err)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T5b ACK-flow epoch (spec §7.1.11)
+// ---------------------------------------------------------------------------
+
+// flowMust reads the flow snapshot or fails the test.
+func flowMust(t *testing.T, r *Registry, id ID) FlowSnapshot {
+	t.Helper()
+	fs, err := r.FlowState(id)
+	if err != nil {
+		t.Fatalf("FlowState(%d): %v", uint64(id), err)
+	}
+	return fs
+}
+
+// setupFlowSession drives one session through the REAL lifecycle
+// primitives into IN_WORLD with an initialized flow epoch (the only
+// legal production path).
+func setupFlowSession(t *testing.T, r *Registry) ID {
+	t.Helper()
+	id := setupAuthenticated(t, r, "flow", 7)
+	if err := r.BeginEnterWorld(id, 55); err != nil {
+		t.Fatalf("begin enter: %v", err)
+	}
+	if err := r.CompleteEnterWorld(id, 55); err != nil {
+		t.Fatalf("complete enter: %v", err)
+	}
+	return id
+}
+
+// forceFlow installs an exact flow epoch and server sequence value for
+// wrap/edge tests. In-package reach into registry internals mirrors the
+// existing byChar manipulation precedent.
+func forceFlow(r *Registry, id ID, serverSeq, lastAck, lastFlowSent uint32) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e := r.byID[id]
+	e.serverSeq.Store(serverSeq)
+	e.lastAck = lastAck
+	e.lastFlowSent = lastFlowSent
+	e.flowActive = true
+}
+
+func flowLag(fs FlowSnapshot) int { return int(uint32(fs.LastFlowSent - fs.LastAck)) }
+
+// TestFlowEpochLifecycle proves the epoch's full lifecycle coupling
+// (spec §7.1.11): inactive through authenticate/begin, atomically
+// initialized at the written 219 sequence on complete, atomically
+// cleared on leave, and a fresh baseline with no old debt on re-enter.
+func TestFlowEpochLifecycle(t *testing.T) {
+	r := NewRegistry()
+	id := r.Create(nil)
+
+	// CONNECTED/AUTHENTICATED: no epoch.
+	if fs := flowMust(t, r, id); fs.Active {
+		t.Fatalf("flow after create = %+v, want inactive", fs)
+	}
+	if err := r.Authenticate(id, "sub", 7, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if fs := flowMust(t, r, id); fs.Active {
+		t.Fatalf("flow after authenticate = %+v, want inactive", fs)
+	}
+	if err := r.BeginEnterWorld(id, 55); err != nil {
+		t.Fatal(err)
+	}
+	if fs := flowMust(t, r, id); fs.Active {
+		t.Fatalf("flow after begin = %+v, want inactive (baseline ungated)", fs)
+	}
+	// Baseline traffic: three untracked allocations while selected.
+	for i := 0; i < 3; i++ {
+		seq, tracked, lag, err := r.NextFlowControlledServerSeq(id, 4)
+		if err != nil || tracked || lag != 0 || seq != uint32(i+1) {
+			t.Fatalf("baseline alloc %d = %d,%v,%d,%v", i, seq, tracked, lag, err)
+		}
+	}
+	if fs := flowMust(t, r, id); fs.Active || fs.LastFlowSent != 0 {
+		t.Fatalf("baseline consumed flow: %+v", fs)
+	}
+	if err := r.CompleteEnterWorld(id, 55); err != nil {
+		t.Fatal(err)
+	}
+	// Epoch initialized at the CURRENT server seq (3), never +1.
+	if fs := flowMust(t, r, id); !fs.Active || fs.LastAck != 3 || fs.LastFlowSent != 3 || flowLag(fs) != 0 {
+		t.Fatalf("flow after complete = %+v, want active 3/3 lag 0", fs)
+	}
+	// Two unacked IN_WORLD frames leave debt 2.
+	for i, wantLag := range []int{1, 2} {
+		seq, tracked, lag, err := r.NextFlowControlledServerSeq(id, 8)
+		if err != nil || !tracked || lag != wantLag || seq != uint32(4+i) {
+			t.Fatalf("world alloc %d = %d,%v,%d,%v", i, seq, tracked, lag, err)
+		}
+	}
+	// Leave clears everything atomically.
+	if err := r.CompleteLeaveWorld(id, 55); err != nil {
+		t.Fatal(err)
+	}
+	if fs := flowMust(t, r, id); fs.Active || fs.LastAck != 0 || fs.LastFlowSent != 0 {
+		t.Fatalf("flow after leave = %+v, want inactive and cleared", fs)
+	}
+	// Re-enter starts a completely new epoch at its new baseline with no
+	// old debt.
+	if _, err := r.NextServerSeq(id); err != nil { // seq 6
+		t.Fatal(err)
+	}
+	if err := r.BeginEnterWorld(id, 55); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.CompleteEnterWorld(id, 55); err != nil {
+		t.Fatal(err)
+	}
+	if fs := flowMust(t, r, id); !fs.Active || fs.LastAck != 6 || fs.LastFlowSent != 6 || flowLag(fs) != 0 {
+		t.Fatalf("flow after re-enter = %+v, want fresh epoch 6/6 lag 0", fs)
+	}
+}
+
+// TestCompleteEnterWorldCapturesWrittenSeq pins the exact captured
+// world_ready sequence: the epoch baseline is the serverSeq AT complete
+// time (the already-written 219), never worldReadySeq+1 and never a
+// fresh allocation.
+func TestCompleteEnterWorldCapturesWrittenSeq(t *testing.T) {
+	r := NewRegistry()
+	id := setupAuthenticated(t, r, "sub", 7)
+	for i := 0; i < 5; i++ {
+		if _, err := r.NextServerSeq(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.BeginEnterWorld(id, 55); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.CompleteEnterWorld(id, 55); err != nil {
+		t.Fatal(err)
+	}
+	fs := flowMust(t, r, id)
+	if fs.LastAck != 5 || fs.LastFlowSent != 5 {
+		t.Fatalf("epoch baseline = %d/%d, want 5/5 (current seq, not +1)", fs.LastAck, fs.LastFlowSent)
+	}
+	// No sequence was consumed by the completion itself.
+	if seq, err := r.NextServerSeq(id); err != nil || seq != 6 {
+		t.Fatalf("next seq = %d,%v want 6 (complete allocated nothing)", seq, err)
+	}
+}
+
+// TestBeginEnterWorldStaleFlowInvariant proves a stale active epoch at
+// begin time is an internal invariant failure with zero mutation
+// (spec §7.1.11): old ACK debt never rides into a new baseline.
+func TestBeginEnterWorldStaleFlowInvariant(t *testing.T) {
+	r := NewRegistry()
+	id := setupAuthenticated(t, r, "sub", 7)
+	// Manufacture the impossible residue directly: AUTHENTICATED,
+	// unbound, but a still-active epoch.
+	r.mu.Lock()
+	e := r.byID[id]
+	e.flowActive = true
+	e.lastAck = 9
+	e.lastFlowSent = 40
+	r.mu.Unlock()
+	err := r.BeginEnterWorld(id, 55)
+	if !errors.Is(err, ErrInvariant) {
+		t.Fatalf("begin with stale epoch err = %v, want ErrInvariant", err)
+	}
+	// Zero lifecycle mutation.
+	snap := snapshotMust(t, r, id)
+	if snap.State != StateAuthenticated || snap.HasCharacter {
+		t.Fatalf("mutated by failed begin: %+v", snap)
+	}
+	if _, ok := r.SessionByCharacter(55); ok {
+		t.Fatal("index created by failed begin")
+	}
+}
+
+// TestFlowWindowThresholdAndNoSeqOnReject proves the frozen max-unacked
+// semantics (spec §7.1.11, max=2 example): A→lag1, B→lag2, C rejected
+// with ErrAckLag BEFORE any sequence exists, an ACK for B reopens
+// capacity, and the next allocation succeeds.
+func TestFlowWindowThresholdAndNoSeqOnReject(t *testing.T) {
+	r := NewRegistry()
+	id := setupFlowSession(t, r)
+	base := flowMust(t, r, id).LastFlowSent // 0
+	if lag := flowLag(flowMust(t, r, id)); lag != 0 {
+		t.Fatalf("baseline lag = %d, want 0", lag)
+	}
+	// A: lag 1.
+	seqA, tracked, lag, err := r.NextFlowControlledServerSeq(id, 2)
+	if err != nil || !tracked || lag != 1 || seqA != base+1 {
+		t.Fatalf("A = %d,%v,%d,%v", seqA, tracked, lag, err)
+	}
+	// B: lag 2 (still legal — lag <= max).
+	seqB, _, lag, err := r.NextFlowControlledServerSeq(id, 2)
+	if err != nil || lag != 2 || seqB != base+2 {
+		t.Fatalf("B = %d,%d,%v", seqB, lag, err)
+	}
+	_ = seqB
+	// C: rejected, no seq allocated.
+	_, _, _, err = r.NextFlowControlledServerSeq(id, 2)
+	if !errors.Is(err, ErrAckLag) {
+		t.Fatalf("C err = %v, want ErrAckLag", err)
+	}
+	// Mandatory no-seq proof: the very next sequence allocation is B+1,
+	// not B+2 — C consumed nothing.
+	next, err := r.NextServerSeq(id)
+	if err != nil || next != base+3 {
+		t.Fatalf("next seq after rejection = %d,%v want %d (C consumed a sequence)", next, err, base+3)
+	}
+	// ACK for B reopens the window to exactly one unit.
+	disp, lag, err := r.ApplyAck(id, seqB)
+	if disp != AckAdvanced || lag != 0 || err != nil {
+		t.Fatalf("ack B = %v,%d,%v", disp, lag, err)
+	}
+	// The probe above consumed base+3, so D owns base+4 with lag 1.
+	seqD, tracked, lag, err := r.NextFlowControlledServerSeq(id, 2)
+	if err != nil || !tracked || lag != 1 || seqD != base+4 {
+		t.Fatalf("D = %d,%v,%d,%v", seqD, tracked, lag, err)
+	}
+	_ = seqA
+}
+
+// TestFlowAllocationUntrackedOutsideInWorld proves CONNECTED,
+// AUTHENTICATED, and CHARACTER_SELECTED sessions allocate normal
+// sequences without ACK accounting (spec §7.1.11): the baseline is
+// never ACK-gated.
+func TestFlowAllocationUntrackedOutsideInWorld(t *testing.T) {
+	r := NewRegistry()
+	id := r.Create(nil)
+	// CONNECTED.
+	seq, tracked, lag, err := r.NextFlowControlledServerSeq(id, 1)
+	if err != nil || tracked || lag != 0 || seq != 1 {
+		t.Fatalf("connected = %d,%v,%d,%v", seq, tracked, lag, err)
+	}
+	if err := r.Authenticate(id, "sub", 7, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	// AUTHENTICATED.
+	seq, tracked, lag, err = r.NextFlowControlledServerSeq(id, 1)
+	if err != nil || tracked || lag != 0 || seq != 2 {
+		t.Fatalf("authenticated = %d,%v,%d,%v", seq, tracked, lag, err)
+	}
+	// CHARACTER_SELECTED (mid-baseline).
+	if err := r.BeginEnterWorld(id, 55); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		seq, tracked, lag, err = r.NextFlowControlledServerSeq(id, 1)
+		if err != nil || tracked || lag != 0 || seq != uint32(3+i) {
+			t.Fatalf("selected alloc %d = %d,%v,%d,%v", i, seq, tracked, lag, err)
+		}
+	}
+	if fs := flowMust(t, r, id); fs.Active || fs.LastFlowSent != 0 {
+		t.Fatalf("baseline moved flow: %+v", fs)
+	}
+	// Unknown session.
+	if _, _, _, err := r.NextFlowControlledServerSeq(9999, 8); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestFlowInvariantInWorldWithoutEpoch proves an IN_WORLD session with
+// no initialized epoch (only constructible outside the real lifecycle)
+// is an internal invariant failure at allocation time — never a silent
+// baseline synthesized from the first post-world frame (spec §7.1.11).
+func TestFlowInvariantInWorldWithoutEpoch(t *testing.T) {
+	r := NewRegistry()
+	id := setupInWorld(t, r, "cas", 7, 55) // CAS path: no epoch
+	if fs := flowMust(t, r, id); fs.Active {
+		t.Fatalf("cas in-world flow = %+v, want inactive", fs)
+	}
+	if _, _, _, err := r.NextFlowControlledServerSeq(id, 8); !errors.Is(err, ErrInvariant) {
+		t.Fatalf("alloc err = %v, want ErrInvariant", err)
+	}
+	// ApplyAck hits the same invariant.
+	if _, _, err := r.ApplyAck(id, 1); !errors.Is(err, ErrInvariant) {
+		t.Fatalf("ack err = %v, want ErrInvariant", err)
+	}
+}
+
+// TestNextFlowControlledMaxValidation proves an out-of-range window is
+// an internal configuration error rather than a silently disabled
+// window (spec §7.1.1/§7.1.11).
+func TestNextFlowControlledMaxValidation(t *testing.T) {
+	r := NewRegistry()
+	id := setupAuthenticated(t, r, "sub", 7)
+	for _, bad := range []int{0, -1, MaxUnackedWindow + 1} {
+		if _, _, _, err := r.NextFlowControlledServerSeq(id, bad); !errors.Is(err, ErrInvariant) {
+			t.Fatalf("max %d err = %v, want ErrInvariant", bad, err)
+		}
+	}
+	for _, ok := range []int{MinUnackedWindow, 64, MaxUnackedWindow} {
+		if _, _, _, err := r.NextFlowControlledServerSeq(id, ok); err != nil {
+			t.Fatalf("max %d err = %v, want nil", ok, err)
+		}
+	}
+}
+
+// TestApplyAckClassifications covers the exact frozen classifications
+// (spec §7.1.11): duplicate, stale, valid cumulative advance, and
+// future/invalid — with lag values and no mutation on failure.
+func TestApplyAckClassifications(t *testing.T) {
+	r := NewRegistry()
+	id := setupFlowSession(t, r)
+	// Four unacked frames: seqs 1..4.
+	for i := 0; i < 4; i++ {
+		seq, tracked, lag, err := r.NextFlowControlledServerSeq(id, 64)
+		if err != nil || !tracked || lag != i+1 {
+			t.Fatalf("alloc %d = %d,%v,%d,%v", i, seq, tracked, lag, err)
+		}
+	}
+	// PARTIAL cumulative advance: ACK the second frame — exactly frames
+	// 3 and 4 remain as lag 2.
+	disp, lag, err := r.ApplyAck(id, 2)
+	if disp != AckAdvanced || lag != 2 || err != nil {
+		t.Fatalf("partial advance = %v,%d,%v", disp, lag, err)
+	}
+	if fs := flowMust(t, r, id); fs.LastAck != 2 || fs.LastFlowSent != 4 {
+		t.Fatalf("after partial = %+v, want ack 2 sent 4", fs)
+	}
+	// Duplicate of the current lastAck: no-op.
+	if disp, lag, err = r.ApplyAck(id, 2); disp != AckDuplicate || lag != 2 || err != nil {
+		t.Fatalf("duplicate = %v,%d,%v", disp, lag, err)
+	}
+	// Stale: serially before lastAck.
+	if disp, lag, err = r.ApplyAck(id, 1); disp != AckStale || lag != 2 || err != nil {
+		t.Fatalf("stale = %v,%d,%v", disp, lag, err)
+	}
+	// Neither stale nor duplicate moved the window.
+	if fs := flowMust(t, r, id); fs.LastAck != 2 || flowLag(fs) != 2 {
+		t.Fatalf("no-op moved flow: %+v", fs)
+	}
+	// Future: ahead of lastFlowSent; zero mutation.
+	before := flowMust(t, r, id)
+	if _, _, err = r.ApplyAck(id, 5); !errors.Is(err, ErrFutureAck) {
+		t.Fatalf("future err = %v, want ErrFutureAck", err)
+	}
+	if after := flowMust(t, r, id); after != before {
+		t.Fatalf("future mutated flow: %+v -> %+v", before, after)
+	}
+	// Full advance to the exact newest is legal (<= lastFlowSent).
+	if disp, lag, err = r.ApplyAck(id, 4); disp != AckAdvanced || lag != 0 || err != nil {
+		t.Fatalf("advance to newest = %v,%d,%v", disp, lag, err)
+	}
+	// Later ACK for the same point stays duplicate.
+	if disp, lag, err = r.ApplyAck(id, 4); disp != AckDuplicate || lag != 0 || err != nil {
+		t.Fatalf("late duplicate = %v,%d,%v", disp, lag, err)
+	}
+}
+
+// TestApplyAckHalfRange proves an ACK at exactly the 2^31 distance is
+// future/invalid in both directions — never accepted as stale
+// (spec §7.1.11): both serial helpers are false there.
+func TestApplyAckHalfRange(t *testing.T) {
+	r := NewRegistry()
+	id := setupFlowSession(t, r)
+	for _, tc := range []struct {
+		lastAck, lastFlowSent, ack uint32
+	}{
+		{0, 0, 0x80000000},
+		{5, 5, 5 + 0x80000000},
+		{0x80000000, 0x80000000, 0},
+	} {
+		forceFlow(r, id, tc.lastFlowSent, tc.lastAck, tc.lastFlowSent)
+		before := flowMust(t, r, id)
+		if _, _, err := r.ApplyAck(id, tc.ack); !errors.Is(err, ErrFutureAck) {
+			t.Fatalf("ack %d at half-range from %d: err = %v, want ErrFutureAck",
+				tc.ack, tc.lastAck, err)
+		}
+		if after := flowMust(t, r, id); after != before {
+			t.Fatalf("half-range ack mutated flow: %+v -> %+v", before, after)
+		}
+	}
+}
+
+// TestFlowWraparound covers MaxUint32-1, MaxUint32, 0, and 1 (spec
+// §6/§7.1.11): allocation wraps naturally, 0 is legitimately after
+// MaxUint32, cumulative ACKs advance across the wrap, stale/future
+// classifications hold, and lag stays a pure modulo distance.
+func TestFlowWraparound(t *testing.T) {
+	r := NewRegistry()
+	id := setupFlowSession(t, r)
+	// Epoch as if the 219 was written at MaxUint32-1.
+	forceFlow(r, id, math.MaxUint32-1, math.MaxUint32-1, math.MaxUint32-1)
+	if lag := flowLag(flowMust(t, r, id)); lag != 0 {
+		t.Fatalf("wrap baseline lag = %d, want 0", lag)
+	}
+	// A: MaxUint32 (lag 1); B: 0 after the wrap (lag 2).
+	seqA, _, lag, err := r.NextFlowControlledServerSeq(id, 4)
+	if err != nil || seqA != math.MaxUint32 || lag != 1 {
+		t.Fatalf("A = %d,%d,%v", seqA, lag, err)
+	}
+	seqB, _, lag, err := r.NextFlowControlledServerSeq(id, 4)
+	if err != nil || seqB != 0 || lag != 2 {
+		t.Fatalf("B = %d,%d,%v (wrap failed)", seqB, lag, err)
+	}
+	// Lag is the modulo distance across the wrap.
+	if lag := flowLag(flowMust(t, r, id)); lag != 2 {
+		t.Fatalf("wrap lag = %d, want 2", lag)
+	}
+	// Max-unacked still enforced across the wrap: lag 2 with max 2.
+	if _, _, _, err := r.NextFlowControlledServerSeq(id, 2); !errors.Is(err, ErrAckLag) {
+		t.Fatalf("wrap rejection err = %v, want ErrAckLag", err)
+	}
+	// Valid cumulative ACK across the wrap: 0 is after MaxUint32-1.
+	if disp, lag, err := r.ApplyAck(id, 0); disp != AckAdvanced || lag != 0 || err != nil {
+		t.Fatalf("wrap advance = %v,%d,%v", disp, lag, err)
+	}
+	// Stale MaxUint32 after lastAck=0.
+	if disp, lag, err := r.ApplyAck(id, math.MaxUint32); disp != AckStale || lag != 0 || err != nil {
+		t.Fatalf("stale MaxUint32 = %v,%d,%v", disp, lag, err)
+	}
+	// One more frame (seq 1), then future ACK across the wrap.
+	if _, _, _, err := r.NextFlowControlledServerSeq(id, 4); err != nil {
+		t.Fatal(err)
+	}
+	if fs := flowMust(t, r, id); fs.LastFlowSent != 1 || flowLag(fs) != 1 {
+		t.Fatalf("post-wrap flow = %+v, want sent 1 lag 1", fs)
+	}
+	if _, _, err := r.ApplyAck(id, 2); !errors.Is(err, ErrFutureAck) {
+		t.Fatalf("future across wrap err = %v, want ErrFutureAck", err)
+	}
+	// Duplicate at the wrapped point.
+	if disp, _, err := r.ApplyAck(id, 0); disp != AckDuplicate || err != nil {
+		t.Fatalf("wrap duplicate = %v,%v", disp, err)
+	}
+	// Advance to the wrapped newest.
+	if disp, lag, err := r.ApplyAck(id, 1); disp != AckAdvanced || lag != 0 || err != nil {
+		t.Fatalf("wrap advance to 1 = %v,%d,%v", disp, lag, err)
+	}
+}
+
+// TestApplyAckStateErrors covers the state preconditions: unknown
+// session, wrong state, and missing epoch.
+func TestApplyAckStateErrors(t *testing.T) {
+	r := NewRegistry()
+	if _, _, err := r.ApplyAck(9999, 1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown err = %v, want ErrNotFound", err)
+	}
+	authed := setupAuthenticated(t, r, "authed", 7)
+	if _, _, err := r.ApplyAck(authed, 1); !errors.Is(err, ErrBadState) {
+		t.Fatalf("authenticated err = %v, want ErrBadState", err)
+	}
+	if err := r.BeginEnterWorld(authed, 55); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.ApplyAck(authed, 1); !errors.Is(err, ErrBadState) {
+		t.Fatalf("selected err = %v, want ErrBadState", err)
+	}
+	if _, err := r.FlowState(9999); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("flow state unknown err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestFlowConcurrentAllocAck races sequence allocation against ACK
+// application and inspection (the -race proof that flow state is
+// guarded by the registry lock): the window never goes inconsistent
+// and a final cumulative ACK always reaches lag 0.
+func TestFlowConcurrentAllocAck(t *testing.T) {
+	r := NewRegistry()
+	id := setupFlowSession(t, r)
+	const workers, per = 8, 50
+	var maxSeq atomic.Uint32
+	var wg sync.WaitGroup
+	errs := make(chan error, workers+1)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < per; i++ {
+				seq, tracked, lag, err := r.NextFlowControlledServerSeq(id, workers*per)
+				if err != nil {
+					errs <- err
+					return
+				}
+				if !tracked || lag < 1 || lag > workers*per {
+					errs <- fmt.Errorf("alloc = %d,%v,%d", seq, tracked, lag)
+					return
+				}
+				for {
+					old := maxSeq.Load()
+					if seq <= old || maxSeq.CompareAndSwap(old, seq) {
+						break
+					}
+				}
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < workers*per/10; i++ {
+			disp, _, err := r.ApplyAck(id, maxSeq.Load())
+			if err != nil && !errors.Is(err, ErrFutureAck) {
+				errs <- err
+				return
+			}
+			_ = disp
+			if _, err := r.FlowState(id); err != nil {
+				errs <- err
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	disp, lag, err := r.ApplyAck(id, maxSeq.Load())
+	if disp != AckAdvanced && disp != AckDuplicate {
+		t.Fatalf("final disp = %v", disp)
+	}
+	if err != nil || lag != 0 {
+		t.Fatalf("final = %v,%d,%v want lag 0", disp, lag, err)
 	}
 }
