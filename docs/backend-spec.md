@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.6 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.7 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -321,15 +321,35 @@ holds dirty in-memory state.
   i32}` (M59 shape — reuse for HUD), `208 stat_group {entity u32, count
   u16 + [[u16 entryLen]{statId u8, value/min/max/curmax i32}]...}`,
   `209 said {from u32, channel u8, text string}`, `210 effect {id u16,
-  target u32, pos}`,   `211 inventory_delta {count u16 + [[u16
-  entryLen]{item u32 NetEntityID, proto u16 stable, qty u16, ...}]...}`
-  (full entry layout frozen at implementation per §13 entry-schema task;
-  entry-framed so the protocol is unaffected),
+  target u32, pos}`, `211 inventory_delta {count u16 + [[u16
+  entryLen]inventoryEntry]...}` where `inventoryEntry v1 = {item u32
+  NetEntityID, proto u16 stable item-proto ID, qty u16, hits i32,
+  location u8, container u32 NetEntityID, slot string}` (field order
+  binding; fixed prefix 19 bytes + slot UTF-8 bytes: 4+2+2+4+1+4+2;
+  `location` 0 = directly owned by the current character with
+  `container` ignored (senders emit 0), 1 = contained in another
+  inventory item named by `container`; unknown `location` values are
+  reserved for additive evolution and MUST NOT be rejected by the
+  codec; `slot` = authoritative item-location slot label, general
+  1024-byte string cap, no numeric slot IDs; `hits` is signed to match
+  the persisted representation, no gameplay meaning imposed; `qty`
+  stays `u16`, producers emit wire-representable quantities;
+  `item_instances.revision`, raw enchants JSONB, and database IDs NEVER
+  cross this message — future typed enchant metadata appends to the
+  entry under a `msg_version` bump and is skipped via `entryLen`).
+  `211` entries are authoritative upserts for client-visible inventory
+  state; removal/invalidation of an item handle uses `206
+  entity_remove` — there is deliberately no inventory-specific delete
+  op, so two competing removal mechanisms can never diverge),
   `212 offer_update {with u32, state u8, count u16 + [[u16 entryLen]{item
   u32, qty u16}]...}`, `213 trade_result {ok u8}`, `214 death {victim
   u32}`, `215 respawn {pos}`, `218 chunk_fragment {cell, chunkIdx u32,
-  fragIdx u16, fragCount u16, bytes (≤60 KiB so the frame stays under
-  64 KiB)}` (classic mode voxel streaming; server paces ≤N
+  fragIdx u16, fragCount u16, byteLen u16, bytes u8[byteLen]}`
+  (`byteLen` ≤ 60 KiB = 61440, so the max complete frame is
+  12+8+4+2+2+2+61440 = 61470 bytes, safely under 64 KiB; the explicit
+  length lets decoders read exactly `byteLen` bytes and then ignore any
+  future `msg_version` trailing fields per the global versioning rule;
+  classic mode voxel streaming needs reliable-lane pacing; server paces ≤N
   fragments/tick/session, `N` in config; procedural mode never sends
   these), `219 world_ready {}` (baseline boundary, §6.1), `220 shop_list
   {vendor u32, count u16 + [[u16 entryLen]{listing u16 stable, price u32,
@@ -854,6 +874,10 @@ ledger is never replayed.
 
 ## 14. Version history
 
+- v0.3.7: freeze M2-T3c wire layouts — complete inventory_delta
+  entry v1, explicit inventory removal via 206 handle invalidation, and
+  length-prefix chunk_fragment bytes so msg_version trailing extensions
+  remain possible.
 - v0.3.6: leftover consistency — INT proto FKs in §8 summary (incl.
   numeric `kills` mob FKs, `vendor_id → mob_protos`), display-name
   pointer fixed, plan header sync.
