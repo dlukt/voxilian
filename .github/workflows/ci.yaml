@@ -43,30 +43,49 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Proves the runner can execute containers for the future M0-T4
-  # testcontainers suites. Real PG smoke, independent of Voxilian
-  # migrations (which do not exist until M1).
-  pg-smoke:
-    name: postgres container smoke
+  # M1 migration validation: the compiled binary runs embedded
+  # migrations against a fresh service PG18 (replaces the M0 shell-level
+  # pg-smoke; testcontainers coverage continues inside the go job).
+  migration:
+    name: embedded migration run
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: vox
+          POSTGRES_PASSWORD: voxdev
+          POSTGRES_DB: voxilian
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vox -d voxilian"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      VOX_PG_DSN: postgres://vox:voxdev@127.0.0.1:5432/voxilian?sslmode=disable
     steps:
-      - run: docker run -d --name vox-pg-smoke -e POSTGRES_PASSWORD=smoke -e POSTGRES_DB=smoke postgres:18-alpine
-      - run: |
-          for i in $(seq 1 30); do
-            docker exec vox-pg-smoke pg_isready -U postgres -d smoke && break
-            sleep 2
-          done
-          docker exec vox-pg-smoke pg_isready -U postgres -d smoke
-          docker exec vox-pg-smoke psql -U postgres -d smoke -tAc 'show server_version;'
-      - run: docker rm -f vox-pg-smoke
-        if: always()
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/voxilian/go.mod
+          cache: true
+          cache-dependency-path: backend/voxilian/go.sum
+      - run: go build -o /tmp/voxilian .
+        working-directory: backend/voxilian
+      - run: cd /tmp && ./voxilian migrate up
+      - run: cd /tmp && ./voxilian migrate status
+      - run: cd /tmp && ./voxilian migrate up
+      - run: cd /tmp && ./voxilian migrate status | tee /tmp/vox-status.txt
+      - run: grep -q 'current=5 target=5 pending=0' /tmp/vox-status.txt
 
   # GHCR publish, gated on all validation jobs above. Trusted pushes to
   # main only — PRs build the image in `docker` without pushing.
   publish:
     name: publish ghcr.io/dlukt/voxilian
     runs-on: ubuntu-latest
-    needs: [go, docker, pg-smoke]
+    needs: [go, docker, migration]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read

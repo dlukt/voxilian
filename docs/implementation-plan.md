@@ -66,7 +66,7 @@ Exit: all §8 tables (incl. prototype catalogs) exist via goose; `Store` covers 
 - [x] **M1-T7a** `Store` CAS: character aggregate (root CAS → child spells/skills in same txn). Stale-revision test. Spec: §8.1, D7.
 - [x] **M1-T7b** `Store` CAS: item aggregate (root CAS → location row in same txn). Stale-revision test. Spec: §8.1.
 - [x] **M1-T7c** `Store` CAS: bank balance + `Store` interface assembly. Stale-revision test + metric. Spec: §8.1.
-- [ ] **M1-T8** `voxilian migrate up/down/status` wired to embedded migrations (one-shot container compatible) + CI migrate-up-against-service-PG check (moved here from M0). Spec: §8, §10.
+- [x] **M1-T8** `voxilian migrate up/down/status` wired to embedded migrations (one-shot container compatible) + CI migrate-up-against-service-PG check (moved here from M0). Spec: §8, §10.
 - [ ] **M1 exit criteria met** (all §8 tables exist via goose; internal/store owns §8 CRUD/query coverage and exposes safe domain operations + CAS for mutable aggregates; stale-write + CI-migration checks green).
 
 ## M2 — Binary protocol + golden vectors

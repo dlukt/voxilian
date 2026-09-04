@@ -1,9 +1,7 @@
 name: voxilian
 
-# Development stack (plan M0-T3). Pre-M1 topology rule: NOTHING in the
-# default `compose up` path may depend on a command that intentionally
-# fails (migrate stub until M1-T8, serve stub until M3). M1-T8 promotes
-# `migrate` to a real startup dependency and M3 promotes `app`.
+# Development stack. M1-T8: default `compose up` brings postgres (healthy)
+# then the migrate one-shot; app stays profile-gated until serve (M3).
 services:
   postgres:
     image: postgres:18-alpine
@@ -21,11 +19,11 @@ services:
       timeout: 3s
       retries: 10
 
-  # Opt-in until M1-T8: real `voxilian migrate up` one-shot against the
-  # existing prod PG (spec §10). Run explicitly:
-  #   docker compose --profile tools run --rm migrate
+  # Migration init (M1-T8): real `voxilian migrate up` one-shot against
+  # the compose postgres. Default startup so `compose up` always lands on
+  # a migrated database. The app service (serve stub until M3) stays
+  # profile-gated but correctly depends on this completing.
   migrate:
-    profiles: ["tools"]
     build: .
     depends_on:
       postgres:
@@ -41,6 +39,9 @@ services:
   app:
     profiles: ["tools"]
     build: .
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     environment:
       VOX_PG_DSN: postgres://vox:voxdev@postgres:5432/voxilian?sslmode=disable
     ports:
