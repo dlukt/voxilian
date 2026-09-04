@@ -1,6 +1,6 @@
 # Voxilian Backend — Implementation Plan (v1.2)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.11).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.12).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -92,7 +92,8 @@ Exit: full §6.1 state machine live over real WS; char CRUD end-to-end against P
 - [x] **M3-T3b** Character WS handler: 121 list, 122 create, 123 delete + 216/217/202 mappings; per-account deletion/in-use serialization; 126 leave_world via fake WorldExit seam with flush-before-unbind; real WebSocket integration tests. Opcode 124 belongs wholly to M3-T4. Spec: §6.1, §8, §9.
 - [x] **M3-T4a** Enter-world baseline lifecycle: opcode 124 decode/lookup; atomic AUTHENTICATED→CHARACTER_SELECTED+bind; 217 enter OK; fake streaming BaselineProvider emits ordered 203/218/220; 219 world_ready barrier; atomic CHARACTER_SELECTED→IN_WORLD; baseline failure rollback; full per-account serialization. No duplicate-login kick yet: an existing same-account CHARACTER_SELECTED/IN_WORLD session returns retry as explicit staging. Spec: §6.1, §7.1.
 - [x] **M3-T4b** Duplicate-login/takeover: replace T4a retry staging with final kick-old semantics; quiesce/flush old world state before new baseline; atomically release old binding; best-effort 202 kicked + forced close; refactor session Connection so all normal and cross-session binary writes share one writer serialization; same/different character takeover and simultaneous-enter tests. Spec: §6.1, §7.
-- [ ] **M3-T5** Backpressure: two-lane bounded outbound queues (coalescible vs critical), `125 ack` flow control, slow-client disconnect + full-resync test, saturation metrics, cell-owner non-blocking rule (no indefinite block; fail-closed disconnect). Load-ish test with fake slow peer. Spec: §7.1.
+- [ ] **M3-T5a** Outbound queue/backpressure core: per-session bounded two-lane writer; exact byte+message budgets; critical FIFO; explicit coalescible-state keys/newest-wins; synchronous critical SendFunc preserves physical-write barrier; non-blocking TryCritical/TryState producer seam; critical saturation/write timeout fail-closed; terminal kicked/auth-expiry bypass; config + deterministic slow-writer tests. Spec: §7.1.
+- [ ] **M3-T5b** ACK + observability + resync: opcode 125 cumulative ACK flow control after world_ready; max-unacked window with modulo-2^32 tests; Prometheus saturation/depth/coalescing/ACK metrics; slow-client full reconnect+fresh-baseline test; load-ish fake slow peer. Spec: §6.1, §7.1.
 - [ ] **M3 exit criteria met** (lifecycle fuzz/property test: random opcode sequences never violate state table).
 
 ## M4 — Deterministic sim skeleton
@@ -209,11 +210,13 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M1-T1…T5 | M0 | `backend/voxilian/migrations/` only |
 | M1-T6a…c, T7a…c, T8 | per-table predecessor migrations | `backend/voxilian/queries/`, `internal/store` |
 | M2-T1, T2, T3a…c, T4, T5 | M0 | `backend/voxilian/internal/proto`, repo-root `testdata/protocol/` |
-| M3-T1, T2, T5 | M1-T8 (migrate CLI), M2-T1, M2-T2 | `backend/voxilian/internal/{auth,gateway,session,store}` |
+| M3-T1, T2 | M1-T8 (migrate CLI), M2-T1, M2-T2 | `backend/voxilian/internal/{auth,gateway,session,store}` |
 | M3-T3a | M1-T7a (character CAS), M2-T2 | `backend/voxilian/internal/character`, `internal/store` |
 | M3-T3b | M3-T3a | `backend/voxilian/internal/{gateway,session,character}` |
 | M3-T4a | M1-T7a, M2-T3b, M2-T3c, M3-T3b | `backend/voxilian/internal/{gateway,session}` |
 | M3-T4b | M3-T4a | `backend/voxilian/internal/{gateway,session}` |
+| M3-T5a | M3-T4b | `backend/voxilian/internal/{gateway,config}` |
+| M3-T5b | M3-T5a | `backend/voxilian/internal/{gateway,observe}` |
 | M4-T1, T2, T5 | M2-T3a/b, M3-T1 | `backend/voxilian/internal/sim` |
 | M4-T3a…c, T4 | M1-T7a…c (CAS), M3-T1 | `backend/voxilian/internal/sim`, `internal/store` |
 | M5-T1…T6 | M4-T1, M4-T2 | `backend/voxilian/internal/sim` (combat/vitals/intents) |
@@ -243,7 +246,7 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 120 respawn_ack | M5-T5 | death pipeline |
 | 121–123 char CRUD, 126 leave | M3-T3b | lifecycle |
 | 124 enter_world | M3-T4a baseline, M3-T4b takeover | lifecycle |
-| 125 ack | M3-T5 | flow control |
+| 125 ack | M3-T5b | flow control |
 
 ## Plan history
 

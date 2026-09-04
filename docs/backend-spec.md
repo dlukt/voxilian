@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.11 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.12 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -572,9 +572,14 @@ injectable clock (tests never wait a real 90 s).
   12+8+4+2+2+2+61440 = 61470 bytes, safely under 64 KiB; the explicit
   length lets decoders read exactly `byteLen` bytes and then ignore any
   future `msg_version` trailing fields per the global versioning rule;
-  classic mode voxel streaming needs reliable-lane pacing; server paces ≤N
-  fragments/tick/session, `N` in config; procedural mode never sends
-  these), `219 world_ready {}` (baseline boundary, §6.1), `220 shop_list
+  classic mode voxel streaming needs reliable-lane pacing; the
+  production fragment-per-tick rate (≤N fragments/tick/session) belongs
+  to the REAL production world streamer — M3-T5 implements bounded
+  reliable queueing/backpressure only (§7.1) and defines no
+  fragment-per-tick config value, while M10-T4 chooses and validates the
+  production `N` against the real world source and min-spec bandwidth;
+  procedural mode never sends these), `219 world_ready {}` (baseline
+  boundary, §6.1), `220 shop_list
   {vendor u32, count u16 + [[u16 entryLen]{listing u16 stable, price u32,
   qty u16}]...}`.
 - Reconciliation (normative): the client tags every `102 move` with
@@ -652,39 +657,352 @@ registries (guarded maps / `sync.Map`; single process, no cross-instance sync).
   client reconnect flow (`202 error{session_expired}` → re-login → full
   resync).
 
-### 7.1 Slow-client and backpressure rules
+### 7.1 Slow-client and backpressure rules (frozen, v0.3.12)
 
-- Every session has a bounded outbound queue (e.g. 256 KiB / 1024
-  messages; exact budgets in `config.yaml`, validated on min-spec).
-- Movement/state deltas MAY be coalesced or dropped in favor of newest
-  state. Critical ordered events (`trade_result`, `death`, `stat`
-  milestones, `offer_update`, `enter_world` flow) MUST NOT be silently
-  dropped — they queue behind the same bound.
-- If a client cannot drain within budget, the server disconnects it;
-  reconnect performs a full resync (§6.1). Saturation is a first-class
-  metric (`vox_session_drops_total`, queue-depth histograms).
-- Lanes: the outbound path is TWO lanes — a coalescible-state lane
-  (`entity_move` and other absolute/latest-state deltas: newest wins) and
-  a control/critical lane (everything else, ordered, never dropped).
-  `218 chunk_fragment` is in the RELIABLE lane, never coalescible: a
-  fragment is not replaceable state, dropping one corrupts the chunk with
-  no replay protocol. Pace PRODUCTION instead — if the reliable queue
-  cannot accept another fragment, stop producing chunk data for that
-  session until it drains; past the configured limit/deadline, disconnect
-  and let reconnect/full-resync recover. `219 world_ready` is a barrier:
-  all baseline snapshots and required classic-mode fragments MUST have
-  been written to the socket before `world_ready`. (WS order + reliability
-  then needs no fragment ACK/retransmission for MVP.) If the critical
-  lane itself fills, the affected sessions are disconnected rather than
-  stalling the sim — blocking a cell worker on a slow client is a spec
-  violation.
-- Same principle internally: sim→gateway channels are bounded with
-  defined overload behavior (shed newest movement first, never critical
-  events; count + log). Cell-owner goroutines MUST NOT block indefinitely
-  on gateway delivery; critical-lane saturation fails closed by
-  disconnecting/resyncing the affected sessions rather than dropping the
-  event or stalling the simulation. Unbounded queues are a spec
-  violation.
+M3-T5 delivers this section in two parts: T5a implements the bounded
+two-lane queue/backpressure core (everything below except the ACK window
+and metric registration); T5b adds opcode-125 flow control plus the
+Prometheus metrics. The split is a plan concern — the semantics below
+are frozen now.
+
+#### 7.1.1 Exact outbound configuration
+
+Every session owns one bounded outbound queue configured by (MVP
+defaults shown):
+
+```yaml
+outbound:
+  max_messages: 1024
+  max_bytes: 262144
+  reliable_enqueue_timeout_ms: 1000
+  write_timeout_ms: 5000
+  max_unacked_messages: 1024
+```
+
+- `max_messages`: total resident outbound messages for one session.
+- `max_bytes`: total resident complete-frame bytes for one session.
+- `reliable_enqueue_timeout_ms`: maximum time a synchronous reliable
+  producer may wait for queue capacity before the session is failed
+  closed as a slow client.
+- `write_timeout_ms`: maximum time one normal queued physical WebSocket
+  write may take.
+- `max_unacked_messages`: T5b application-level ACK lag window after
+  entering IN_WORLD (§7.1.11).
+
+Environment overrides (exact names, no alternate aliases; the normal
+precedence `defaults < config.yaml < VOX_*` applies):
+
+```text
+VOX_OUTBOUND_MAX_MESSAGES
+VOX_OUTBOUND_MAX_BYTES
+VOX_OUTBOUND_RELIABLE_ENQUEUE_TIMEOUT_MS
+VOX_OUTBOUND_WRITE_TIMEOUT_MS
+VOX_OUTBOUND_MAX_UNACKED_MESSAGES
+```
+
+Validation (integral milliseconds only — no floating-point durations):
+
+```text
+max_messages                 1..65535
+max_bytes                    >= 65536 and <= 67108864 (64 MiB ceiling)
+reliable_enqueue_timeout_ms  1..60000
+write_timeout_ms             1..60000
+max_unacked_messages         1..1000000
+```
+
+`max_bytes >= 65536` guarantees any one valid Voxilian frame (≤ 64 KiB,
+§6) can fit the configured queue budget. `max_unacked_messages` is
+frozen now, stays safely below the 2³¹ serial-ambiguity boundary, and
+is implemented by T5b only.
+
+#### 7.1.2 Budget accounting
+
+The session's outbound budget counts:
+
+```text
+queued frames + the frame currently being physically written
+```
+
+until that write completes or fails — a frame remains resident for
+budget purposes while a slow socket is holding it. The two lanes share
+the configured `max_messages`/`max_bytes` TOTAL resident budget: the
+configured limit is per SESSION, not per lane. Byte accounting is exact
+complete protocol-frame bytes including the 12-byte Voxilian frame
+header; payload size is never estimated and Go object overhead is never
+counted.
+
+#### 7.1.3 Lanes and coalescing
+
+Every session has exactly two outbound lanes — no third normal lane in
+M3:
+
+```text
+critical/reliable lane    FIFO, ordered, never silently dropped
+coalescible-state lane    keyed, newest-wins, droppable
+```
+
+Critical lane: all currently-existing gateway `SendFunc` traffic is
+critical by default, without exception — `200 welcome`, `201
+reauth_ok`, `202` ordinary protocol/application errors, `203 baseline
+snapshots`, `204 entity_create`, `206 entity_remove`, `207/208 stats`,
+`209 chat`, `210 effects`, `211 inventory_delta`, `212 offer_update`,
+`213 trade_result`, `214 death`, `215 respawn`, `216 character_list`,
+`217 character_op`, `218 chunk_fragment`, `219 world_ready`, `220
+shop_list`. Future code may explicitly use another producer API for
+coalescible state; an opcode MUST NOT be inferred coalescible merely
+because it is a "delta".
+
+Coalescible lane: M3 freezes one canonical use — `205 entity_move`
+keyed by entity NetEntityID. Future absolute/latest-state producers may
+opt into the same lane using an explicit producer-supplied key; the
+outbound queue MUST NOT decode payloads to discover a coalescing key. A
+generic comparable key shape such as `{Kind uint16, ID uint64}` is
+appropriate (exact Go naming may differ).
+
+Same-key coalescing: if a coalescible state message with key K is
+queued but has not begun writing and a newer message for K arrives, the
+old queued value is replaced by the new one. The replaced message is
+never written, never receives an S→C seq, and consumes no ACK-window
+state — the newest value wins. Once a state frame has been selected by
+the writer and begins its physical write it is no longer replaceable; a
+new value for the same key may become the next queued value. Bytes are
+never mutated underneath an active WebSocket write.
+
+#### 7.1.4 Saturation and eviction
+
+State saturation: for a NEW coalescible state key that cannot fit the
+total resident budget, drop the new state update and keep the session
+alive (no sequence is allocated — deliberate overload shedding). For a
+replacement of an existing key, remove the old queued value first, then
+attempt to admit the newest value; if the newest still cannot fit
+because critical traffic consumes the budget, drop the new value and
+leave no stale older value for that key — known-stale state is never
+retained merely because it was smaller.
+
+Critical traffic may evict state: when admitting a critical frame,
+queued coalescible state is expendable. The queue evicts oldest queued
+state entries as necessary to make room; critical frames themselves are
+never evicted. If the frame still cannot fit because resident CRITICAL
+traffic alone fills the budget, the critical saturation behavior
+(§7.1.6) applies.
+
+#### 7.1.5 Synchronous reliable producer
+
+The existing gateway `SendFunc` remains logically synchronous:
+
+```text
+SendFunc → encode payload → admit critical frame → wait until that
+exact frame is physically written or definitively failed → return
+```
+
+This preserves all existing handler assumptions; in particular the T4
+baseline (`217`, `203/218/220…`, `219`) continues to have a real
+physical `world_ready` barrier — all baseline snapshots and required
+classic-mode fragments MUST have been physically written before `219`.
+`SendFunc` returning nil means the frame was physically written; it
+MUST NOT mean merely "queued successfully".
+
+A synchronous reliable producer may wait for resident queue capacity,
+but only up to `reliable_enqueue_timeout_ms` and its caller context —
+whichever deadline/cancellation occurs first wins. If capacity does not
+become available in time, the session is classified slow, the
+connection is failed closed, and the send returns a stable slow-client
+error. Producers never block indefinitely.
+
+Every NORMAL queued physical WebSocket write uses a fresh internal
+`write_timeout_ms` timeout — never one inherited solely from a
+long-lived HTTP request context. On write timeout the session fails
+closed as a slow client: all pending synchronous reliable senders are
+woken/failed, queued state is discarded, remaining critical queue
+contents are discarded, and the WebSocket is force-closed. Reconnect and
+full resync (§7.1.10) are the recovery mechanism.
+
+#### 7.1.6 Non-blocking producers and fail-closed slow sessions
+
+M4 cell-owner goroutines use a future-sim-facing non-blocking producer
+seam with two operations, conceptually `TryCritical(...)` and
+`TryState(key, ...)`. They MUST NOT wait for a socket write, wait for
+queue capacity, sleep, or spin — they return based only on immediate
+bounded in-memory queue state.
+
+`TryCritical` tries immediate admission (evicting coalescible state if
+useful). If the critical frame still cannot fit because critical
+backlog alone fills the budget, the critical event is NOT dropped: the
+affected session is failed closed and a stable slow-client/saturation
+result is returned. Cell owners never block indefinitely, critical
+events are never silently dropped, and a slow affected client is
+disconnected instead — the producing cell/world goroutine remains free
+to continue.
+
+`TryState` coalesces same key if possible, otherwise admits immediately
+if budget allows, otherwise drops the newest state update; it MUST NOT
+disconnect solely because one state update was dropped. Its result
+distinguishes at least `queued`, `coalesced`, `dropped`, and
+`closed/slow` (exact representation is an implementation detail).
+
+When the outbound system drops a slow client — critical queue
+saturation, reliable enqueue timeout, or physical write timeout — no
+new `202` error code is introduced: the server may simply terminate the
+connection, and reconnect performs a new WS, `hello`, fresh
+`enter_world`, and fresh full baseline.
+
+#### 7.1.7 Writer pump and scheduling
+
+Normal queued traffic is drained by exactly one bounded-lifetime writer
+goroutine per WebSocket session — no goroutine per message, no
+unbounded worker pool, no one-goroutine-per-waiter admission. The pump
+schedules the critical lane first; the state lane runs only when no
+critical frame is ready. Critical FIFO order is binding. State ordering
+across DIFFERENT keys is not a wire contract but MUST be deterministic
+and testable — a small ordered list plus key index is preferable to Go
+map iteration.
+
+The T4b connection-level writer gate remains the final physical
+serialization: the normal queue writer calls through that existing
+low-level writer, and direct terminal/emergency writes may also call
+through it. Therefore a queued writer, a terminal kicked write, and an
+authorization-deadline write can never physically write one WebSocket
+concurrently; no second raw writer path is introduced.
+
+`218 chunk_fragment` remains critical/reliable and is never
+coalescible. T4's synchronous BaselineProvider naturally paces
+production because each critical `SendFunc` returns only after that
+fragment has been physically written; T5a introduces no artificial
+sleep or fixed fragment timer.
+
+#### 7.1.8 Frame preparation, sequencing, and completion
+
+To enforce exact byte budgets while preserving seq/write ordering, the
+message PAYLOAD is encoded exactly once BEFORE queue admission using
+`proto.Encoder`, and those payload bytes are frozen/copied into the
+queued item. The full queued size is `proto.HeaderSize + len(payload)`.
+The S→C sequence is NOT allocated at admission and the frame tick is
+NOT frozen at admission.
+
+Only after the writer selects the queued item and owns physical writer
+serialization does it allocate `NextServerSeq`, sample `TickFunc`,
+construct the final frame header, append the already-frozen payload,
+and physically write. Thus a queued-but-replaced state message, a
+queued-but-dropped state message, and a critical admission timeout
+never allocate a sequence, and physical wire order remains identical to
+sequence allocation order (the T4b invariant stays binding).
+
+The `encode func(*proto.Encoder) error` passed by current gateway
+callers is invoked exactly once, during payload preparation — never
+once to estimate size and again to write. If payload preparation fails,
+the encoding error is returned, nothing is queued, no sequence is
+allocated, and the client is NOT classified slow: an internal encoding
+bug is not backpressure.
+
+The synchronous critical queue item carries one bounded completion
+signal: on physical write success the waiting SendFunc returns nil; on
+failure it returns the actual classified error. Closing the session
+completes ALL outstanding synchronous waiters — no sender stays parked
+forever after the socket has closed.
+
+#### 7.1.9 Queue shutdown and terminal control bypass
+
+Queue/session shutdown is idempotent. Concurrent causes — client
+disconnect, write timeout, critical saturation, authorization expiry,
+forced duplicate-login kick, normal deferred cleanup — are all safe:
+only the first shutdown performs internal queue closure, all later
+closes are harmless, and no send-on-closed-channel panics occur.
+
+Two terminal-control frames are the explicit exceptions to normal
+queueing, both best-effort DIRECT low-level writer paths that still
+serialize on the one physical writer gate (§7.1.7):
+
+- Forced duplicate-login `202 error{kicked}` (T4b): it MUST continue to
+  bypass the normal outbound queue — a saturated old queue must never
+  prevent authoritative retirement, and the kick must never enqueue
+  behind the traffic that made the old session unresponsive.
+- Hard authorization-deadline `202 error{session_expired}`: likewise a
+  best-effort direct low-level write bounded by the existing deadline
+  write context, then connection close. The 90-second authorization
+  semantics (§6.2.2) do not change.
+
+#### 7.1.10 Slow-client disconnect and full-resync semantics
+
+After any backpressure/slow-client disconnect, the old session's seq
+state, queue contents, coalesced state, and ACK state are discarded; a
+reconnect starts a brand-new session and a full baseline (`new WS →
+hello → fresh enter_world → fresh full baseline`). Queued frames from
+the old socket are never replayed — there is no replay buffer (§6.1).
+
+#### 7.1.11 ACK flow control — frozen for M3-T5b
+
+Opcode `125 ack {ackSeq u32}` remains cumulative: the highest S→C
+sequence fully applied by the client. No replay buffer exists. The
+window does NOT gate the initial baseline: M3 has one synchronous
+per-connection read loop, so the client cannot process an inbound ACK
+concurrently while its server-side `124 enter_world` handler streams
+the baseline. Baseline `217/203/218/220/219` traffic is governed by
+transport/queue backpressure only — never by the application ACK
+window, so no baseline deadlock is possible.
+
+When `CompleteEnterWorld` changes `CHARACTER_SELECTED → IN_WORLD`, the
+flow-control baseline initializes to the current server S→C sequence —
+the already-written `219 world_ready` sequence (`lastAck =
+lastFlowSent = worldReadySeq` for flow-control purposes). This
+establishes that the baseline itself is outside the steady-state ACK
+lag window; it does not synthesize an actual client ACK. Every normal
+S→C application frame allocated while IN_WORLD advances the sent-flow
+sequence; pre-world AUTHENTICATED traffic and baseline
+CHARACTER_SELECTED traffic do not consume the window. A successful
+`leave_world → AUTHENTICATED` clears the accounting, and a later enter
+initializes a NEW baseline at its new `world_ready` sequence — no stale
+ACK debt carries across re-enter or full resync.
+
+T5b enforces: the number of sent IN_WORLD frames not cumulatively
+ACKed MUST stay ≤ `max_unacked_messages`. No payloads are retained. If
+sending the next frame would exceed the limit, the session is
+classified slow, disconnected/fail-closed, and that next frame is not
+written. No replay.
+
+ACK acceptance uses modulo-2³² serial arithmetic via the M2 helpers
+(`Serial32After`/`Serial32Before`): `0` is legitimately after
+`MaxUint32` within the valid serial window; the configured window is
+far below 2³¹, so half-range ambiguity never occurs during valid
+operation. In IN_WORLD: `ack == lastAck` is a duplicate (no-op); `ack`
+before `lastAck` is stale (no-op); `lastAck < ack <= lastFlowSent` is a
+valid cumulative advance; `ack` after `lastFlowSent` is future/invalid
+→ `202 protocol_error`. A valid, stale, or duplicate ACK receives no
+success reply. In CHARACTER_SELECTED — before the flow window is
+initialized — a structurally valid ACK is accepted as a no-op with no
+response (the lifecycle table already permits opcode 125 there); a
+malformed payload still maps to `202 protocol_error`.
+
+#### 7.1.12 Saturation metrics — frozen for M3-T5b
+
+Exact Prometheus names (no session/account/character labels; no
+high-cardinality identifiers):
+
+```text
+vox_session_drops_total{reason}
+vox_outbound_queue_depth_messages{lane}
+vox_outbound_queue_depth_bytes{lane}
+vox_outbound_state_drops_total{reason}
+vox_outbound_state_coalesced_total
+vox_outbound_ack_lag_messages
+```
+
+Queue-depth lanes are exactly `lane="critical"` and `lane="state"` — no
+opcode label, no entity label. Initial stable drop reasons are
+`critical_queue_saturated`, `reliable_enqueue_timeout`, `write_timeout`,
+and `ack_lag`; forced `kicked` and `session_expired` are NOT
+backpressure drop reasons for this metric. T5a exposes only a narrow
+no-op-by-default observer seam — sufficient to observe queue depth
+messages/bytes per lane, state dropped, state coalesced, and session
+slow-drop reason — so T5b can attach Prometheus without rewriting queue
+internals; the core queue does not import Prometheus.
+
+The internal-delivery rule is unchanged in spirit: sim→gateway channels
+are bounded with defined overload behavior (shed newest movement first,
+never critical events; count + log). Cell-owner goroutines MUST NOT
+block indefinitely on gateway delivery; critical-lane saturation fails
+closed by disconnecting/resyncing the affected sessions rather than
+dropping the event or stalling the simulation. Unbounded queues are a
+spec violation.
 
 ## 8. PostgreSQL schema (authoritative; migrations via goose, queries via sqlc)
 
@@ -1183,6 +1501,11 @@ ledger is never replayed.
 
 ## 14. Version history
 
+- v0.3.12: freeze M3 outbound backpressure semantics — exact per-session
+  queue budgets, critical/state lane behavior, physical-write-preserving
+  SendFunc, non-blocking future-sim producers, terminal-control bypasses,
+  post-world_ready cumulative ACK window, metric names, and split T5 into
+  queue core T5a plus ACK/observability T5b.
 - v0.3.11: freeze enter-world baseline semantics — atomic selected/in-world
   registry transitions, provisional-baseline rollback, exact world_ready
   barrier, full account-guard serialization, deterministic account-world
