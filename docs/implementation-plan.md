@@ -73,7 +73,7 @@ Exit: all §8 tables (incl. prototype catalogs) exist via goose; `Store` covers 
 
 Exit: every §6 opcode encodes/decodes both sides (Go done; Godot side stubs + fixtures ready for client plan); fuzz + golden suites green.
 
-- [ ] **M2-T1** Codec core (`internal/proto`): envelope `[opcode|msg_version|seq|tick|payload]`, LE integers, `string`/`array`/`cell`/`pos`/`angle` primitives, 64 KiB frame cap, string/array caps (1024; chat 512; accessToken 8 KiB), `msg_version` trailing-skip, `[u16 entryLen]` entry framing. Round-trip tests. Spec: §6 framing.
+- [x] **M2-T1** Codec core (`internal/proto`): envelope `[opcode|msg_version|seq|tick|payload]`, LE integers, `string`/`array`/`cell`/`pos`/`angle` primitives, 64 KiB frame cap, string/array caps (1024; chat 512; accessToken 8 KiB), `msg_version` trailing-skip, `[u16 entryLen]` entry framing. Round-trip tests. Spec: §6 framing.
 - [ ] **M2-T2** Opcodes `100/101/200/201/202` (hello/welcome/reauth/reauth_ok/error) + `216/217/219` (character_list/op, world_ready) + `121–126` (char CRUD/ack/leave). Round-trip tests. Spec: §6.1, §6.2.
 - [ ] **M2-T3a** Intents codec `102–120` + `126` (incl. `inputSeq`/`yaw`, fixed-`u32` `105 use`, vendor+stable-listing `114 buy`). Round-trip tests. Spec: §6.3.
 - [ ] **M2-T3b** Entity/stat codec `203–210`, `213–215` (incl. `lastProcessedInputSeq`, entryLen framing). Round-trip tests. Spec: §6.3.
