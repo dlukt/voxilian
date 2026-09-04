@@ -299,7 +299,7 @@ func encodeCreate(t *testing.T, slot uint8, name string) []byte {
 
 func callHandle(
 	t *testing.T,
-	h *CharacterHandler,
+	h MessageHandler,
 	sid session.ID,
 	opcode uint16,
 	payload []byte,

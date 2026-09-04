@@ -123,6 +123,10 @@ var (
 	// ErrCharacterInUse reports binding a character that is already
 	// bound to a different live session.
 	ErrCharacterInUse = errors.New("character_in_use")
+	// ErrInvariant reports a registry invariant violation that must
+	// fail closed (e.g. more than one world-active session for one
+	// account). It is never a client error mapping.
+	ErrInvariant = errors.New("invariant_violation")
 )
 
 // entry is the mutable registry record behind one Snapshot.
@@ -329,6 +333,131 @@ func (r *Registry) CompleteLeaveWorld(id ID, expectedCharacterID int64) error {
 	e.hasCharacter = false
 	e.state = StateAuthenticated
 	return nil
+}
+
+// BeginEnterWorld atomically begins an enter_world operation
+// (spec §6.1.2): under ONE write lock it requires an existing
+// AUTHENTICATED unbound session and a character free of other bindings,
+// then moves to CHARACTER_SELECTED + bound + indexed. Identity, token,
+// connection, and server sequence are unchanged. There is never a
+// public CHARACTER_SELECTED-yet-unbound or AUTHENTICATED-yet-bound
+// state, and any failure mutates nothing. A character bound elsewhere
+// reports ErrCharacterInUse; callers must resolve ownership themselves
+// and never surface a current-account enter as wire character_in_use.
+func (r *Registry) BeginEnterWorld(id ID, characterID int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.byID[id]
+	if !ok {
+		return fmt.Errorf("session: begin enter unknown session: %w", ErrNotFound)
+	}
+	if e.state != StateAuthenticated {
+		return fmt.Errorf("session: begin enter in %s: %w", e.state, ErrBadState)
+	}
+	if e.hasCharacter {
+		return fmt.Errorf("session: begin enter already bound: %w", ErrBadState)
+	}
+	if owner, taken := r.byChar[characterID]; taken {
+		if owner == id {
+			return fmt.Errorf("session: begin enter inconsistent index: %w", ErrBadState)
+		}
+		return fmt.Errorf("session: character %d in use: %w", characterID, ErrCharacterInUse)
+	}
+	e.state = StateCharacterSelected
+	e.characterID = characterID
+	e.hasCharacter = true
+	r.byChar[characterID] = id
+	return nil
+}
+
+// AbortEnterWorld atomically rolls a CHARACTER_SELECTED session back
+// to the exact pre-enter state (spec §6.1.2): under ONE write lock it
+// requires the selected state with a matching binding and matching
+// index owner, then deletes the index, clears the binding, and returns
+// to AUTHENTICATED. Identity, token, connection, and server sequence
+// are unchanged. Any failure mutates nothing.
+func (r *Registry) AbortEnterWorld(id ID, expectedCharacterID int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.byID[id]
+	if !ok {
+		return fmt.Errorf("session: abort enter unknown session: %w", ErrNotFound)
+	}
+	if e.state != StateCharacterSelected {
+		return fmt.Errorf("session: abort enter in %s: %w", e.state, ErrBadState)
+	}
+	if !e.hasCharacter || e.characterID != expectedCharacterID {
+		return fmt.Errorf("session: abort enter character mismatch: %w", ErrBadState)
+	}
+	if owner, taken := r.byChar[e.characterID]; !taken || owner != id {
+		return fmt.Errorf("session: abort enter index mismatch: %w", ErrBadState)
+	}
+	delete(r.byChar, e.characterID)
+	e.characterID = 0
+	e.hasCharacter = false
+	e.state = StateAuthenticated
+	return nil
+}
+
+// CompleteEnterWorld atomically completes an enter_world operation
+// after a successfully written 219 world_ready (spec §6.1.2): under
+// ONE write lock it requires CHARACTER_SELECTED with a matching
+// binding and matching index owner, then moves to IN_WORLD keeping the
+// same binding and index. Nothing else changes. Any failure mutates
+// nothing.
+func (r *Registry) CompleteEnterWorld(id ID, expectedCharacterID int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.byID[id]
+	if !ok {
+		return fmt.Errorf("session: complete enter unknown session: %w", ErrNotFound)
+	}
+	if e.state != StateCharacterSelected {
+		return fmt.Errorf("session: complete enter in %s: %w", e.state, ErrBadState)
+	}
+	if !e.hasCharacter || e.characterID != expectedCharacterID {
+		return fmt.Errorf("session: complete enter character mismatch: %w", ErrBadState)
+	}
+	if owner, taken := r.byChar[e.characterID]; !taken || owner != id {
+		return fmt.Errorf("session: complete enter index mismatch: %w", ErrBadState)
+	}
+	e.state = StateInWorld
+	return nil
+}
+
+// WorldSessionForAccount deterministically finds another live session
+// of the same account that is currently world-active
+// (CHARACTER_SELECTED or IN_WORLD), excluding one session ID
+// (normally the caller). The scan runs under ONE read lock and never
+// depends on map iteration order: zero candidates return false, one
+// returns its immutable snapshot, and more than one is an internal
+// invariant failure (ErrInvariant) rather than an arbitrary pick.
+// CONNECTED/AUTHENTICATED sessions never count.
+func (r *Registry) WorldSessionForAccount(accountID int64, exclude ID) (Snapshot, bool, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var found Snapshot
+	count := 0
+	for id, e := range r.byID {
+		if id == exclude || e.accountID != accountID {
+			continue
+		}
+		if e.state != StateCharacterSelected && e.state != StateInWorld {
+			continue
+		}
+		count++
+		if count == 1 {
+			found = snapshotOf(e)
+		}
+	}
+	if count > 1 {
+		return Snapshot{}, false, fmt.Errorf(
+			"session: %d world-active sessions for account %d: %w", count, accountID, ErrInvariant)
+	}
+	if count == 0 {
+		return Snapshot{}, false, nil
+	}
+	return found, true, nil
 }
 
 // BindCharacter binds characterID to the session and records the

@@ -1269,7 +1269,7 @@ type charFixture struct {
 
 func charStrPtr(s string) *string { return &s }
 
-func newCharFixture(t *testing.T, nextMarker bool) *charFixture {
+func newCharFixture(t *testing.T, nextMarker bool, baseline gateway.BaselineProvider) *charFixture {
 	t.Helper()
 	t0 := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
 	f := &charFixture{
@@ -1338,6 +1338,20 @@ func newCharFixture(t *testing.T, nextMarker bool) *charFixture {
 	if err != nil {
 		t.Fatalf("NewCharacterHandler: %v", err)
 	}
+	// T4a chain when a baseline provider is supplied: CharacterHandler
+	// owns 121/122/123/126 and delegates 124 to EnterWorldHandler,
+	// which delegates the rest to the recording Next.
+	var top gateway.MessageHandler = chars
+	if baseline != nil {
+		enter, err := gateway.NewEnterWorldHandler(svc, f.reg, baseline, f.next)
+		if err != nil {
+			t.Fatalf("NewEnterWorldHandler: %v", err)
+		}
+		top, err = gateway.NewCharacterHandler(svc, f.reg, gateway.WorldExitFunc(f.exit.ExitWorld), enter)
+		if err != nil {
+			t.Fatalf("NewCharacterHandler: %v", err)
+		}
+	}
 	srv := gateway.NewServer(gateway.ServerDeps{
 		Registry:  f.reg,
 		Validator: validator,
@@ -1346,7 +1360,7 @@ func newCharFixture(t *testing.T, nextMarker bool) *charFixture {
 		Tick:      func() uint32 { return testTick },
 		Now:       f.clock.Now,
 		Schedule:  f.sched.schedule,
-		Handler:   chars,
+		Handler:   top,
 	})
 	f.ts = httptest.NewServer(srv)
 	t.Cleanup(f.ts.Close)
@@ -1479,7 +1493,7 @@ func (f *charFixture) liveCount(t *testing.T, accountID int64) int {
 // list, create, listed level 20, delete, empty list — with S→C seq and
 // msg_version asserted on every reply.
 func TestCharCRUDLiveSequence(t *testing.T) {
-	f := newCharFixture(t, false)
+	f := newCharFixture(t, false, nil)
 	c := f.dial(t)
 	accountID := f.helloChar(t, c)
 
@@ -1548,7 +1562,7 @@ func TestCharCRUDLiveSequence(t *testing.T) {
 // TestCharCreateMappingWS proves every create mapping over a real
 // socket; each rejection leaves the connection usable for the next.
 func TestCharCreateMappingWS(t *testing.T) {
-	f := newCharFixture(t, false)
+	f := newCharFixture(t, false, nil)
 	c := f.dial(t)
 	f.helloChar(t, c)
 
@@ -1611,7 +1625,7 @@ func TestCharCreateMappingWS(t *testing.T) {
 // TestCharMalformedWS proves truncated 122/123 payloads (valid outer
 // frames) yield protocol errors without disconnecting.
 func TestCharMalformedWS(t *testing.T) {
-	f := newCharFixture(t, false)
+	f := newCharFixture(t, false, nil)
 	c := f.dial(t)
 	f.helloChar(t, c)
 
@@ -1642,7 +1656,7 @@ func TestCharMalformedWS(t *testing.T) {
 // in CHARACTER_SELECTED then IN_WORLD via test-only registry moves,
 // and proves deletion from the other socket reports in-use both times.
 func TestCharDeleteInUseWS(t *testing.T) {
-	f := newCharFixture(t, false)
+	f := newCharFixture(t, false, nil)
 	c1 := f.dial(t)
 	accountID := f.helloChar(t, c1)
 	sid1 := f.reg.SessionsBySub("test-sub")[0]
@@ -1684,7 +1698,7 @@ func TestCharDeleteInUseWS(t *testing.T) {
 // TestCharLeaveWorldWS proves a silent successful leave: the next S→C
 // frame after 126 is the 121-driven 216, and the registry is clean.
 func TestCharLeaveWorldWS(t *testing.T) {
-	f := newCharFixture(t, false)
+	f := newCharFixture(t, false, nil)
 	c := f.dial(t)
 	accountID := f.helloChar(t, c)
 	sendCreate(t, c, 2, validCharCreate(0, "Aria"))
@@ -1733,7 +1747,7 @@ func TestCharLeaveWorldWS(t *testing.T) {
 // TestCharLeaveWorldFailureWS proves a failed flush keeps the session
 // fully bound, and a later retry succeeds.
 func TestCharLeaveWorldFailureWS(t *testing.T) {
-	f := newCharFixture(t, false)
+	f := newCharFixture(t, false, nil)
 	c := f.dial(t)
 	accountID := f.helloChar(t, c)
 	sendCreate(t, c, 2, validCharCreate(0, "Aria"))
@@ -1780,7 +1794,7 @@ func TestCharLeaveWorldFailureWS(t *testing.T) {
 // TestEnterWorldDelegatedWS guards the T3/T4 boundary: 124 reaches Next
 // exactly once with SendFunc intact, while T3b emits nothing itself.
 func TestEnterWorldDelegatedWS(t *testing.T) {
-	f := newCharFixture(t, true)
+	f := newCharFixture(t, true, nil)
 	c := f.dial(t)
 	f.helloChar(t, c)
 
@@ -1812,5 +1826,505 @@ func TestEnterWorldDelegatedWS(t *testing.T) {
 	snap, _ := f.reg.Get(ids[0])
 	if snap.State != session.StateAuthenticated || snap.HasCharacter {
 		t.Errorf("session changed by 124: %+v", snap)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// enter_world WS + PG integration (M3-T4a)
+// ---------------------------------------------------------------------------
+
+type wsBaselineEvent struct {
+	kind uint16 // 203, 218, or 220
+	snap proto.CellSnapshot
+	frag proto.ChunkFragment
+	shop proto.ShopList
+}
+
+type wsBaselineFake struct {
+	mu          sync.Mutex
+	events      []wsBaselineEvent
+	err         error
+	calls       int
+	entered     chan struct{} // closed once on first entry; never reassigned
+	enteredOnce sync.Once
+	block       chan struct{}
+	blockAfter  int // emit first N events, then wait for block; -1 disables
+	sawAcct     int64
+	sawChar     int64
+}
+
+func newWsBaselineFake() *wsBaselineFake {
+	return &wsBaselineFake{entered: make(chan struct{}), blockAfter: -1}
+}
+
+func (f *wsBaselineFake) StreamBaseline(
+	ctx context.Context,
+	_ session.ID,
+	accountID int64,
+	characterID int64,
+	sink gateway.BaselineSink,
+) error {
+	f.mu.Lock()
+	f.calls++
+	f.sawAcct = accountID
+	f.sawChar = characterID
+	f.mu.Unlock()
+	f.enteredOnce.Do(func() { close(f.entered) })
+	f.mu.Lock()
+	events := append([]wsBaselineEvent(nil), f.events...)
+	err := f.err
+	block := f.block
+	n := f.blockAfter
+	f.mu.Unlock()
+	for i, ev := range events {
+		if block != nil && i == n {
+			select {
+			case <-block:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		var serr error
+		switch ev.kind {
+		case proto.OpcodeCellSnapshot:
+			serr = sink.CellSnapshot(ev.snap)
+		case proto.OpcodeChunkFragment:
+			serr = sink.ChunkFragment(ev.frag)
+		case proto.OpcodeShopList:
+			serr = sink.ShopList(ev.shop)
+		default:
+			return errors.New("ws baseline: unknown event kind")
+		}
+		if serr != nil {
+			return serr
+		}
+	}
+	return err
+}
+
+func (f *wsBaselineFake) setEvents(events []wsBaselineEvent) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = events
+}
+
+func (f *wsBaselineFake) setErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
+}
+
+func (f *wsBaselineFake) setBlock(ch chan struct{}, after int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.block = ch
+	f.blockAfter = after
+}
+
+func (f *wsBaselineFake) closeBlock() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.block != nil {
+		close(f.block)
+		f.block = nil
+	}
+}
+
+func (f *wsBaselineFake) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func intSnap(cellX int32, entity uint32) proto.CellSnapshot {
+	return proto.CellSnapshot{
+		Cell: proto.Cell{X: cellX, Z: 0},
+		Entities: []proto.EntityEntry{
+			{Entity: entity, Kind: 1, Proto: 21, Pos: proto.Position{X: 1, Y: 2, Z: 3}, Angle: 100, Speed: 5},
+		},
+	}
+}
+
+func intFrag(idx uint16) proto.ChunkFragment {
+	return proto.ChunkFragment{
+		Cell: proto.Cell{X: 0, Z: 0}, ChunkIdx: 7,
+		FragIdx: idx, FragCount: 2, Bytes: []byte{byte(idx + 1), 2, 3},
+	}
+}
+
+func intShop() proto.ShopList {
+	return proto.ShopList{
+		Vendor: 77,
+		Listings: []proto.ShopListingEntry{
+			{Listing: 3, Price: 100, Qty: 5},
+		},
+	}
+}
+
+// enterChar creates slot-0 "Aria" and returns its durable character ID.
+func (f *charFixture) enterChar(t *testing.T, c *websocket.Conn, accountID int64, seq uint32) int64 {
+	t.Helper()
+	sendCreate(t, c, seq, validCharCreate(0, "Aria"))
+	if _, op := readCharOp(t, c); op.OK != proto.CharacterOpOK {
+		t.Fatalf("create = %+v", op)
+	}
+	rows, err := f.st.ListLiveCharacters(context.Background(), accountID)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("live = %+v, %v", rows, err)
+	}
+	return rows[0].ID
+}
+
+// TestEnterWorldBaselineWS is the end-to-end T4a proof: exact wire
+// order 217/203/218/218/203/220/219 with decoded payloads, contiguous
+// S→C seq, msg_version 1, and IN_WORLD bound afterward.
+func TestEnterWorldBaselineWS(t *testing.T) {
+	provider := newWsBaselineFake()
+	provider.setEvents([]wsBaselineEvent{
+		{kind: proto.OpcodeCellSnapshot, snap: intSnap(0, 11)},
+		{kind: proto.OpcodeChunkFragment, frag: intFrag(0)},
+		{kind: proto.OpcodeChunkFragment, frag: intFrag(1)},
+		{kind: proto.OpcodeCellSnapshot, snap: intSnap(1, 12)},
+		{kind: proto.OpcodeShopList, shop: intShop()},
+	})
+	f := newCharFixture(t, false, provider)
+	c := f.dial(t)
+	accountID := f.helloChar(t, c) // 200 seq 1
+	charID := f.enterChar(t, c, accountID, 2)
+
+	sendEnterWorld(t, c, 3, 0)
+	type frame struct {
+		header  proto.Header
+		payload *proto.Decoder
+	}
+	read := func() frame {
+		t.Helper()
+		h, p := readFrame(t, c)
+		if h.MsgVersion != proto.MessageVersion1 {
+			t.Fatalf("msg_version = %d, want 1", h.MsgVersion)
+		}
+		return frame{header: h, payload: p}
+	}
+	// 200(1) hello, 217 create(2) already consumed; baseline must be
+	// exactly 217(3), 203(4), 218(5), 218(6), 203(7), 220(8), 219(9).
+	wantOps := []uint16{
+		proto.OpcodeCharacterOp,
+		proto.OpcodeCellSnapshot,
+		proto.OpcodeChunkFragment,
+		proto.OpcodeChunkFragment,
+		proto.OpcodeCellSnapshot,
+		proto.OpcodeShopList,
+		proto.OpcodeWorldReady,
+	}
+	var frames []frame
+	for range wantOps {
+		frames = append(frames, read())
+	}
+	for i, want := range wantOps {
+		if frames[i].header.Opcode != want {
+			t.Fatalf("frame %d opcode = %d, want %d", i, frames[i].header.Opcode, want)
+		}
+		if frames[i].header.Seq != uint32(3+i) {
+			t.Fatalf("frame %d seq = %d, want %d", i, frames[i].header.Seq, 3+i)
+		}
+	}
+	if op, err := proto.DecodeCharacterOp(frames[0].payload); err != nil ||
+		op.Op != proto.CharacterOpEnterWorld || op.OK != proto.CharacterOpOK {
+		t.Fatalf("217 = %+v, %v", op, err)
+	}
+	if got, err := proto.DecodeCellSnapshot(frames[1].payload); err != nil || got.Cell.X != 0 {
+		t.Fatalf("203a = %+v, %v", got, err)
+	} else if len(got.Entities) != 1 || got.Entities[0].Entity != 11 {
+		t.Fatalf("203a entities = %+v", got.Entities)
+	}
+	for i, wantIdx := range []uint16{0, 1} {
+		got, err := proto.DecodeChunkFragment(frames[2+i].payload)
+		if err != nil || got.FragIdx != wantIdx || got.FragCount != 2 {
+			t.Fatalf("218[%d] = %+v, %v", i, got, err)
+		}
+		if len(got.Bytes) != 3 || got.Bytes[0] != byte(wantIdx+1) {
+			t.Fatalf("218[%d] bytes = %v", i, got.Bytes)
+		}
+	}
+	if got, err := proto.DecodeCellSnapshot(frames[4].payload); err != nil || got.Cell.X != 1 {
+		t.Fatalf("203b = %+v, %v", got, err)
+	}
+	if got, err := proto.DecodeShopList(frames[5].payload); err != nil ||
+		got.Vendor != 77 || len(got.Listings) != 1 || got.Listings[0].Listing != 3 {
+		t.Fatalf("220 = %+v, %v", got, err)
+	}
+	if _, err := proto.DecodeWorldReady(frames[6].payload); err != nil {
+		t.Fatalf("219 decode: %v", err)
+	}
+	// Registry is IN_WORLD and bound; provider got internal IDs only.
+	ids := f.reg.SessionsBySub("test-sub")
+	snap, _ := f.reg.Get(ids[0])
+	if snap.State != session.StateInWorld || !snap.HasCharacter || snap.CharacterID != charID {
+		t.Errorf("after enter: %+v, want IN_WORLD bound to %d", snap, charID)
+	}
+	if owner, ok := f.reg.SessionByCharacter(charID); !ok || owner != ids[0] {
+		t.Errorf("index = %d,%v", owner, ok)
+	}
+	// Nothing follows the barrier: the next reply is a live 121→216,
+	// and a second 124 hits the existing bad_state gate.
+	sendCharList(t, c, 10)
+	if _, list := readCharList(t, c); len(list.Characters) != 1 {
+		t.Errorf("list after enter = %+v", list.Characters)
+	}
+	sendEnterWorld(t, c, 11, 0)
+	if _, msg := readError(t, c); msg.Code != proto.ErrorCodeBadState {
+		t.Errorf("second 124 code = %d, want bad_state from the server gate", msg.Code)
+	}
+}
+
+// TestEnterWorldBarrierWS blocks the provider mid-baseline and proves
+// the session sits CHARACTER_SELECTED with no 219 until release.
+func TestEnterWorldBarrierWS(t *testing.T) {
+	provider := newWsBaselineFake()
+	provider.setEvents([]wsBaselineEvent{
+		{kind: proto.OpcodeCellSnapshot, snap: intSnap(0, 11)},
+		{kind: proto.OpcodeShopList, shop: intShop()},
+	})
+	f := newCharFixture(t, false, provider)
+	c := f.dial(t)
+	accountID := f.helloChar(t, c)
+	charID := f.enterChar(t, c, accountID, 2)
+	ids := f.reg.SessionsBySub("test-sub")
+	sid := ids[0]
+
+	provider.setBlock(make(chan struct{}), 1) // emit 203, then wait
+	sendEnterWorld(t, c, 3, 0)
+	// 217 then 203 arrive; the 220/219 cannot.
+	if _, op := readCharOp(t, c); op.OK != proto.CharacterOpOK {
+		t.Fatalf("217 = %+v", op)
+	}
+	h, _ := readFrame(t, c)
+	if h.Opcode != proto.OpcodeCellSnapshot {
+		t.Fatalf("opcode = %d, want 203", h.Opcode)
+	}
+	<-provider.entered
+	snap, _ := f.reg.Get(sid)
+	if snap.State != session.StateCharacterSelected || !snap.HasCharacter || snap.CharacterID != charID {
+		t.Fatalf("mid-baseline = %+v, want SELECTED bound", snap)
+	}
+	provider.closeBlock()
+	h, _ = readFrame(t, c)
+	if h.Opcode != proto.OpcodeShopList {
+		t.Fatalf("opcode = %d, want 220 after release", h.Opcode)
+	}
+	h, p := readFrame(t, c)
+	if h.Opcode != proto.OpcodeWorldReady {
+		t.Fatalf("opcode = %d, want 219 barrier", h.Opcode)
+	}
+	if _, err := proto.DecodeWorldReady(p); err != nil {
+		t.Fatalf("219 decode: %v", err)
+	}
+	if s := mustGetSession(t, f.reg, sid); s.State != session.StateInWorld {
+		t.Errorf("final = %+v, want IN_WORLD", s)
+	}
+}
+
+func mustGetSession(t *testing.T, r *session.Registry, id session.ID) session.Snapshot {
+	t.Helper()
+	snap, ok := r.Get(id)
+	if !ok {
+		t.Fatalf("session %d vanished", uint64(id))
+	}
+	return snap
+}
+
+// TestEnterWorldOperationalFailureWS proves the provisional-baseline
+// contract: 217/203/218 then 202 retry, no 219, rollback, and a
+// same-socket retry that completes.
+func TestEnterWorldOperationalFailureWS(t *testing.T) {
+	provider := newWsBaselineFake()
+	provider.setEvents([]wsBaselineEvent{
+		{kind: proto.OpcodeCellSnapshot, snap: intSnap(0, 11)},
+		{kind: proto.OpcodeChunkFragment, frag: intFrag(0)},
+	})
+	provider.setErr(errors.New("cells unavailable"))
+	f := newCharFixture(t, false, provider)
+	c := f.dial(t)
+	accountID := f.helloChar(t, c)
+	charID := f.enterChar(t, c, accountID, 2)
+	ids := f.reg.SessionsBySub("test-sub")
+	sid := ids[0]
+
+	sendEnterWorld(t, c, 3, 0)
+	if _, op := readCharOp(t, c); op.OK != proto.CharacterOpOK {
+		t.Fatalf("217 = %+v", op)
+	}
+	if h, _ := readFrame(t, c); h.Opcode != proto.OpcodeCellSnapshot {
+		t.Fatalf("opcode = %d, want 203", h.Opcode)
+	}
+	if h, _ := readFrame(t, c); h.Opcode != proto.OpcodeChunkFragment {
+		t.Fatalf("opcode = %d, want 218", h.Opcode)
+	}
+	if _, msg := readError(t, c); msg.Code != proto.ErrorCodeRetry {
+		t.Fatalf("code = %d, want retry", msg.Code)
+	}
+	snap, _ := f.reg.Get(sid)
+	if snap.State != session.StateAuthenticated || snap.HasCharacter {
+		t.Fatalf("not rolled back: %+v", snap)
+	}
+	if _, ok := f.reg.SessionByCharacter(charID); ok {
+		t.Fatal("index leaked")
+	}
+	// Same socket retries to a full success.
+	provider.setErr(nil)
+	sendEnterWorld(t, c, 4, 0)
+	if _, op := readCharOp(t, c); op.OK != proto.CharacterOpOK {
+		t.Fatalf("retry 217 = %+v", op)
+	}
+	if h, _ := readFrame(t, c); h.Opcode != proto.OpcodeCellSnapshot {
+		t.Fatalf("opcode = %d", h.Opcode)
+	}
+	if h, _ := readFrame(t, c); h.Opcode != proto.OpcodeChunkFragment {
+		t.Fatalf("opcode = %d", h.Opcode)
+	}
+	if h, _ := readFrame(t, c); h.Opcode != proto.OpcodeWorldReady {
+		t.Fatalf("opcode = %d, want 219", h.Opcode)
+	}
+	if s := mustGetSession(t, f.reg, sid); s.State != session.StateInWorld {
+		t.Errorf("final = %+v", s)
+	}
+}
+
+// TestEnterWorldSameAccountSerializationWS: A enters and blocks
+// mid-baseline; B's enter cannot overlap it, then receives the staged
+// retry once A is IN_WORLD.
+func TestEnterWorldSameAccountSerializationWS(t *testing.T) {
+	provider := newWsBaselineFake()
+	provider.setEvents([]wsBaselineEvent{
+		{kind: proto.OpcodeCellSnapshot, snap: intSnap(0, 11)},
+	})
+	f := newCharFixture(t, false, provider)
+	cA := f.dial(t)
+	accountID := f.helloChar(t, cA)
+	charID := f.enterChar(t, cA, accountID, 2)
+
+	cB := f.dial(t)
+	f.helloChar(t, cB)
+	ids := f.reg.SessionsBySub("test-sub")
+	if len(ids) != 2 {
+		t.Fatalf("sessions = %d, want 2", len(ids))
+	}
+
+	provider.setBlock(make(chan struct{}), 1) // emit 203, then wait
+	sendEnterWorld(t, cA, 3, 0)
+	if _, op := readCharOp(t, cA); op.OK != proto.CharacterOpOK {
+		t.Fatalf("A 217 = %+v", op)
+	}
+	if h, _ := readFrame(t, cA); h.Opcode != proto.OpcodeCellSnapshot {
+		t.Fatalf("A opcode = %d", h.Opcode)
+	}
+	<-provider.entered
+
+	// B enters while A holds the guard mid-baseline.
+	sendEnterWorld(t, cB, 3, 0)
+	// Release A: it completes to IN_WORLD.
+	provider.closeBlock()
+	if h, _ := readFrame(t, cA); h.Opcode != proto.OpcodeWorldReady {
+		t.Fatalf("A opcode = %d, want 219", h.Opcode)
+	}
+	// B now receives the staged retry; A is untouched.
+	if _, msg := readError(t, cB); msg.Code != proto.ErrorCodeRetry {
+		t.Fatalf("B code = %d, want staged retry", msg.Code)
+	}
+	if n := provider.callCount(); n != 1 {
+		t.Errorf("provider calls = %d, want 1 (B never streamed)", n)
+	}
+	// A is IN_WORLD and bound; exactly one session is.
+	inWorld := 0
+	for _, id := range f.reg.SessionsBySub("test-sub") {
+		if s, _ := f.reg.Get(id); s.State == session.StateInWorld {
+			inWorld++
+			if !s.HasCharacter || s.CharacterID != charID {
+				t.Errorf("A = %+v", s)
+			}
+		} else if s.State != session.StateAuthenticated || s.HasCharacter {
+			t.Errorf("B = %+v, want AUTHENTICATED unbound", s)
+		}
+	}
+	if inWorld != 1 {
+		t.Errorf("IN_WORLD sessions = %d, want 1", inWorld)
+	}
+}
+
+// TestEnterWorldDisconnectCleanupWS: closing the socket mid-baseline
+// must remove the session and its provisional character index.
+func TestEnterWorldDisconnectCleanupWS(t *testing.T) {
+	provider := newWsBaselineFake()
+	provider.setEvents([]wsBaselineEvent{
+		{kind: proto.OpcodeCellSnapshot, snap: intSnap(0, 11)},
+	})
+	f := newCharFixture(t, false, provider)
+	c := f.dial(t)
+	accountID := f.helloChar(t, c)
+	charID := f.enterChar(t, c, accountID, 2)
+
+	provider.setBlock(make(chan struct{}), 0) // block on entry
+	sendEnterWorld(t, c, 3, 0)
+	if _, op := readCharOp(t, c); op.OK != proto.CharacterOpOK {
+		t.Fatalf("217 = %+v", op)
+	}
+	<-provider.entered
+	ids := f.reg.SessionsBySub("test-sub")
+	if s, _ := f.reg.Get(ids[0]); s.State != session.StateCharacterSelected {
+		t.Fatalf("mid-baseline = %+v", s)
+	}
+	// Abrupt close (no handshake: the server is synchronously
+	// mid-baseline and cannot answer one), then release the stranded
+	// provider so its writes fail and cleanup runs.
+	if err := c.CloseNow(); err != nil {
+		t.Fatalf("close now: %v", err)
+	}
+	provider.closeBlock() // let the stranded baseline fail its writes
+	waitFor(t, "session cleanup", func() bool { return f.reg.Len() == 0 })
+	if _, ok := f.reg.SessionByCharacter(charID); ok {
+		t.Error("provisional character index leaked after disconnect")
+	}
+}
+
+// TestEnterWorldSlotMappingWS: malformed 124, invalid/empty slots, then
+// a successful enter on the same socket.
+func TestEnterWorldSlotMappingWS(t *testing.T) {
+	provider := newWsBaselineFake()
+	f := newCharFixture(t, false, provider)
+	c := f.dial(t)
+	accountID := f.helloChar(t, c)
+
+	// Malformed payload inside a valid outer frame.
+	sendFrame(t, c,
+		proto.Header{Opcode: proto.OpcodeEnterWorld, MsgVersion: 1, Seq: 2, Tick: 1},
+		func(e *proto.Encoder) error { return nil })
+	if _, msg := readError(t, c); msg.Code != proto.ErrorCodeProtocol {
+		t.Errorf("malformed code = %d, want protocol_error", msg.Code)
+	}
+	// Invalid slot and empty (but valid) slot.
+	sendEnterWorld(t, c, 3, 7)
+	if _, op := readCharOp(t, c); op.Op != proto.CharacterOpEnterWorld || op.OK != proto.CharacterOpRejected {
+		t.Errorf("217 = %+v, want enter/rejected", op)
+	}
+	sendEnterWorld(t, c, 4, 1)
+	if _, op := readCharOp(t, c); op.Op != proto.CharacterOpEnterWorld || op.OK != proto.CharacterOpRejected {
+		t.Errorf("217 = %+v, want enter/rejected", op)
+	}
+	if n := provider.callCount(); n != 0 {
+		t.Errorf("provider calls = %d, want 0 before valid enter", n)
+	}
+	// Same socket proceeds to a full success.
+	charID := f.enterChar(t, c, accountID, 5)
+	_ = charID
+	sendEnterWorld(t, c, 6, 0)
+	if _, op := readCharOp(t, c); op.OK != proto.CharacterOpOK {
+		t.Fatalf("217 = %+v", op)
+	}
+	if h, _ := readFrame(t, c); h.Opcode != proto.OpcodeWorldReady {
+		t.Fatalf("opcode = %d, want 219 (empty baseline)", h.Opcode)
+	}
+	ids := f.reg.SessionsBySub("test-sub")
+	if s, _ := f.reg.Get(ids[0]); s.State != session.StateInWorld {
+		t.Errorf("final = %+v", s)
 	}
 }

@@ -666,3 +666,261 @@ func TestCompleteLeaveWorldGuardsStaleIndex(t *testing.T) {
 		t.Errorf("index disturbed: %d, %v", owner, ok)
 	}
 }
+
+func setupAuthenticated(t *testing.T, r *Registry, sub string, accountID int64) ID {
+	t.Helper()
+	id := r.Create(nil)
+	if err := r.Authenticate(id, sub, accountID, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	return id
+}
+
+func snapshotMust(t *testing.T, r *Registry, id ID) Snapshot {
+	t.Helper()
+	snap, ok := r.Get(id)
+	if !ok {
+		t.Fatalf("session %d vanished", uint64(id))
+	}
+	return snap
+}
+
+func TestBeginEnterWorld(t *testing.T) {
+	r := NewRegistry()
+	id := setupAuthenticated(t, r, "sub", 7)
+	exp := snapshotMust(t, r, id).TokenExp
+	if _, err := r.NextServerSeq(id); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.BeginEnterWorld(id, 55); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	snap := snapshotMust(t, r, id)
+	if snap.State != StateCharacterSelected || !snap.HasCharacter || snap.CharacterID != 55 {
+		t.Errorf("after begin: %+v", snap)
+	}
+	if owner, ok := r.SessionByCharacter(55); !ok || owner != id {
+		t.Errorf("byChar = %d,%v", owner, ok)
+	}
+	// Identity and server sequence preserved.
+	if snap.Sub != "sub" || snap.AccountID != 7 || !snap.Authenticated || !snap.TokenExp.Equal(exp) {
+		t.Errorf("identity changed: %+v", snap)
+	}
+	if seq, err := r.NextServerSeq(id); err != nil || seq != 2 {
+		t.Errorf("seq = %d,%v want 2", seq, err)
+	}
+
+	// Wrong state (already selected): zero mutation.
+	if err := r.BeginEnterWorld(id, 56); !errors.Is(err, ErrBadState) {
+		t.Errorf("second begin err = %v, want ErrBadState", err)
+	}
+	// Already bound current session via another path: zero mutation.
+	other := setupAuthenticated(t, r, "o", 7)
+	if err := r.BindCharacter(other, 77); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.BeginEnterWorld(other, 78); !errors.Is(err, ErrBadState) {
+		t.Errorf("bound begin err = %v, want ErrBadState", err)
+	}
+	// Character occupied elsewhere: ErrCharacterInUse, zero mutation.
+	third := setupAuthenticated(t, r, "t", 8)
+	if err := r.BeginEnterWorld(third, 55); !errors.Is(err, ErrCharacterInUse) {
+		t.Errorf("occupied begin err = %v, want ErrCharacterInUse", err)
+	}
+	// Unknown session.
+	if err := r.BeginEnterWorld(9999, 1); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown err = %v, want ErrNotFound", err)
+	}
+	// Nothing moved: third still AUTHENTICATED/unbound, 55 still on id.
+	if s := snapshotMust(t, r, third); s.State != StateAuthenticated || s.HasCharacter {
+		t.Errorf("third mutated: %+v", s)
+	}
+	if owner, _ := r.SessionByCharacter(55); owner != id {
+		t.Errorf("55 owner moved")
+	}
+	// CONNECTED session cannot begin.
+	plain := r.Create(nil)
+	if err := r.BeginEnterWorld(plain, 60); !errors.Is(err, ErrBadState) {
+		t.Errorf("connected begin err = %v, want ErrBadState", err)
+	}
+}
+
+func TestAbortEnterWorld(t *testing.T) {
+	r := NewRegistry()
+	id := setupAuthenticated(t, r, "sub", 7)
+	exp := snapshotMust(t, r, id).TokenExp
+	if err := r.BeginEnterWorld(id, 55); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.NextServerSeq(id); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.AbortEnterWorld(id, 55); err != nil {
+		t.Fatalf("abort: %v", err)
+	}
+	snap := snapshotMust(t, r, id)
+	if snap.State != StateAuthenticated || snap.HasCharacter || snap.CharacterID != 0 {
+		t.Errorf("after abort: %+v", snap)
+	}
+	if _, ok := r.SessionByCharacter(55); ok {
+		t.Error("index not removed")
+	}
+	if snap.Sub != "sub" || snap.AccountID != 7 || !snap.TokenExp.Equal(exp) {
+		t.Errorf("identity changed: %+v", snap)
+	}
+	if seq, err := r.NextServerSeq(id); err != nil || seq != 2 {
+		t.Errorf("seq = %d,%v want 2", seq, err)
+	}
+
+	// Wrong state (already AUTHENTICATED): no mutation.
+	if err := r.AbortEnterWorld(id, 55); !errors.Is(err, ErrBadState) {
+		t.Errorf("second abort err = %v, want ErrBadState", err)
+	}
+	// Wrong character.
+	if err := r.BeginEnterWorld(id, 55); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.AbortEnterWorld(id, 56); !errors.Is(err, ErrBadState) {
+		t.Errorf("wrong char err = %v, want ErrBadState", err)
+	}
+	if s := snapshotMust(t, r, id); s.State != StateCharacterSelected || !s.HasCharacter {
+		t.Errorf("mutated by failed abort: %+v", s)
+	}
+	// Missing binding (IN_WORLD session, different primitive path).
+	inWorld := setupInWorld(t, r, "w", 7, 66)
+	if err := r.AbortEnterWorld(inWorld, 66); !errors.Is(err, ErrBadState) {
+		t.Errorf("in-world abort err = %v, want ErrBadState", err)
+	}
+	// Stale/mismatched index.
+	r.mu.Lock()
+	r.byChar[55] = inWorld
+	r.mu.Unlock()
+	if err := r.AbortEnterWorld(id, 55); !errors.Is(err, ErrBadState) {
+		t.Errorf("stale index err = %v, want ErrBadState", err)
+	}
+	if owner, _ := r.SessionByCharacter(55); owner != inWorld {
+		t.Error("stale index disturbed")
+	}
+	// Unknown session.
+	if err := r.AbortEnterWorld(9999, 55); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestCompleteEnterWorld(t *testing.T) {
+	r := NewRegistry()
+	id := setupAuthenticated(t, r, "sub", 7)
+	exp := snapshotMust(t, r, id).TokenExp
+	if err := r.BeginEnterWorld(id, 55); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.NextServerSeq(id); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.CompleteEnterWorld(id, 55); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	snap := snapshotMust(t, r, id)
+	if snap.State != StateInWorld {
+		t.Errorf("state = %s, want IN_WORLD", snap.State)
+	}
+	if !snap.HasCharacter || snap.CharacterID != 55 {
+		t.Errorf("binding lost: %+v", snap)
+	}
+	if owner, ok := r.SessionByCharacter(55); !ok || owner != id {
+		t.Errorf("index = %d,%v", owner, ok)
+	}
+	if snap.Sub != "sub" || snap.AccountID != 7 || !snap.TokenExp.Equal(exp) {
+		t.Errorf("identity changed: %+v", snap)
+	}
+	if seq, err := r.NextServerSeq(id); err != nil || seq != 2 {
+		t.Errorf("seq = %d,%v want 2", seq, err)
+	}
+
+	// Wrong state (already IN_WORLD): no mutation.
+	if err := r.CompleteEnterWorld(id, 55); !errors.Is(err, ErrBadState) {
+		t.Errorf("second complete err = %v, want ErrBadState", err)
+	}
+	// Wrong character.
+	auth2 := setupAuthenticated(t, r, "a2", 7)
+	if err := r.BeginEnterWorld(auth2, 70); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.CompleteEnterWorld(auth2, 71); !errors.Is(err, ErrBadState) {
+		t.Errorf("wrong char err = %v, want ErrBadState", err)
+	}
+	if s := snapshotMust(t, r, auth2); s.State != StateCharacterSelected {
+		t.Errorf("mutated: %+v", s)
+	}
+	// Missing index.
+	r.mu.Lock()
+	delete(r.byChar, 70)
+	r.mu.Unlock()
+	if err := r.CompleteEnterWorld(auth2, 70); !errors.Is(err, ErrBadState) {
+		t.Errorf("missing index err = %v, want ErrBadState", err)
+	}
+	// Unknown session.
+	if err := r.CompleteEnterWorld(9999, 70); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestWorldSessionForAccount(t *testing.T) {
+	r := NewRegistry()
+	me := setupAuthenticated(t, r, "me", 7)
+
+	// None: only self (excluded) plus an AUTHENTICATED peer.
+	peer := setupAuthenticated(t, r, "peer", 7)
+	if _, ok, err := r.WorldSessionForAccount(7, me); err != nil || ok {
+		t.Errorf("empty = %v,%v want false,nil", ok, err)
+	}
+
+	// One CHARACTER_SELECTED other session.
+	sel := setupAuthenticated(t, r, "sel", 7)
+	if err := r.BeginEnterWorld(sel, 80); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := r.WorldSessionForAccount(7, me)
+	if err != nil || !ok {
+		t.Fatalf("selected = %v,%v", ok, err)
+	}
+	if got.ID != sel || got.State != StateCharacterSelected || got.CharacterID != 80 {
+		t.Errorf("got = %+v", got)
+	}
+	// Excluding the candidate itself yields none.
+	if _, ok, err := r.WorldSessionForAccount(7, sel); err != nil || ok {
+		t.Errorf("exclude-candidate = %v,%v", ok, err)
+	}
+
+	// One IN_WORLD other session instead.
+	if err := r.CompleteEnterWorld(sel, 80); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err = r.WorldSessionForAccount(7, me)
+	if err != nil || !ok || got.ID != sel || got.State != StateInWorld {
+		t.Errorf("in-world = %+v,%v,%v", got, ok, err)
+	}
+
+	// Other accounts and CONNECTED sessions never count.
+	_ = peer
+	otherAcct := setupInWorld(t, r, "other", 8, 81)
+	_ = otherAcct
+	if got, ok, err := r.WorldSessionForAccount(8, me); err != nil || !ok || got.AccountID != 8 {
+		t.Errorf("other account = %+v,%v,%v", got, ok, err)
+	}
+
+	// Two world-active same-account sessions: invariant error, and the
+	// outcome cannot depend on map order (run the query repeatedly).
+	second := setupAuthenticated(t, r, "second", 7)
+	if err := r.BeginEnterWorld(second, 82); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 25; i++ {
+		if _, _, err := r.WorldSessionForAccount(7, me); !errors.Is(err, ErrInvariant) {
+			t.Fatalf("iter %d err = %v, want ErrInvariant", i, err)
+		}
+	}
+}
