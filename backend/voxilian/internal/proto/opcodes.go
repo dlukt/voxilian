@@ -1,18 +1,16 @@
 package proto
 
 // Opcode constants for the connect / re-auth / error, character
-// lifecycle (M2-T2), gameplay intent (M2-T3a), and entity/stat (M2-T3b)
-// messages. Numbers are exact per docs/backend-spec.md §6.1–§6.3.
-// Opcodes 211/212/218/220 (containers/chunks/shops, M2-T3c) are NOT
-// defined here.
+// lifecycle (M2-T2), gameplay intent (M2-T3a), entity/stat (M2-T3b), and
+// container/chunk/shop (M2-T3c) messages. Numbers are exact per
+// docs/backend-spec.md §6.1–§6.3 (spec v0.3.7 for 211/212/218/220).
 //
 // Directions (no runtime enforcement in this codec):
 //
 //	C→S: Hello, Reauth, Move–RespawnAck (102–120),
 //	     CharacterListRequest, CharacterCreate,
 //	     CharacterDelete, EnterWorld, Ack, LeaveWorld
-//	S→C: Welcome, ReauthOK, Error, CellSnapshot–Effect (203–210),
-//	     TradeResult–Respawn (213–215),
+//	S→C: Welcome, ReauthOK, Error, CellSnapshot–ShopList (203–220),
 //	     CharacterListResult, CharacterOp, WorldReady
 const (
 	// C→S connect.
@@ -60,10 +58,14 @@ const (
 	OpcodeStatGroup           uint16 = 208
 	OpcodeSaid                uint16 = 209
 	OpcodeEffect              uint16 = 210
+	OpcodeInventoryDelta      uint16 = 211
+	OpcodeOfferUpdate         uint16 = 212
 	OpcodeTradeResult         uint16 = 213
 	OpcodeDeath               uint16 = 214
 	OpcodeRespawn             uint16 = 215
 	OpcodeCharacterListResult uint16 = 216
 	OpcodeCharacterOp         uint16 = 217
+	OpcodeChunkFragment       uint16 = 218
 	OpcodeWorldReady          uint16 = 219
+	OpcodeShopList            uint16 = 220
 )

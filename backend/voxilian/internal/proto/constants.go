@@ -29,6 +29,11 @@ const (
 	// MaxAngle is the maximum valid 12-bit wire angle (inclusive).
 	MaxAngle = 4095
 
+	// MaxChunkFragmentBytes bounds the raw byte blob of opcode 218
+	// chunk_fragment (spec v0.3.7). A max-size fragment still fits the
+	// 64 KiB frame envelope: 12+8+4+2+2+2+61440 = 61470 bytes.
+	MaxChunkFragmentBytes = 60 * 1024 // 61440, not 60000
+
 	// maxU16 bounds every u16 length/count prefix on the wire.
 	maxU16 = 0xFFFF
 )
@@ -68,4 +73,10 @@ var (
 	// union carrier on the wire is wider (e.g. Use kind=0 IDs in the
 	// fixed-u32 payload must still fit u16).
 	ErrStableIDOutOfRange = errors.New("stable_id_out_of_range")
+
+	// ErrChunkFragmentTooLarge reports "chunk_fragment_too_large": an
+	// opcode 218 fragment blob exceeds MaxChunkFragmentBytes. This
+	// message-specific bound is distinct from ErrFrameTooLarge (the
+	// 64 KiB complete-frame ceiling).
+	ErrChunkFragmentTooLarge = errors.New("chunk_fragment_too_large")
 )
