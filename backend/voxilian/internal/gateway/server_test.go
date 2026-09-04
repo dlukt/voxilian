@@ -27,6 +27,7 @@ import (
 	"github.com/pressly/goose/v3"
 
 	"github.com/dlukt/voxilian/internal/auth"
+	"github.com/dlukt/voxilian/internal/character"
 	"github.com/dlukt/voxilian/internal/gateway"
 	"github.com/dlukt/voxilian/internal/proto"
 	"github.com/dlukt/voxilian/internal/session"
@@ -172,6 +173,12 @@ func (f *fakeAccounts) lastCall() accountCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls[len(f.calls)-1]
+}
+
+func (f *fakeAccounts) setFail(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fail = v
 }
 
 type manualTimer struct {
@@ -490,7 +497,7 @@ func TestHelloJWTInvalid(t *testing.T) {
 func TestHelloProvisioningFailure(t *testing.T) {
 	f := newFixture(t)
 	c := f.dial(t)
-	f.accounts.fail = true
+	f.accounts.setFail(true)
 	sendHello(t, c, "tok", 1, 1)
 	_, msg := readError(t, c)
 	if msg.Code != proto.ErrorCodeRetry {
@@ -502,7 +509,7 @@ func TestHelloProvisioningFailure(t *testing.T) {
 	if got := f.reg.SessionsBySub("test-sub"); len(got) != 0 {
 		t.Fatalf("sub index = %v after failed provision, want empty", got)
 	}
-	f.accounts.fail = false
+	f.accounts.setFail(false)
 	sendHello(t, c, "tok", 2, 2)
 	header, _ := readFrame(t, c)
 	if header.Opcode != proto.OpcodeWelcome {
@@ -1155,5 +1162,651 @@ func TestExpiredTokenGateway(t *testing.T) {
 	}
 	if got := f.reg.SessionsBySub("hero-sub"); len(got) != 0 {
 		t.Errorf("sub index = %v, want empty", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// character WS + PG integration (M3-T3b)
+// ---------------------------------------------------------------------------
+
+// Test-only stable IDs for the integration content profile. Explicitly
+// not canonical game IDs; production invents none.
+const (
+	intSpellFree = 100
+	intSpellPaid = 101
+	intSkillPaid = 201
+	intItemMace  = 9001
+	intItemCoins = 9002
+)
+
+type wsExitFake struct {
+	mu       sync.Mutex
+	fail     bool
+	calls    int
+	observed []session.Snapshot
+	reg      *session.Registry
+}
+
+func (f *wsExitFake) ExitWorld(
+	_ context.Context,
+	_ session.ID,
+	_ int64,
+	characterID int64,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if snap, ok := f.reg.GetByCharacter(characterID); ok {
+		f.observed = append(f.observed, snap)
+	}
+	if f.fail {
+		return errors.New("flush failed")
+	}
+	return nil
+}
+
+func (f *wsExitFake) setFail(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fail = v
+}
+
+func (f *wsExitFake) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *wsExitFake) observedCopy() []session.Snapshot {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]session.Snapshot(nil), f.observed...)
+}
+
+type wsNextFake struct {
+	mu      sync.Mutex
+	calls   int
+	headers []proto.Header
+	sids    []session.ID
+	marker  bool // when true, reply 219 to prove delegation + SendFunc
+}
+
+func (n *wsNextFake) Handle(
+	_ context.Context,
+	sid session.ID,
+	header proto.Header,
+	_ *proto.Decoder,
+	send gateway.SendFunc,
+) error {
+	n.mu.Lock()
+	n.calls++
+	n.headers = append(n.headers, header)
+	n.sids = append(n.sids, sid)
+	marker := n.marker
+	n.mu.Unlock()
+	if !marker {
+		return nil
+	}
+	return send(proto.OpcodeWorldReady, proto.MessageVersion1, func(e *proto.Encoder) error {
+		proto.WorldReady{}.Encode(e)
+		return nil
+	})
+}
+
+type charFixture struct {
+	reg   *session.Registry
+	clock *simtest.Clock
+	sched *manualScheduler
+	ts    *httptest.Server
+	st    *store.PGStore
+	pool  *pgxpool.Pool
+	svc   *character.Service
+	exit  *wsExitFake
+	next  *wsNextFake
+	t0    time.Time
+	exp1  time.Time
+}
+
+func charStrPtr(s string) *string { return &s }
+
+func newCharFixture(t *testing.T, nextMarker bool) *charFixture {
+	t.Helper()
+	t0 := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	f := &charFixture{
+		reg:   session.NewRegistry(),
+		clock: simtest.NewClock(t0),
+		sched: &manualScheduler{},
+		t0:    t0,
+		exp1:  t0.Add(5 * time.Minute),
+	}
+	st, pool := openProvisionedStore(t)
+	f.st = st
+	f.pool = pool
+	ctx := context.Background()
+	if err := st.UpsertCatalogBatch(ctx, store.CatalogBatch{
+		Spells: []store.SpellProtoRecord{
+			{ID: intSpellFree, School: 1, Level: 1, Mana: 5, Exertion: 1, CastMs: 100, MinHP: 1,
+				Reagents: json.RawMessage(`{}`), Params: json.RawMessage(`{}`), Version: 1},
+			{ID: intSpellPaid, School: 1, Level: 1, Mana: 5, Exertion: 1, CastMs: 100, MinHP: 1,
+				Reagents: json.RawMessage(`{}`), Params: json.RawMessage(`{}`), Version: 1},
+		},
+		Skills: []store.SkillProtoRecord{
+			{ID: intSkillPaid, Division: 1, Level: 1, Exertion: 1,
+				Params: json.RawMessage(`{}`), Version: 1},
+		},
+		Items: []store.ItemProtoRecord{
+			{ID: intItemMace, Kind: 0, Slot: charStrPtr("hand"), Base: json.RawMessage(`{}`), Version: 1},
+			{ID: intItemCoins, Kind: 0, Slot: charStrPtr("coins"), Base: json.RawMessage(`{}`), Version: 1},
+		},
+	}, false); err != nil {
+		t.Fatalf("seed catalog: %v", err)
+	}
+	content := character.StaticContent{
+		Spells: map[uint16]character.AbilitySpec{
+			intSpellFree: {ID: intSpellFree, Level: 1, Offered: true, InitialAbility: 50, School: 1},
+			intSpellPaid: {ID: intSpellPaid, Level: 1, Offered: true, InitialAbility: 30, School: 1},
+		},
+		Skills: map[uint16]character.AbilitySpec{
+			intSkillPaid: {ID: intSkillPaid, Level: 1, Offered: true, InitialAbility: 25},
+		},
+		Profile: character.StarterProfile{
+			Spells: []character.AbilitySpec{
+				{ID: intSpellFree, Level: 1, Offered: true, InitialAbility: 50, School: 1},
+			},
+			Items: []character.StarterItem{
+				{ProtoID: intItemMace, Qty: 1, Hits: 100, Slot: "hand"},
+				{ProtoID: intItemCoins, Qty: 500, Hits: 0, Slot: "coins"},
+			},
+			Hometown: "tos", PosX: 1, PosY: 2, PosZ: 3,
+		},
+	}
+	svc, err := character.NewService(content,
+		character.NewNamePolicy([]string{"goblin"}, []string{"admin"}), st)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	f.svc = svc
+	f.exit = &wsExitFake{reg: f.reg}
+	f.next = &wsNextFake{marker: nextMarker}
+	validator := &fakeValidator{
+		ids: map[string]auth.Identity{
+			"tok": {Sub: "test-sub", ExpiresAt: f.exp1},
+		},
+		now: f.clock.Now,
+	}
+	chars, err := gateway.NewCharacterHandler(svc, f.reg, gateway.WorldExitFunc(f.exit.ExitWorld), f.next)
+	if err != nil {
+		t.Fatalf("NewCharacterHandler: %v", err)
+	}
+	srv := gateway.NewServer(gateway.ServerDeps{
+		Registry:  f.reg,
+		Validator: validator,
+		Accounts:  st,
+		Welcome:   func(context.Context) proto.Welcome { return fixedWelcome },
+		Tick:      func() uint32 { return testTick },
+		Now:       f.clock.Now,
+		Schedule:  f.sched.schedule,
+		Handler:   chars,
+	})
+	f.ts = httptest.NewServer(srv)
+	t.Cleanup(f.ts.Close)
+	return f
+}
+
+func (f *charFixture) dial(t *testing.T) *websocket.Conn {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	url := "ws" + strings.TrimPrefix(f.ts.URL, "http")
+	c, _, err := websocket.Dial(ctx, url, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close(websocket.StatusNormalClosure, "") })
+	return c
+}
+
+// helloChar performs hello and returns the provisioned account ID.
+func (f *charFixture) helloChar(t *testing.T, c *websocket.Conn) int64 {
+	t.Helper()
+	sendHello(t, c, "tok", 1, 1)
+	header, _ := readFrame(t, c)
+	if header.Opcode != proto.OpcodeWelcome {
+		t.Fatalf("opcode = %d, want 200", header.Opcode)
+	}
+	ids := f.reg.SessionsBySub("test-sub")
+	if len(ids) == 0 {
+		t.Fatal("no session indexed")
+	}
+	snap, _ := f.reg.Get(ids[len(ids)-1])
+	return snap.AccountID
+}
+
+func validCharCreate(slot uint8, name string) proto.CharacterCreate {
+	return proto.CharacterCreate{
+		Slot:   slot,
+		Name:   name,
+		Gender: 1,
+		Face:   proto.CharacterFace{HairStyle: 1, HairColor: 2, SkinTone: 3, Parts: [5]uint8{1, 2, 3, 4, 5}},
+		Stats:  [6]uint8{10, 10, 10, 10, 10, 10},
+		Spells: []uint16{intSpellPaid},
+		Skills: []uint16{intSkillPaid},
+	}
+}
+
+func sendCreate(t *testing.T, c *websocket.Conn, seq uint32, req proto.CharacterCreate) {
+	t.Helper()
+	sendFrame(t, c,
+		proto.Header{Opcode: proto.OpcodeCharacterCreate, MsgVersion: 1, Seq: seq, Tick: 1},
+		func(e *proto.Encoder) error {
+			req.Encode(e)
+			return nil
+		})
+}
+
+func sendDelete(t *testing.T, c *websocket.Conn, seq uint32, slot uint8) {
+	t.Helper()
+	sendFrame(t, c,
+		proto.Header{Opcode: proto.OpcodeCharacterDelete, MsgVersion: 1, Seq: seq, Tick: 1},
+		func(e *proto.Encoder) error {
+			proto.CharacterDelete{Slot: slot}.Encode(e)
+			return nil
+		})
+}
+
+func sendLeave(t *testing.T, c *websocket.Conn, seq uint32) {
+	t.Helper()
+	sendFrame(t, c,
+		proto.Header{Opcode: proto.OpcodeLeaveWorld, MsgVersion: 1, Seq: seq, Tick: 1},
+		func(e *proto.Encoder) error {
+			proto.LeaveWorld{}.Encode(e)
+			return nil
+		})
+}
+
+func sendEnterWorld(t *testing.T, c *websocket.Conn, seq uint32, slot uint8) {
+	t.Helper()
+	sendFrame(t, c,
+		proto.Header{Opcode: proto.OpcodeEnterWorld, MsgVersion: 1, Seq: seq, Tick: 1},
+		func(e *proto.Encoder) error {
+			proto.EnterWorld{Slot: slot}.Encode(e)
+			return nil
+		})
+}
+
+func readCharOp(t *testing.T, c *websocket.Conn) (proto.Header, proto.CharacterOp) {
+	t.Helper()
+	header, payload := readFrame(t, c)
+	if header.Opcode != proto.OpcodeCharacterOp {
+		t.Fatalf("opcode = %d, want 217", header.Opcode)
+	}
+	if header.MsgVersion != proto.MessageVersion1 {
+		t.Fatalf("msg_version = %d, want 1", header.MsgVersion)
+	}
+	op, err := proto.DecodeCharacterOp(payload)
+	if err != nil {
+		t.Fatalf("decode 217: %v", err)
+	}
+	return header, op
+}
+
+func readCharList(t *testing.T, c *websocket.Conn) (proto.Header, proto.CharacterList) {
+	t.Helper()
+	header, payload := readFrame(t, c)
+	if header.Opcode != proto.OpcodeCharacterListResult {
+		t.Fatalf("opcode = %d, want 216", header.Opcode)
+	}
+	if header.MsgVersion != proto.MessageVersion1 {
+		t.Fatalf("msg_version = %d, want 1", header.MsgVersion)
+	}
+	list, err := proto.DecodeCharacterList(payload)
+	if err != nil {
+		t.Fatalf("decode 216: %v", err)
+	}
+	return header, list
+}
+
+func (f *charFixture) liveCount(t *testing.T, accountID int64) int {
+	t.Helper()
+	rows, err := f.st.ListLiveCharacters(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("list live: %v", err)
+	}
+	return len(rows)
+}
+
+// TestCharCRUDLiveSequence is the end-to-end M3 proof: hello, empty
+// list, create, listed level 20, delete, empty list — with S→C seq and
+// msg_version asserted on every reply.
+func TestCharCRUDLiveSequence(t *testing.T) {
+	f := newCharFixture(t, false)
+	c := f.dial(t)
+	accountID := f.helloChar(t, c)
+
+	sendCharList(t, c, 2)
+	h216a, list := readCharList(t, c)
+	if len(list.Characters) != 0 {
+		t.Fatalf("initial list = %+v, want empty", list.Characters)
+	}
+	if h216a.Seq != 2 {
+		t.Errorf("216 seq = %d, want 2", h216a.Seq)
+	}
+
+	sendCreate(t, c, 3, validCharCreate(0, "Aria"))
+	h217, op := readCharOp(t, c)
+	if op.Op != proto.CharacterOpCreate || op.OK != proto.CharacterOpOK {
+		t.Fatalf("217 = %+v, want create/ok", op)
+	}
+	if h217.Seq != 3 {
+		t.Errorf("217 seq = %d, want 3", h217.Seq)
+	}
+
+	sendCharList(t, c, 4)
+	h216b, list := readCharList(t, c)
+	if h216b.Seq != 4 {
+		t.Errorf("216 seq = %d, want 4", h216b.Seq)
+	}
+	if len(list.Characters) != 1 {
+		t.Fatalf("list = %+v, want one row", list.Characters)
+	}
+	got := list.Characters[0]
+	if got.Slot != 0 || got.CharName != "Aria" || got.Level != 20 {
+		t.Errorf("row = %+v, want slot 0 Aria level 20", got)
+	}
+
+	sendDelete(t, c, 5, 0)
+	h217d, op := readCharOp(t, c)
+	if op.Op != proto.CharacterOpDelete || op.OK != proto.CharacterOpOK {
+		t.Fatalf("217 = %+v, want delete/ok", op)
+	}
+	if h217d.Seq != 5 {
+		t.Errorf("217 seq = %d, want 5", h217d.Seq)
+	}
+
+	sendCharList(t, c, 6)
+	h216c, list := readCharList(t, c)
+	if h216c.Seq != 6 {
+		t.Errorf("216 seq = %d, want 6", h216c.Seq)
+	}
+	if len(list.Characters) != 0 {
+		t.Errorf("final list = %+v, want empty", list.Characters)
+	}
+	// Durable soft-delete behind the wire.
+	if n := f.liveCount(t, accountID); n != 0 {
+		t.Errorf("live rows = %d, want 0", n)
+	}
+	var deleted bool
+	if err := f.pool.QueryRow(context.Background(),
+		`SELECT deleted_at IS NOT NULL FROM characters WHERE account_id = $1`, accountID).Scan(&deleted); err != nil {
+		t.Fatalf("durable row: %v", err)
+	}
+	if !deleted {
+		t.Error("durable row not soft-deleted")
+	}
+}
+
+// TestCharCreateMappingWS proves every create mapping over a real
+// socket; each rejection leaves the connection usable for the next.
+func TestCharCreateMappingWS(t *testing.T) {
+	f := newCharFixture(t, false)
+	c := f.dial(t)
+	f.helloChar(t, c)
+
+	badStats := validCharCreate(0, "Aria")
+	badStats.Stats = [6]uint8{50, 50, 50, 50, 50, 50}
+	badBudget := validCharCreate(0, "Aria")
+	badBudget.Spells = []uint16{999}
+	cases := []struct {
+		name   string
+		req    proto.CharacterCreate
+		op     *proto.CharacterOp // nil → expect 202
+		err204 uint16
+	}{
+		{"invalid slot", validCharCreate(7, "Aria"),
+			&proto.CharacterOp{Op: proto.CharacterOpCreate, OK: proto.CharacterOpRejected}, 0},
+		{"invalid name", validCharCreate(0, "ab"),
+			&proto.CharacterOp{Op: proto.CharacterOpCreate, OK: proto.CharacterOpRejected}, 0},
+		{"blocked name", validCharCreate(0, "goblin"), nil, proto.ErrorCodeNameTaken},
+		{"bad stats", badStats, nil, proto.ErrorCodeBadStats},
+		{"bad budget", badBudget, nil, proto.ErrorCodeBadBudget},
+	}
+	var seq uint32 = 2
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sendCreate(t, c, seq, tc.req)
+			seq++
+			if tc.op != nil {
+				_, op := readCharOp(t, c)
+				if op != *tc.op {
+					t.Errorf("217 = %+v, want %+v", op, *tc.op)
+				}
+				return
+			}
+			_, msg := readError(t, c)
+			if msg.Code != tc.err204 {
+				t.Errorf("code = %d, want %d", msg.Code, tc.err204)
+			}
+		})
+	}
+	// Usable afterward: a valid create succeeds on the same socket.
+	sendCreate(t, c, seq, validCharCreate(0, "Aria"))
+	seq++
+	if _, op := readCharOp(t, c); op.OK != proto.CharacterOpOK {
+		t.Fatalf("217 = %+v after rejections", op)
+	}
+	// Same live name, free slot → name_taken.
+	sendCreate(t, c, seq, validCharCreate(1, "Aria"))
+	seq++
+	if _, msg := readError(t, c); msg.Code != proto.ErrorCodeNameTaken {
+		t.Errorf("duplicate name code = %d, want name_taken", msg.Code)
+	}
+	// Occupied slot, fresh name → slot_occupied.
+	sendCreate(t, c, seq, validCharCreate(0, "Bram"))
+	seq++
+	if _, msg := readError(t, c); msg.Code != proto.ErrorCodeSlotOccupied {
+		t.Errorf("occupied slot code = %d, want slot_occupied", msg.Code)
+	}
+}
+
+// TestCharMalformedWS proves truncated 122/123 payloads (valid outer
+// frames) yield protocol errors without disconnecting.
+func TestCharMalformedWS(t *testing.T) {
+	f := newCharFixture(t, false)
+	c := f.dial(t)
+	f.helloChar(t, c)
+
+	sendFrame(t, c,
+		proto.Header{Opcode: proto.OpcodeCharacterCreate, MsgVersion: 1, Seq: 2, Tick: 1},
+		func(e *proto.Encoder) error {
+			e.U8(0)
+			e.U8(1)
+			e.U8(2)
+			return nil
+		})
+	if _, msg := readError(t, c); msg.Code != proto.ErrorCodeProtocol {
+		t.Errorf("122 code = %d, want protocol_error", msg.Code)
+	}
+	sendFrame(t, c,
+		proto.Header{Opcode: proto.OpcodeCharacterDelete, MsgVersion: 1, Seq: 3, Tick: 1},
+		func(e *proto.Encoder) error { return nil })
+	if _, msg := readError(t, c); msg.Code != proto.ErrorCodeProtocol {
+		t.Errorf("123 code = %d, want protocol_error", msg.Code)
+	}
+	sendCharList(t, c, 4)
+	if _, list := readCharList(t, c); len(list.Characters) != 0 {
+		t.Errorf("list after malformed = %+v", list.Characters)
+	}
+}
+
+// TestCharDeleteInUseWS builds two sessions for one account, parks one
+// in CHARACTER_SELECTED then IN_WORLD via test-only registry moves,
+// and proves deletion from the other socket reports in-use both times.
+func TestCharDeleteInUseWS(t *testing.T) {
+	f := newCharFixture(t, false)
+	c1 := f.dial(t)
+	accountID := f.helloChar(t, c1)
+	sendCreate(t, c1, 2, validCharCreate(0, "Aria"))
+	if _, op := readCharOp(t, c1); op.OK != proto.CharacterOpOK {
+		t.Fatalf("create = %+v", op)
+	}
+	rows, err := f.st.ListLiveCharacters(context.Background(), accountID)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("live = %+v, %v", rows, err)
+	}
+	charID := rows[0].ID
+
+	c2 := f.dial(t)
+	f.helloChar(t, c2)
+	ids := f.reg.SessionsBySub("test-sub")
+	if len(ids) != 2 {
+		t.Fatalf("sessions = %d, want 2", len(ids))
+	}
+	owner := ids[0]
+	if err := f.reg.BindCharacter(owner, charID); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	for _, want := range []session.State{session.StateCharacterSelected, session.StateInWorld} {
+		cur, _ := f.reg.Get(owner)
+		if err := f.reg.CompareAndSetState(owner, cur.State, want); err != nil {
+			t.Fatalf("cas to %s: %v", want, err)
+		}
+		sendDelete(t, c2, 3, 0)
+		if _, msg := readError(t, c2); msg.Code != proto.ErrorCodeCharacterInUse {
+			t.Fatalf("delete in %s: code = %d, want character_in_use", want, msg.Code)
+		}
+	}
+}
+
+// TestCharLeaveWorldWS proves a silent successful leave: the next S→C
+// frame after 126 is the 121-driven 216, and the registry is clean.
+func TestCharLeaveWorldWS(t *testing.T) {
+	f := newCharFixture(t, false)
+	c := f.dial(t)
+	accountID := f.helloChar(t, c)
+	sendCreate(t, c, 2, validCharCreate(0, "Aria"))
+	if _, op := readCharOp(t, c); op.OK != proto.CharacterOpOK {
+		t.Fatalf("create = %+v", op)
+	}
+	rows, err := f.st.ListLiveCharacters(context.Background(), accountID)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("live = %+v, %v", rows, err)
+	}
+	charID := rows[0].ID
+	ids := f.reg.SessionsBySub("test-sub")
+	sid := ids[0]
+	if err := f.reg.BindCharacter(sid, charID); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	for _, want := range []session.State{session.StateCharacterSelected, session.StateInWorld} {
+		cur, _ := f.reg.Get(sid)
+		if err := f.reg.CompareAndSetState(sid, cur.State, want); err != nil {
+			t.Fatalf("cas: %v", err)
+		}
+	}
+
+	sendLeave(t, c, 3)
+	sendCharList(t, c, 4)
+	// No hidden leave frame: the very next reply is the 216.
+	if _, list := readCharList(t, c); len(list.Characters) != 1 {
+		t.Errorf("list after leave = %+v", list.Characters)
+	}
+	snap, _ := f.reg.Get(sid)
+	if snap.State != session.StateAuthenticated || snap.HasCharacter || snap.CharacterID != 0 {
+		t.Errorf("after leave: %+v", snap)
+	}
+	if _, ok := f.reg.SessionByCharacter(charID); ok {
+		t.Error("character index still present")
+	}
+	if f.exit.callCount() != 1 {
+		t.Fatalf("WorldExit calls = %d, want 1", f.exit.callCount())
+	}
+	ob := f.exit.observedCopy()[0]
+	if ob.State != session.StateInWorld || !ob.HasCharacter || ob.CharacterID != charID {
+		t.Errorf("exit observed %+v, want IN_WORLD bound", ob)
+	}
+}
+
+// TestCharLeaveWorldFailureWS proves a failed flush keeps the session
+// fully bound, and a later retry succeeds.
+func TestCharLeaveWorldFailureWS(t *testing.T) {
+	f := newCharFixture(t, false)
+	c := f.dial(t)
+	accountID := f.helloChar(t, c)
+	sendCreate(t, c, 2, validCharCreate(0, "Aria"))
+	if _, op := readCharOp(t, c); op.OK != proto.CharacterOpOK {
+		t.Fatalf("create = %+v", op)
+	}
+	rows, err := f.st.ListLiveCharacters(context.Background(), accountID)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("live = %+v, %v", rows, err)
+	}
+	charID := rows[0].ID
+	sid := f.reg.SessionsBySub("test-sub")[0]
+	if err := f.reg.BindCharacter(sid, charID); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	for _, want := range []session.State{session.StateCharacterSelected, session.StateInWorld} {
+		cur, _ := f.reg.Get(sid)
+		if err := f.reg.CompareAndSetState(sid, cur.State, want); err != nil {
+			t.Fatalf("cas: %v", err)
+		}
+	}
+
+	f.exit.setFail(true)
+	sendLeave(t, c, 3)
+	if _, msg := readError(t, c); msg.Code != proto.ErrorCodeRetry {
+		t.Fatalf("code = %d, want retry", msg.Code)
+	}
+	snap, _ := f.reg.Get(sid)
+	if snap.State != session.StateInWorld || !snap.HasCharacter || snap.CharacterID != charID {
+		t.Errorf("partial leave: %+v", snap)
+	}
+	if owner, ok := f.reg.SessionByCharacter(charID); !ok || owner != sid {
+		t.Errorf("index = %d,%v", owner, ok)
+	}
+
+	f.exit.setFail(false)
+	sendLeave(t, c, 4)
+	sendCharList(t, c, 5)
+	if _, list := readCharList(t, c); len(list.Characters) != 1 {
+		t.Errorf("list after retry = %+v", list.Characters)
+	}
+}
+
+// TestEnterWorldDelegatedWS guards the T3/T4 boundary: 124 reaches Next
+// exactly once with SendFunc intact, while T3b emits nothing itself.
+func TestEnterWorldDelegatedWS(t *testing.T) {
+	f := newCharFixture(t, true)
+	c := f.dial(t)
+	f.helloChar(t, c)
+
+	sendEnterWorld(t, c, 2, 0)
+	header, payload := readFrame(t, c)
+	if header.Opcode != proto.OpcodeWorldReady {
+		t.Fatalf("opcode = %d, want Next marker 219 (no T3b 217)", header.Opcode)
+	}
+	if _, err := proto.DecodeWorldReady(payload); err != nil {
+		t.Fatalf("decode marker: %v", err)
+	}
+	f.next.mu.Lock()
+	defer f.next.mu.Unlock()
+	if f.next.calls != 1 {
+		t.Fatalf("Next calls = %d, want exactly 1", f.next.calls)
+	}
+	if f.next.headers[0].Opcode != proto.OpcodeEnterWorld {
+		t.Errorf("delegated opcode = %d, want 124 unchanged", f.next.headers[0].Opcode)
+	}
+	var n int
+	if err := f.pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM characters`).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("characters = %d, want 0 (no T3b service operation)", n)
+	}
+	ids := f.reg.SessionsBySub("test-sub")
+	snap, _ := f.reg.Get(ids[0])
+	if snap.State != session.StateAuthenticated || snap.HasCharacter {
+		t.Errorf("session changed by 124: %+v", snap)
 	}
 }

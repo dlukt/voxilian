@@ -514,3 +514,155 @@ func TestRegistryConcurrentSmoke(t *testing.T) {
 		t.Errorf("Len() = %d, want 0 after concurrent churn", n)
 	}
 }
+
+func setupInWorld(t *testing.T, r *Registry, sub string, accountID, characterID int64) ID {
+	t.Helper()
+	id := r.Create(nil)
+	exp := time.Now().Add(time.Hour)
+	if err := r.Authenticate(id, sub, accountID, exp); err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if err := r.BindCharacter(id, characterID); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	for _, s := range []State{StateCharacterSelected, StateInWorld} {
+		cur, _ := r.Get(id)
+		if err := r.CompareAndSetState(id, cur.State, s); err != nil {
+			t.Fatalf("cas to %s: %v", s, err)
+		}
+	}
+	return id
+}
+
+func TestGetByCharacter(t *testing.T) {
+	r := NewRegistry()
+	if _, ok := r.GetByCharacter(99); ok {
+		t.Fatal("unbound character resolved")
+	}
+	id := setupInWorld(t, r, "sub", 7, 99)
+	snap, ok := r.GetByCharacter(99)
+	if !ok {
+		t.Fatal("bound character not resolved")
+	}
+	if snap.ID != id || snap.Sub != "sub" || snap.AccountID != 7 ||
+		!snap.HasCharacter || snap.CharacterID != 99 || snap.State != StateInWorld {
+		t.Errorf("snapshot = %+v", snap)
+	}
+	// Returned snapshots are copies: mutating the caller copy cannot
+	// affect the registry.
+	snap.State = StateConnected
+	if cur, _ := r.Get(id); cur.State != StateInWorld {
+		t.Errorf("registry mutated through snapshot: %+v", cur)
+	}
+	r.Remove(id)
+	if _, ok := r.GetByCharacter(99); ok {
+		t.Error("removed session still resolved")
+	}
+}
+
+func TestCompleteLeaveWorld(t *testing.T) {
+	r := NewRegistry()
+	expBefore := time.Now().Add(time.Hour)
+	id := r.Create(nil)
+	if err := r.Authenticate(id, "leaver", 11, expBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.BindCharacter(id, 55); err != nil {
+		t.Fatal(err)
+	}
+	snap0, _ := r.Get(id)
+	if err := r.CompareAndSetState(id, snap0.State, StateCharacterSelected); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.CompareAndSetState(id, StateCharacterSelected, StateInWorld); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.NextServerSeq(id); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.CompleteLeaveWorld(id, 55); err != nil {
+		t.Fatalf("leave: %v", err)
+	}
+	snap, ok := r.Get(id)
+	if !ok {
+		t.Fatal("session vanished")
+	}
+	if snap.State != StateAuthenticated {
+		t.Errorf("state = %s, want AUTHENTICATED", snap.State)
+	}
+	if snap.HasCharacter || snap.CharacterID != 0 {
+		t.Errorf("binding not cleared: %+v", snap)
+	}
+	if _, taken := r.SessionByCharacter(55); taken {
+		t.Error("character index not removed")
+	}
+	// Identity preserved: sub, account, expiry, auth flag, seq counter.
+	if snap.Sub != "leaver" || snap.AccountID != 11 || !snap.Authenticated ||
+		!snap.TokenExp.Equal(expBefore) {
+		t.Errorf("identity changed: %+v", snap)
+	}
+	if seq, err := r.NextServerSeq(id); err != nil || seq != 2 {
+		t.Errorf("server seq = %d, %v; want 2 (counter preserved)", seq, err)
+	}
+}
+
+func TestCompleteLeaveWorldNoMutationOnFailure(t *testing.T) {
+	r := NewRegistry()
+	id := setupInWorld(t, r, "sub", 7, 99)
+
+	cases := map[string]func() error{
+		"unknown session": func() error { return r.CompleteLeaveWorld(9999, 99) },
+		"wrong character": func() error { return r.CompleteLeaveWorld(id, 100) },
+	}
+	for name, call := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := call()
+			if !errors.Is(err, ErrNotFound) && !errors.Is(err, ErrBadState) {
+				t.Errorf("err = %v, want ErrNotFound/ErrBadState", err)
+			}
+		})
+	}
+	// Wrong state: move to AUTHENTICATED first via a second leave, then
+	// retry the completed leave.
+	if err := r.CompleteLeaveWorld(id, 99); err != nil {
+		t.Fatalf("first leave: %v", err)
+	}
+	if err := r.CompleteLeaveWorld(id, 99); !errors.Is(err, ErrBadState) {
+		t.Errorf("second leave err = %v, want ErrBadState", err)
+	}
+	// Missing binding: fresh authenticated session, never bound.
+	plain := r.Create(nil)
+	if err := r.Authenticate(plain, "plain", 8, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.CompleteLeaveWorld(plain, 1); !errors.Is(err, ErrBadState) {
+		t.Errorf("unbound leave err = %v, want ErrBadState", err)
+	}
+	// The original session is untouched apart from its own completed leave.
+	after, _ := r.Get(id)
+	if after.State != StateAuthenticated || after.HasCharacter {
+		t.Errorf("unexpected mutation: %+v", after)
+	}
+}
+
+func TestCompleteLeaveWorldGuardsStaleIndex(t *testing.T) {
+	r := NewRegistry()
+	a := setupInWorld(t, r, "a", 1, 77)
+	b := r.Create(nil)
+	if err := r.Authenticate(b, "b", 2, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	// Force the index to point at b while a still believes it is bound:
+	// CompleteLeaveWorld on a must fail rather than clear b's index.
+	// (Reached by rebinding bookkeeping, not by public API drift.)
+	r.mu.Lock()
+	r.byChar[77] = b
+	r.mu.Unlock()
+	if err := r.CompleteLeaveWorld(a, 77); !errors.Is(err, ErrBadState) {
+		t.Errorf("err = %v, want ErrBadState on index mismatch", err)
+	}
+	if owner, ok := r.SessionByCharacter(77); !ok || owner != b {
+		t.Errorf("index disturbed: %d, %v", owner, ok)
+	}
+}

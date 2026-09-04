@@ -42,6 +42,15 @@ var (
 	// ErrInvalidSlot reports a slot outside 0/1
 	// (→ 217 rejected for the requesting op).
 	ErrInvalidSlot = errors.New("invalid_slot")
+	// ErrSlotOccupied reports a lost slot-claim race at the store
+	// (→ 202 slot_occupied). Translated from the store sentinel so the
+	// gateway never imports store errors.
+	ErrSlotOccupied = errors.New("slot_occupied")
+	// ErrPersistence reports repository/persistence unavailability:
+	// connection loss, query failure, stale CAS on delete (→ 202 retry
+	// at the WS layer). Corrupt durable content stays ErrInvalidContent
+	// and is never mapped here.
+	ErrPersistence = errors.New("persistence_unavailable")
 	// ErrNotFound reports no live character in the requested slot.
 	ErrNotFound = errors.New("character_not_found")
 	// ErrInvalidContent reports broken trusted creation metadata or
@@ -439,8 +448,9 @@ func NewService(content Content, policy NamePolicy, repo Repository) (*Service, 
 
 // Create validates a creation request and persists the full aggregate
 // (root + abilities + free spell + starter inventory) in one store
-// transaction. Store unique-violations (slot/name race losers) pass
-// through as store.ErrSlotOccupied / store.ErrNameTaken.
+// transaction. Store unique-violations translate to the character
+// boundary (ErrNameUnavailable / ErrSlotOccupied); any other
+// repository failure becomes ErrPersistence. Store errors never escape.
 func (s *Service) Create(ctx context.Context, accountID int64, req CreateRequest) (int64, error) {
 	if req.Slot > 1 {
 		return 0, fmt.Errorf("character: slot = %d, want 0/1: %w", req.Slot, ErrInvalidSlot)
@@ -516,7 +526,17 @@ func (s *Service) Create(ctx context.Context, accountID int64, req CreateRequest
 			Slot:     it.Slot,
 		})
 	}
-	return s.repo.CreateCharacter(ctx, nc)
+	id, err := s.repo.CreateCharacter(ctx, nc)
+	if err != nil {
+		if errors.Is(err, store.ErrNameTaken) {
+			return 0, fmt.Errorf("character: name race lost: %w", ErrNameUnavailable)
+		}
+		if errors.Is(err, store.ErrSlotOccupied) {
+			return 0, fmt.Errorf("character: slot race lost: %w", ErrSlotOccupied)
+		}
+		return 0, fmt.Errorf("character: persist: %w: %w", err, ErrPersistence)
+	}
+	return id, nil
 }
 
 // ListEntry is one domain-level character-list row (spec §6.1):
@@ -528,10 +548,12 @@ type ListEntry struct {
 }
 
 // List returns live characters for one account as list rows.
+// Repository failure becomes ErrPersistence; corrupt durable vitals
+// stay ErrInvalidContent (a server invariant failure, never retry).
 func (s *Service) List(ctx context.Context, accountID int64) ([]ListEntry, error) {
 	rows, err := s.repo.ListLiveCharacters(ctx, accountID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("character: list: %w: %w", err, ErrPersistence)
 	}
 	out := make([]ListEntry, 0, len(rows))
 	for _, r := range rows {
@@ -577,7 +599,7 @@ func (s *Service) FindBySlot(ctx context.Context, accountID int64, slot uint8) (
 	}
 	rows, err := s.repo.ListLiveCharacters(ctx, accountID)
 	if err != nil {
-		return Descriptor{}, err
+		return Descriptor{}, fmt.Errorf("character: lookup: %w: %w", err, ErrPersistence)
 	}
 	for _, r := range rows {
 		if r.Slot == int16(slot) {
@@ -588,7 +610,18 @@ func (s *Service) FindBySlot(ctx context.Context, accountID int64, slot uint8) (
 }
 
 // Delete soft-deletes by durable ID + expected revision (store CAS).
-// Session in-use checks belong to T3b under the account guard, not here.
+// A stale CAS becomes ErrPersistence without exposing the store
+// sentinel; every other repository failure becomes ErrPersistence with
+// its cause preserved (→ 202 retry at the WS layer). The store's CAS
+// semantics are unchanged. Session in-use checks belong to T3b under
+// the account guard, not here.
 func (s *Service) Delete(ctx context.Context, id, expectedRevision int64) (int64, error) {
-	return s.repo.SoftDeleteCharacter(ctx, id, expectedRevision)
+	rev, err := s.repo.SoftDeleteCharacter(ctx, id, expectedRevision)
+	if err != nil {
+		if errors.Is(err, store.ErrStaleRevision) {
+			return 0, fmt.Errorf("character: delete stale revision: %w", ErrPersistence)
+		}
+		return 0, fmt.Errorf("character: delete: %w: %w", err, ErrPersistence)
+	}
+	return rev, nil
 }

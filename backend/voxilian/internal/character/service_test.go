@@ -408,10 +408,15 @@ func TestCreateOrchestration(t *testing.T) {
 		nc.Items[1].ProtoID != testItemCoins || nc.Items[1].Qty != 500 {
 		t.Errorf("items = %+v", nc.Items)
 	}
-	// Store race sentinels pass through untouched.
+	// Store race sentinels translate to the character boundary and
+	// never escape to callers.
 	repo.createErr = store.ErrNameTaken
-	if _, err := svc.Create(context.Background(), 42, validRequest()); !errors.Is(err, store.ErrNameTaken) {
-		t.Errorf("sentinel err = %v, want ErrNameTaken", err)
+	if _, err := svc.Create(context.Background(), 42, validRequest()); !errors.Is(err, ErrNameUnavailable) {
+		t.Errorf("sentinel err = %v, want ErrNameUnavailable", err)
+	}
+	repo.createErr = store.ErrSlotOccupied
+	if _, err := svc.Create(context.Background(), 42, validRequest()); !errors.Is(err, ErrSlotOccupied) {
+		t.Errorf("sentinel err = %v, want ErrSlotOccupied", err)
 	}
 }
 
@@ -730,7 +735,7 @@ func TestServiceDoubleCreateRace(t *testing.T) {
 			} else if ids[i] != winner {
 				t.Fatalf("two winners: %v", ids)
 			}
-		} else if !errors.Is(errs[i], store.ErrSlotOccupied) && !errors.Is(errs[i], store.ErrNameTaken) {
+		} else if !errors.Is(errs[i], ErrSlotOccupied) && !errors.Is(errs[i], ErrNameUnavailable) {
 			t.Fatalf("loser %d err = %v, want slot/name conflict", i, errs[i])
 		}
 	}
@@ -779,8 +784,8 @@ func TestServiceCaseInsensitiveNameRace(t *testing.T) {
 	for _, err := range errs {
 		if err == nil {
 			wins++
-		} else if !errors.Is(err, store.ErrNameTaken) {
-			t.Fatalf("err = %v, want nil or ErrNameTaken", err)
+		} else if !errors.Is(err, ErrNameUnavailable) {
+			t.Fatalf("err = %v, want nil or ErrNameUnavailable", err)
 		}
 	}
 	if wins != 1 {
@@ -789,4 +794,77 @@ func TestServiceCaseInsensitiveNameRace(t *testing.T) {
 	if c := countRows(t, pool, `SELECT COUNT(*) FROM characters WHERE account_id = $1 AND deleted_at IS NULL`, acct); c != 1 {
 		t.Errorf("live rows = %d, want 1", c)
 	}
+}
+
+// TestServiceErrorBoundary proves store failures translate to the
+// character boundary and store sentinels never escape to callers.
+func TestServiceErrorBoundary(t *testing.T) {
+	ctx := context.Background()
+	boom := errors.New("pg unavailable")
+
+	t.Run("create name conflict", func(t *testing.T) {
+		repo := &fakeRepo{createErr: store.ErrNameTaken}
+		svc := newUnitService(t, repo)
+		_, err := svc.Create(ctx, 1, validRequest())
+		if !errors.Is(err, ErrNameUnavailable) {
+			t.Errorf("err = %v, want ErrNameUnavailable", err)
+		}
+		if errors.Is(err, store.ErrNameTaken) {
+			t.Errorf("store sentinel leaked: %v", err)
+		}
+	})
+	t.Run("create slot conflict", func(t *testing.T) {
+		repo := &fakeRepo{createErr: store.ErrSlotOccupied}
+		svc := newUnitService(t, repo)
+		_, err := svc.Create(ctx, 1, validRequest())
+		if !errors.Is(err, ErrSlotOccupied) {
+			t.Errorf("err = %v, want ErrSlotOccupied", err)
+		}
+		if errors.Is(err, store.ErrSlotOccupied) {
+			t.Errorf("store sentinel leaked: %v", err)
+		}
+	})
+	t.Run("create failure", func(t *testing.T) {
+		repo := &fakeRepo{createErr: boom}
+		svc := newUnitService(t, repo)
+		_, err := svc.Create(ctx, 1, validRequest())
+		if !errors.Is(err, ErrPersistence) {
+			t.Errorf("err = %v, want ErrPersistence", err)
+		}
+	})
+	t.Run("list failure", func(t *testing.T) {
+		repo := &fakeRepo{listErr: boom}
+		svc := newUnitService(t, repo)
+		_, err := svc.List(ctx, 1)
+		if !errors.Is(err, ErrPersistence) {
+			t.Errorf("err = %v, want ErrPersistence", err)
+		}
+	})
+	t.Run("lookup failure", func(t *testing.T) {
+		repo := &fakeRepo{listErr: boom}
+		svc := newUnitService(t, repo)
+		_, err := svc.FindBySlot(ctx, 1, 0)
+		if !errors.Is(err, ErrPersistence) {
+			t.Errorf("err = %v, want ErrPersistence", err)
+		}
+	})
+	t.Run("stale delete", func(t *testing.T) {
+		repo := &fakeRepo{deleteErr: store.ErrStaleRevision}
+		svc := newUnitService(t, repo)
+		_, err := svc.Delete(ctx, 9, 0)
+		if !errors.Is(err, ErrPersistence) {
+			t.Errorf("err = %v, want ErrPersistence", err)
+		}
+		if errors.Is(err, store.ErrStaleRevision) {
+			t.Errorf("store sentinel leaked: %v", err)
+		}
+	})
+	t.Run("generic delete failure", func(t *testing.T) {
+		repo := &fakeRepo{deleteErr: boom}
+		svc := newUnitService(t, repo)
+		_, err := svc.Delete(ctx, 9, 0)
+		if !errors.Is(err, ErrPersistence) {
+			t.Errorf("err = %v, want ErrPersistence", err)
+		}
+	})
 }

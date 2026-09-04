@@ -279,6 +279,58 @@ func (r *Registry) SessionByCharacter(characterID int64) (ID, bool) {
 	return id, ok
 }
 
+// GetByCharacter atomically resolves the character index to one
+// immutable snapshot of the bound live session: one read lock covers
+// the index lookup and the entry read, so callers never observe a torn
+// index/entry pair. It returns false when the character is unbound or
+// its indexed session is gone (stale index, treated as unbound).
+func (r *Registry) GetByCharacter(characterID int64) (Snapshot, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	id, ok := r.byChar[characterID]
+	if !ok {
+		return Snapshot{}, false
+	}
+	e, ok := r.byID[id]
+	if !ok {
+		return Snapshot{}, false
+	}
+	return snapshotOf(e), true
+}
+
+// CompleteLeaveWorld atomically completes a leave_world transition
+// (spec §6.1): under ONE write lock it verifies the session exists,
+// is IN_WORLD, holds a character binding for exactly
+// expectedCharacterID, and still owns the character index — then
+// removes the index, clears the binding, and moves the session to
+// AUTHENTICATED. Identity (sub, accountID, tokenExp, connection,
+// server seq) is unchanged. No public snapshot can show an
+// intermediate AUTHENTICATED-yet-bound or IN_WORLD-yet-unbound state.
+// Any precondition failure returns ErrBadState/ErrNotFound and leaves
+// the registry untouched.
+func (r *Registry) CompleteLeaveWorld(id ID, expectedCharacterID int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.byID[id]
+	if !ok {
+		return fmt.Errorf("session: leave unknown session: %w", ErrNotFound)
+	}
+	if e.state != StateInWorld {
+		return fmt.Errorf("session: leave in %s: %w", e.state, ErrBadState)
+	}
+	if !e.hasCharacter || e.characterID != expectedCharacterID {
+		return fmt.Errorf("session: leave character mismatch: %w", ErrBadState)
+	}
+	if owner, taken := r.byChar[e.characterID]; !taken || owner != id {
+		return fmt.Errorf("session: leave index mismatch: %w", ErrBadState)
+	}
+	delete(r.byChar, e.characterID)
+	e.characterID = 0
+	e.hasCharacter = false
+	e.state = StateAuthenticated
+	return nil
+}
+
 // BindCharacter binds characterID to the session and records the
 // character → session index. Binding a character that is already bound
 // to a different live session fails with ErrCharacterInUse and changes
