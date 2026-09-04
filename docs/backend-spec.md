@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.12 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.13 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -919,7 +919,12 @@ serialize on the one physical writer gate (§7.1.7):
 - Hard authorization-deadline `202 error{session_expired}`: likewise a
   best-effort direct low-level write bounded by the existing deadline
   write context, then connection close. The 90-second authorization
-  semantics (§6.2.2) do not change.
+  semantics (§6.2.2) do not change. Both hard-expiry paths — the
+  synchronous on-message expiry gate and the scheduled idle deadline
+  callback — use the SAME bounded direct terminal-write budget
+  (context.Background() plus the deadline write budget): neither may
+  inherit an effectively unbounded request context. Both bypass normal
+  queue capacity and share the one physical writer gate (§7.1.7).
 
 #### 7.1.10 Slow-client disconnect and full-resync semantics
 
@@ -929,72 +934,212 @@ reconnect starts a brand-new session and a full baseline (`new WS →
 hello → fresh enter_world → fresh full baseline`). Queued frames from
 the old socket are never replayed — there is no replay buffer (§6.1).
 
-#### 7.1.11 ACK flow control — frozen for M3-T5b
+#### 7.1.11 ACK flow control — frozen for M3-T5b (clarified v0.3.13)
 
 Opcode `125 ack {ackSeq u32}` remains cumulative: the highest S→C
-sequence fully applied by the client. No replay buffer exists. The
-window does NOT gate the initial baseline: M3 has one synchronous
-per-connection read loop, so the client cannot process an inbound ACK
-concurrently while its server-side `124 enter_world` handler streams
-the baseline. Baseline `217/203/218/220/219` traffic is governed by
-transport/queue backpressure only — never by the application ACK
-window, so no baseline deadlock is possible.
+sequence fully applied by the client (v0.3.12 semantics). No replay
+buffer exists and no success reply is ever sent for a valid, stale, or
+duplicate ACK.
 
-When `CompleteEnterWorld` changes `CHARACTER_SELECTED → IN_WORLD`, the
-flow-control baseline initializes to the current server S→C sequence —
-the already-written `219 world_ready` sequence (`lastAck =
-lastFlowSent = worldReadySeq` for flow-control purposes). This
-establishes that the baseline itself is outside the steady-state ACK
-lag window; it does not synthesize an actual client ACK. Every normal
-S→C application frame allocated while IN_WORLD advances the sent-flow
-sequence; pre-world AUTHENTICATED traffic and baseline
-CHARACTER_SELECTED traffic do not consume the window. A successful
-`leave_world → AUTHENTICATED` clears the accounting, and a later enter
-initializes a NEW baseline at its new `world_ready` sequence — no stale
-ACK debt carries across re-enter or full resync.
-
-T5b enforces: the number of sent IN_WORLD frames not cumulatively
-ACKed MUST stay ≤ `max_unacked_messages`. No payloads are retained. If
-sending the next frame would exceed the limit, the session is
-classified slow, disconnected/fail-closed, and that next frame is not
-written. No replay.
-
-ACK acceptance uses modulo-2³² serial arithmetic via the M2 helpers
-(`Serial32After`/`Serial32Before`): `0` is legitimately after
-`MaxUint32` within the valid serial window; the configured window is
-far below 2³¹, so half-range ambiguity never occurs during valid
-operation. In IN_WORLD: `ack == lastAck` is a duplicate (no-op); `ack`
-before `lastAck` is stale (no-op); `lastAck < ack <= lastFlowSent` is a
-valid cumulative advance; `ack` after `lastFlowSent` is future/invalid
-→ `202 protocol_error`. A valid, stale, or duplicate ACK receives no
-success reply. In CHARACTER_SELECTED — before the flow window is
-initialized — a structurally valid ACK is accepted as a no-op with no
-response (the lifecycle table already permits opcode 125 there); a
-malformed payload still maps to `202 protocol_error`.
-
-#### 7.1.12 Saturation metrics — frozen for M3-T5b
-
-Exact Prometheus names (no session/account/character labels; no
-high-cardinality identifiers):
+**Session-scoped ephemeral flow state.** Each live session owns exactly
+one ephemeral ACK-flow epoch:
 
 ```text
-vox_session_drops_total{reason}
-vox_outbound_queue_depth_messages{lane}
-vox_outbound_queue_depth_bytes{lane}
-vox_outbound_state_drops_total{reason}
-vox_outbound_state_coalesced_total
-vox_outbound_ack_lag_messages
+flowActive   bool
+lastAck      u32
+lastFlowSent u32
 ```
 
-Queue-depth lanes are exactly `lane="critical"` and `lane="state"` — no
-opcode label, no entity label. Initial stable drop reasons are
+This state is never persisted, never appears as a separate protocol
+message, and is discarded with the session on removal/disconnect. No
+replay payloads are stored — the epoch is three counters only.
+
+**The flow epoch begins atomically with IN_WORLD.** `CompleteEnterWorld`
+validates `CHARACTER_SELECTED` plus its matching binding/index, obtains
+the current S→C server sequence — the already physically-written `219
+world_ready` sequence — and in ONE registry mutation sets:
+
+```text
+State        = IN_WORLD
+flowActive   = true
+lastAck      = currentServerSeq (the 219 seq)
+lastFlowSent = currentServerSeq (the 219 seq)
+```
+
+The lifecycle transition and the flow baseline are one atomic
+session-registry operation: there is never an observable IN_WORLD
+interval with an uninitialized ACK epoch, and no second public
+"initialize ACK state" step exists. The epoch does not synthesize a
+client ACK; it establishes that the baseline itself is outside the
+steady-state lag window. The `219` sequence is captured as-is (never
+`worldReadySeq + 1`; no additional sequence is allocated).
+
+**The flow epoch clears atomically on leave.** `CompleteLeaveWorld`
+moves `IN_WORLD/bound → AUTHENTICATED/unbound` and in the SAME registry
+mutation sets `flowActive = false; lastAck = 0; lastFlowSent = 0`. This
+covers both a normal `126 leave_world` and a forced takeover
+old-session leave. A later enter starts a completely new epoch at its
+new `world_ready` sequence — old ACK debt never survives leave/re-enter
+or full resync.
+
+**Begin/abort invariants.** `BeginEnterWorld` starts the
+`CHARACTER_SELECTED` phase with `flowActive = false`; a stale active
+flow epoch at BeginEnterWorld time is an internal invariant failure
+(zero lifecycle mutation). `AbortEnterWorld` returns to AUTHENTICATED
+with the flow state inactive and cleared — no partial epoch survives a
+failed baseline. Baseline `CHARACTER_SELECTED` traffic is therefore
+never ACK-gated: M3 has one synchronous per-connection read loop, so
+the client cannot process an inbound ACK concurrently while its
+server-side `124 enter_world` handler streams the baseline, and
+baseline `217/203/218/220/219` traffic is governed by transport/queue
+backpressure only — never by the application ACK window. No baseline
+deadlock is possible.
+
+**Normal IN_WORLD sequence reservation is flow-controlled.** For every
+NORMAL queued S→C frame, ONE logical registry operation runs while the
+physical writer slot is held (atomic against ACK application and
+lifecycle transitions):
+
+```text
+inspect session state
+if not IN_WORLD:
+    allocate the normal S→C seq; no ACK-window accounting
+if IN_WORLD:
+    require flowActive (else internal invariant failure)
+    currentLag = serial distance(lastAck → lastFlowSent)
+    if currentLag >= max_unacked_messages:
+        return the ack_lag slow-client failure;
+        DO NOT allocate a sequence; DO NOT write the frame
+    allocate the next S→C sequence; lastFlowSent = that sequence;
+    the frame may now be physically written
+```
+
+Max-unacked semantics: `lag <= max_unacked_messages` is legal. When lag
+already equals the configured maximum, the NEXT normal IN_WORLD frame
+is rejected as `ack_lag` — no new seq, no write, fail-closed
+disconnect, reconnect/full resync as the only recovery. Example with
+`max = 2`: baseline leaves lag 0; frame A written → lag 1; frame B
+written → lag 2; frame C attempted → ack_lag disconnect and C receives
+no sequence and is never written.
+
+**Why ACK accounting happens at physical-write selection.** Messages
+that are `queued`, `coalesced-away`, `evicted`, `dropped`, or failed at
+admission-timeout never consume ACK state: the flow window advances
+only when the writer has SELECTED a NORMAL frame for physical
+transmission and is about to allocate its S→C sequence. This preserves
+the T5a invariant `no physical frame → no seq → no ACK debt`.
+
+**Direct terminal frames are outside the ACK window.** The two terminal
+exceptions of §7.1.9 (`202 kicked`, hard-deadline `202
+session_expired`) remain outside ACK-window accounting: they still
+allocate the session's normal S→C serial number through the direct
+physical writer path, but the session terminates immediately afterward,
+so they never create continuing ACK debt.
+
+**Exact ACK classifications (IN_WORLD).** Ordering uses the M2 serial
+helpers (`Serial32After`/`Serial32Before`; no rival arithmetic). `0` is
+legitimately after `MaxUint32` within the valid serial window:
+
+```text
+ack == lastAck                          duplicate  → no-op, no reply
+ack serially before lastAck             stale      → no-op, no reply
+lastAck < ack <= lastFlowSent (serial)  valid cumulative advance
+                                        → lastAck = ack, no reply
+ack serially after lastFlowSent         future/invalid → 202 protocol_error
+exact 2^31 ambiguous distance           future/invalid → 202 protocol_error
+```
+
+The configured window is far below 2³¹, so half-range ambiguity never
+occurs during valid operation; an ACK at exactly the half-range
+distance is treated as future/invalid, never as stale. The lifecycle
+permission table (§6.1) runs before ACK handling — e.g.
+`AUTHENTICATED + 125 → 202 bad_state` — and the ACK handler never
+duplicates that state logic.
+
+**CHARACTER_SELECTED ACK.** A structurally valid `125` in
+`CHARACTER_SELECTED` is a no-op with no reply and no flow-epoch
+initialization or mutation; a malformed payload still maps to `202
+protocol_error`. This prevents baseline/read-loop deadlocks.
+
+T5b enforces: the number of sent IN_WORLD frames not cumulatively ACKed
+MUST stay ≤ `max_unacked_messages`. No payloads are retained. If
+sending the next frame would exceed the limit, the session is
+classified slow, disconnected/fail-closed, and that next frame is not
+written. No replay. Reconnect (new WS + `hello`) ALWAYS performs a full
+resync (fresh snapshots); previous seq state is discarded (§7.1.10).
+
+#### 7.1.12 Saturation metrics — frozen for M3-T5b (types clarified v0.3.13)
+
+Exact Prometheus names AND types (no session/account/character labels;
+no high-cardinality identifiers):
+
+```text
+vox_session_drops_total{reason}           CounterVec
+vox_outbound_queue_depth_messages{lane}   HistogramVec
+vox_outbound_queue_depth_bytes{lane}      HistogramVec
+vox_outbound_state_drops_total{reason}    CounterVec
+vox_outbound_state_coalesced_total        Counter
+vox_outbound_ack_lag_messages             Histogram
+```
+
+**Why depth/lag are histograms.** The T5a observer emits event
+snapshots and deliberately carries no session ID. `queue_depth_*` and
+`ack_lag_messages` are therefore event-sampled DISTRIBUTIONS, not
+per-session gauges: they MUST NOT be implemented as "last session to
+update wins" global gauges, and no session label is ever added.
+
+**Queue-depth observation semantics.** Each T5a
+`QueueDepth(lane, messages, bytes)` callback adds ONE observation to
+the corresponding histogram. The values continue to mean queued lane
+depth only — not the currently-active physical write. Resident budget
+enforcement (§7.1.2) remains unchanged and DOES include the active
+write; metrics and budget accounting intentionally describe different
+things (`budget = queued + active write`, `depth histogram = queued
+lane depth`).
+
+**Deterministic MVP histogram buckets:**
+
+```text
+messages: prometheus.ExponentialBuckets(1, 2, 17)
+          → 1 .. 65536 (+Inf), matching the message ceiling
+bytes:    prometheus.ExponentialBuckets(1024, 2, 17)
+          → 1 KiB .. 64 MiB (+Inf), matching the byte ceiling
+ack lag:  prometheus.ExponentialBuckets(1, 2, 21)
+          → 1 .. 1,048,576 (+Inf), covering the 1,000,000 window cap
+```
+
+Zero-valued observations naturally fall into the first bucket.
+
+**Frozen label values.** Queue-depth lanes are exactly `lane="critical"`
+and `lane="state"` — no opcode label, no entity label, no other lane
+value. `vox_session_drops_total` reasons are exactly
 `critical_queue_saturated`, `reliable_enqueue_timeout`, `write_timeout`,
 and `ack_lag`; forced `kicked` and `session_expired` are NOT
-backpressure drop reasons for this metric. T5a exposes only a narrow
-no-op-by-default observer seam — sufficient to observe queue depth
-messages/bytes per lane, state dropped, state coalesced, and session
-slow-drop reason — so T5b can attach Prometheus without rewriting queue
-internals; the core queue does not import Prometheus.
+backpressure drop reasons for this metric. `vox_outbound_state_drops_total`
+reasons are exactly the T5a internal classifications `evicted`,
+`saturated`, and `closed`; no opcode/entity/session labels.
+
+**ACK-lag observations.** `vox_outbound_ack_lag_messages` observes the
+current lag after: a successful NORMAL IN_WORLD sequence allocation, a
+valid cumulative ACK application, a duplicate ACK, a stale ACK, and a
+flow-epoch initialization (0). A future/invalid ACK does not mutate
+flow state and observes nothing; an ACK-lag rejection observes no
+fictional next lag because the rejected frame was not sent, and a frame
+whose physical write fails after reservation is not reported as
+delivered ACK lag (the session is closing anyway).
+
+**No arbitrary label creation.** The Prometheus adapter whitelists the
+frozen `lane`, session-drop-reason, and state-drop-reason values.
+Unexpected internal telemetry strings MUST NOT create arbitrary new
+label series — ignoring an unknown internal value is preferable to
+accidental high-cardinality metric creation. No user-provided
+diagnostic string ever becomes a metric label.
+
+T5a exposes only a narrow no-op-by-default observer seam — sufficient
+to observe queue depth messages/bytes per lane, state dropped, state
+coalesced, session slow-drop reason, and (T5b) current ACK lag — so T5b
+attaches Prometheus without rewriting queue internals; the core queue
+does not import Prometheus.
 
 The internal-delivery rule is unchanged in spirit: sim→gateway channels
 are bounded with defined overload behavior (shed newest movement first,
@@ -1501,6 +1646,11 @@ ledger is never replayed.
 
 ## 14. Version history
 
+- v0.3.13: clarify final M3 ACK/observability semantics — ACK epoch is
+  atomically coupled to IN_WORLD lifecycle, normal write sequence allocation
+  enforces max-unacked before assigning a seq, direct terminal frames remain
+  outside the window, and frozen outbound metric names are typed as counters
+  plus event-sampled histograms with bounded label sets.
 - v0.3.12: freeze M3 outbound backpressure semantics — exact per-session
   queue budgets, critical/state lane behavior, physical-write-preserving
   SendFunc, non-blocking future-sim producers, terminal-control bypasses,

@@ -1,6 +1,6 @@
 # Voxilian Backend — Implementation Plan (v1.2)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.12).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.13).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -216,7 +216,7 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M3-T4a | M1-T7a, M2-T3b, M2-T3c, M3-T3b | `backend/voxilian/internal/{gateway,session}` |
 | M3-T4b | M3-T4a | `backend/voxilian/internal/{gateway,session}` |
 | M3-T5a | M3-T4b | `backend/voxilian/internal/{gateway,config}` |
-| M3-T5b | M3-T5a | `backend/voxilian/internal/{gateway,observe}` |
+| M3-T5b | M3-T5a | `backend/voxilian/internal/{gateway,session,observe}` |
 | M4-T1, T2, T5 | M2-T3a/b, M3-T1 | `backend/voxilian/internal/sim` |
 | M4-T3a…c, T4 | M1-T7a…c (CAS), M3-T1 | `backend/voxilian/internal/sim`, `internal/store` |
 | M5-T1…T6 | M4-T1, M4-T2 | `backend/voxilian/internal/sim` (combat/vitals/intents) |
