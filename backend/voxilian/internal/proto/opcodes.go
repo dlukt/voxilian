@@ -1,20 +1,44 @@
 package proto
 
-// Opcode constants for the connect / re-auth / error and character
-// lifecycle messages (M2-T2). Numbers are exact per docs/backend-spec.md
-// §6.1–§6.2. Opcodes for later tasks (102–120 gameplay intents,
-// 203–215 entity/stat, 211/212/218/220 containers) are NOT defined here.
+// Opcode constants for the connect / re-auth / error, character
+// lifecycle (M2-T2), and gameplay intent (M2-T3a) messages. Numbers are
+// exact per docs/backend-spec.md §6.1–§6.3. Opcodes for later tasks
+// (203–215 entity/stat, 211/212/218/220 containers) are NOT defined here.
 //
 // Directions (no runtime enforcement in this codec):
 //
-//	C→S: Hello, Reauth, CharacterListRequest, CharacterCreate,
+//	C→S: Hello, Reauth, Move–RespawnAck (102–120),
+//	     CharacterListRequest, CharacterCreate,
 //	     CharacterDelete, EnterWorld, Ack, LeaveWorld
 //	S→C: Welcome, ReauthOK, Error,
 //	     CharacterListResult, CharacterOp, WorldReady
 const (
-	// C→S connect / character lifecycle.
-	OpcodeHello           uint16 = 100
-	OpcodeReauth          uint16 = 101
+	// C→S connect.
+	OpcodeHello  uint16 = 100
+	OpcodeReauth uint16 = 101
+
+	// C→S gameplay intents.
+	OpcodeMove         uint16 = 102
+	OpcodeAttack       uint16 = 103
+	OpcodeCast         uint16 = 104
+	OpcodeUse          uint16 = 105
+	OpcodeGet          uint16 = 106
+	OpcodeDrop         uint16 = 107
+	OpcodePut          uint16 = 108
+	OpcodeGive         uint16 = 109
+	OpcodeOffer        uint16 = 110
+	OpcodeCounter      uint16 = 111
+	OpcodeAccept       uint16 = 112
+	OpcodeCancel       uint16 = 113
+	OpcodeBuy          uint16 = 114
+	OpcodeRest         uint16 = 115
+	OpcodeEat          uint16 = 116
+	OpcodeSay          uint16 = 117
+	OpcodeSayGroup     uint16 = 118
+	OpcodeSafetyToggle uint16 = 119
+	OpcodeRespawnAck   uint16 = 120
+
+	// C→S character lifecycle.
 	OpcodeCharacterList   uint16 = 121
 	OpcodeCharacterCreate uint16 = 122
 	OpcodeCharacterDelete uint16 = 123

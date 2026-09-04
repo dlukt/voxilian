@@ -62,4 +62,10 @@ var (
 	// ErrEntryTooLarge reports "entry_too_large": a single entry's bytes
 	// exceed the u16 entryLen range.
 	ErrEntryTooLarge = errors.New("entry_too_large")
+
+	// ErrStableIDOutOfRange reports "stable_id_out_of_range": a stable
+	// catalog/listing namespace ID exceeds the u16 range even though its
+	// union carrier on the wire is wider (e.g. Use kind=0 IDs in the
+	// fixed-u32 payload must still fit u16).
+	ErrStableIDOutOfRange = errors.New("stable_id_out_of_range")
 )
