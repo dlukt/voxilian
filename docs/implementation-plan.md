@@ -1,6 +1,6 @@
 # Voxilian Backend — Implementation Plan (v1.2)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.7).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.8).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.

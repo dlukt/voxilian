@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.7 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.8 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -45,7 +45,7 @@ server-reconcile, browser/web export specifics.
 | sqlc | **v1.31.1** | Generate typed queries from SQL; config `sqlc.yaml`, `pgx/v5` emit |
 | goose | `github.com/pressly/goose/v3` **v3.27.x** | `migrations/*.sql`, embed + `voxilian migrate` cobra subcommand |
 | CLI | cobra (already `v1.10.2` in `go.mod`) | `voxilian serve / migrate / admin / seed` |
-| WS | `github.com/coder/websocket` (current) | Pick over archived gorilla; single maintained dep |
+| WS | `github.com/coder/websocket` **v1.8.15** | Pick over archived gorilla; single maintained dep |
 | OIDC/JWT | TBD at implementation (`lestrrat-go/jwx` v3 vs `golang-jwt/jwt` + JWKS fetch) | Access-token validation against Keycloak JWKS (D6) |
 | Logging | `log/slog` (stdlib) | JSON in prod, text in dev |
 | Metrics | Prometheus client (current) + `/metrics` | Counters/histograms per §11 |
@@ -173,8 +173,17 @@ bytes; chat text max 512; `accessToken` max 8 KiB — Keycloak JWTs with
 roles/claims routinely exceed 1 KiB); `array` = `u16 count + elements`
 (max 1024 elements); `cell` = `i32 cx + i32 cz`; `pos` = `3×i32`
 millimeters (fixed-point, deterministic); angles `u16` 0–4095 (M59's
-12-bit convention). Max frame 64 KiB — larger frames are rejected with
-`202 error`, never parsed. Codecs use stdlib only — Go
+12-bit convention). The application frame ceiling remains exactly
+64 KiB (`proto.MaxFrameSize` = 65536). The WebSocket connection MUST
+set its message read limit to 65536 bytes. A message that exceeds the
+WebSocket read limit is never parsed and MAY be terminated directly by
+the transport with WebSocket status 1009 (Message Too Big). This is
+the only transport-level exception to the usual `202 protocol_error`
+response rule, because the application does not receive a complete
+bounded frame from which to produce a protocol reply. Frames that are
+received by the application but are malformed for other reasons use
+`202 protocol_error` and do not cause a disconnect on the first offense
+unless continuing the connection is unsafe. Codecs use stdlib only — Go
 `encoding/binary`, Godot `PackedByteArray.encode_*/decode_*` (both C++,
 fast on low-end; no protobuf/GDExtension weight). Protobuf is the
 documented escape hatch if hand maintenance ever stops scaling; the
@@ -189,6 +198,17 @@ within a `protoVersion`). For repeated structures this is NOT enough
 the remainder. Changing an entry layout is therefore a `msg_version`
 bump, never a silent break; removing/renaming fields is a
 `protoVersion` break.
+Runtime message versions start at 1. Every currently frozen message
+layout in `protoVersion` 1 uses `msg_version = 1`. An additive change
+to one opcode increments only that opcode's `msg_version`; other
+opcodes remain at their existing versions. Receivers MUST continue
+decoding the known prefix and ignoring unknown trailing fields as
+already specified. `msg_version = 0` is not emitted by normal runtime
+senders. The M2 golden fixtures deliberately use 0 as fixture-only
+test data and remain valid decoder compatibility vectors. There is no
+`msg_version` negotiation protocol, and a receiver MUST NOT reject an
+incoming message merely because its `msg_version` is greater than 1;
+M2 forward-compatible decoding remains binding.
 Sequencing: header `seq` is a per-session `u32` counter (S→C and C→S
 independent). Comparison is modulo-2³² serial arithmetic (RFC 1982
 style); wraparound is normal, not an error. Header `tick` is the `u32`
@@ -362,6 +382,48 @@ holds dirty in-memory state.
   client predictions — the 0.5 m rule is enforced client-side against
   authoritative snapshots; server-side anomaly detection (§11) stays an
   independent tripwire.
+
+### 6.4 `202 error` numeric registry (frozen, v0.3.8)
+
+The wire layout is unchanged: `202 error {code u16, message string}`.
+The stable numeric registry is:
+
+```text
+0   reserved / unspecified
+1   bad_state
+2   protocol_error
+3   session_expired
+4   kicked
+5   character_in_use
+6   retry
+7   name_taken
+8   slot_occupied
+9   bad_stats
+10  bad_budget
+11  rate_limited
+12  invalid_handle
+```
+
+Rules:
+
+- `0` MUST NOT be emitted for a currently defined error reason.
+- Numeric codes are the machine-readable contract. `message` is
+  diagnostic/human-readable context and MUST NOT be parsed by clients
+  for control flow.
+- Clients MUST tolerate unknown future numeric error codes and may
+  display/log `message`.
+- Adding a new numeric code is additive and does not change the `202`
+  message layout or require a `msg_version` bump.
+- Existing numeric meanings MUST NEVER be reassigned.
+  Removing/reinterpreting an existing numeric meaning is a
+  `protoVersion`-breaking change.
+- `protocol_error` is the reason for protocol-level problems such as:
+  unsupported/unknown opcode, a client sending an S→C-only opcode, a
+  non-binary WebSocket application message, a malformed frame below the
+  transport read ceiling, or a malformed hello/reauth payload.
+- `bad_state` is ONLY a known C→S opcode that is structurally valid but
+  not permitted in the session's current lifecycle state (§6.1).
+  `bad_state` MUST NOT be used for unknown opcodes.
 
 ## 7. In-memory ephemeral state (no external store)
 
@@ -874,6 +936,9 @@ ledger is never replayed.
 
 ## 14. Version history
 
+- v0.3.8: freeze M3 gateway wire semantics — runtime msg_version starts
+  at 1, stable 202 error-code registry, coder/websocket v1.8.15 pin, and
+  bounded WebSocket oversize handling via transport status 1009.
 - v0.3.7: freeze M2-T3c wire layouts — complete inventory_delta
   entry v1, explicit inventory removal via 206 handle invalidation, and
   length-prefix chunk_fragment bytes so msg_version trailing extensions
