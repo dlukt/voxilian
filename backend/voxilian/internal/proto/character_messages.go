@@ -4,9 +4,25 @@ import "fmt"
 
 // Character lifecycle messages: opcodes 121–126 (C→S) and 216, 217, 219
 // (S→C). This is a wire codec only: no session-state enforcement, no
-// display-name rules, no slot/stat/budget validation, no mapping of
-// CharacterOp raw values to named operations. Structural widths,
+// display-name rules, no slot/stat/budget validation. Structural widths,
 // string wire limits/UTF-8, and array count limits are the only checks.
+// The 217 character_op op/ok values below are the frozen numeric registry
+// (spec v0.3.10 §6.1.1); the codec still round-trips arbitrary raw values
+// so future additive values decode without a codec change.
+
+// CharacterOp op values for opcode 217 (spec §6.1.1).
+const (
+	CharacterOpCreate     uint8 = 1
+	CharacterOpDelete     uint8 = 2
+	CharacterOpEnterWorld uint8 = 3
+)
+
+// CharacterOp ok values for opcode 217 (spec §6.1.1): success vs
+// simple rejection. Rich failures use the 202 error registry instead.
+const (
+	CharacterOpRejected uint8 = 0
+	CharacterOpOK       uint8 = 1
+)
 
 // CharacterListRequest is opcode 121 (C→S): empty request; the server
 // answers with opcode 216.
@@ -269,8 +285,8 @@ func DecodeCharacterList(d *Decoder) (CharacterList, error) {
 }
 
 // CharacterOp is opcode 217 (S→C): {op u8, ok u8}. Both fields are raw
-// wire values; no numeric operation/result mapping is frozen here, and
-// OK is intentionally not a Go bool.
+// wire values carrying the frozen registry above (OK is intentionally
+// not a Go bool); unknown future values still round-trip.
 type CharacterOp struct {
 	Op uint8
 	OK uint8

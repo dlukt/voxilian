@@ -26,6 +26,8 @@ type Store interface {
 	UpsertCatalogBatch(ctx context.Context, batch CatalogBatch, allowDowngrade bool) error
 	LoadCatalogRegistry(ctx context.Context) (*CatalogRegistry, error)
 	EnsureAccount(ctx context.Context, keycloakSub string, email *string) (int64, error)
+	CreateCharacter(ctx context.Context, nc NewCharacter) (int64, error)
+	ListLiveCharacters(ctx context.Context, accountID int64) ([]LiveCharacter, error)
 }
 
 // BankSnapshot is the complete bank write: composite identity plus the
@@ -36,6 +38,65 @@ type BankSnapshot struct {
 	System           string
 	ExpectedRevision int64
 	Balance          int64
+}
+
+// NewCharacterAbility is one ability row of a creation aggregate:
+// stable catalog ID plus server-resolved initial ability percentage.
+// Atrophy always starts false (no field: the store hard-codes it).
+type NewCharacterAbility struct {
+	ID      int32
+	Ability int16
+}
+
+// NewCharacterItem is one starter-inventory template of a creation
+// aggregate. Empty Enchants persists as {}.
+type NewCharacterItem struct {
+	ProtoID  int32
+	Qty      int32
+	Hits     int32
+	Enchants []byte
+	Slot     string
+}
+
+// NewCharacter is the complete creation aggregate (spec §9): root
+// fields plus abilities plus starter inventory. Face/Vitals/
+// Advancement carry already-encoded JSON. No proto/gen/pgx types.
+type NewCharacter struct {
+	AccountID int64
+	Slot      int16
+	Name      string
+	Gender    int16
+	Face      []byte
+
+	Might     int16
+	Intellect int16
+	Stamina   int16
+	Agility   int16
+	Mysticism int16
+	Aim       int16
+
+	Karma       int32
+	Hometown    string
+	PosX        int64
+	PosY        int64
+	PosZ        int64
+	Vitals      []byte
+	Advancement []byte
+	Flags       int32
+
+	Spells []NewCharacterAbility
+	Skills []NewCharacterAbility
+	Items  []NewCharacterItem
+}
+
+// LiveCharacter is the store-domain list row: identity plus the fields
+// character-list summaries and slot lookup need.
+type LiveCharacter struct {
+	ID       int64
+	Slot     int16
+	Name     string
+	Revision int64
+	Vitals   []byte
 }
 
 // PGStore is the concrete PostgreSQL Store. Construct via New; methods
