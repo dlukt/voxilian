@@ -7,6 +7,8 @@ import (
 
 	"github.com/dlukt/voxilian/internal/store/gen"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -23,6 +25,7 @@ type Store interface {
 	SaveBankBalance(ctx context.Context, snap BankSnapshot) (int64, error)
 	UpsertCatalogBatch(ctx context.Context, batch CatalogBatch, allowDowngrade bool) error
 	LoadCatalogRegistry(ctx context.Context) (*CatalogRegistry, error)
+	EnsureAccount(ctx context.Context, keycloakSub string, email *string) (int64, error)
 }
 
 // BankSnapshot is the complete bank write: composite identity plus the
@@ -213,4 +216,40 @@ func (s *PGStore) UpsertCatalogBatch(ctx context.Context, batch CatalogBatch, al
 // snapshot (see catalog.go).
 func (s *PGStore) LoadCatalogRegistry(ctx context.Context) (*CatalogRegistry, error) {
 	return loadCatalogRegistry(ctx, s.pool)
+}
+
+// EnsureAccount maps a validated Keycloak subject to its durable
+// account, auto-provisioning the row on first login (spec §6.2.1). An
+// existing subject returns its ID without touching the stored email —
+// login is not profile synchronization. A new row stores the validated
+// email (CITEXT) or NULL when absent. Concurrent first logins for one
+// subject converge: a UNIQUE-race loser re-reads by sub and returns the
+// winner's ID instead of failing the login.
+func (s *PGStore) EnsureAccount(ctx context.Context, keycloakSub string, email *string) (int64, error) {
+	if keycloakSub == "" {
+		return 0, errors.New("store: ensure account: empty sub")
+	}
+	q := gen.New(s.pool)
+	if acct, err := q.GetAccountByKeycloakSub(ctx, keycloakSub); err == nil {
+		return acct.ID, nil
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return 0, fmt.Errorf("store: ensure account: lookup: %w", err)
+	}
+	var em pgtype.Text
+	if email != nil && *email != "" {
+		em = pgtype.Text{String: *email, Valid: true}
+	}
+	acct, err := q.CreateAccount(ctx, gen.CreateAccountParams{KeycloakSub: keycloakSub, Email: em})
+	if err == nil {
+		return acct.ID, nil
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		winner, rerr := q.GetAccountByKeycloakSub(ctx, keycloakSub)
+		if rerr != nil {
+			return 0, fmt.Errorf("store: ensure account: re-read after conflict: %w", rerr)
+		}
+		return winner.ID, nil
+	}
+	return 0, fmt.Errorf("store: ensure account: create: %w", err)
 }

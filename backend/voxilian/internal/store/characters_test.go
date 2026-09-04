@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/dlukt/voxilian/internal/simtest"
@@ -242,5 +243,93 @@ func TestCharacterReads(t *testing.T) {
 	}
 	if _, err := q.GetLiveCharacterForAccount(ctx, gen.GetLiveCharacterForAccountParams{ID: c0.ID, AccountID: a1.ID}); !isNoRows(err) {
 		t.Fatalf("deleted err = %v, want NoRows", err)
+	}
+}
+
+func strptr(s string) *string { return &s }
+
+// TestEnsureAccountKeepsEmail proves provisioning stores the first-seen
+// email and never re-synchronizes it on later logins.
+func TestEnsureAccountKeepsEmail(t *testing.T) {
+	pool, q := openQueries(t)
+	ctx := context.Background()
+	st, err := New(pool, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	first, err := st.EnsureAccount(ctx, "sub-a", strptr("first@example.com"))
+	if err != nil || first <= 0 {
+		t.Fatalf("EnsureAccount new = %d, %v", first, err)
+	}
+	again, err := st.EnsureAccount(ctx, "sub-a", strptr("changed@example.com"))
+	if err != nil || again != first {
+		t.Fatalf("EnsureAccount existing = %d, %v; want %d", again, err, first)
+	}
+	row, err := q.GetAccountByKeycloakSub(ctx, "sub-a")
+	if err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	if !row.Email.Valid || row.Email.String != "first@example.com" {
+		t.Errorf("durable email = %+v, want first@example.com", row.Email)
+	}
+	// Absent email provisions NULL, not empty string.
+	noid, err := st.EnsureAccount(ctx, "sub-b", nil)
+	if err != nil || noid <= 0 || noid == first {
+		t.Fatalf("EnsureAccount no-email = %d, %v", noid, err)
+	}
+	row, err = q.GetAccountByKeycloakSub(ctx, "sub-b")
+	if err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	if row.Email.Valid {
+		t.Errorf("durable email = %+v, want NULL", row.Email)
+	}
+	if _, err := st.EnsureAccount(ctx, "", strptr("x@y")); err == nil {
+		t.Error("empty sub must fail")
+	}
+}
+
+// TestEnsureAccountConcurrentFirstLogin proves simultaneous first logins
+// converge on one durable row and one ID via the UNIQUE race path.
+func TestEnsureAccountConcurrentFirstLogin(t *testing.T) {
+	pool, _ := openQueries(t)
+	ctx := context.Background()
+	st, err := New(pool, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	const n = 8
+	ids := make([]int64, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			var email *string
+			if i%2 == 0 {
+				email = strptr("race@example.com")
+			}
+			ids[i], errs[i] = st.EnsureAccount(ctx, "race-sub", email)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("goroutine %d: %v", i, errs[i])
+		}
+		if ids[i] != ids[0] || ids[0] <= 0 {
+			t.Fatalf("ids = %v, want all equal positive", ids)
+		}
+	}
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM accounts WHERE keycloak_sub = $1`, "race-sub").Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("durable rows = %d, want exactly 1", count)
 	}
 }
