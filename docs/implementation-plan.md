@@ -1,6 +1,6 @@
 # Voxilian Backend — Implementation Plan (v1.2)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.10).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.11).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -90,7 +90,8 @@ Exit: full §6.1 state machine live over real WS; char CRUD end-to-end against P
 - [x] **M3-T2** Auth hookup (JWT validation behind interface; startup-JWKS baseline: one fetch at construction, immutable key set, no cache/rotation yet): `100 hello` → JWKS check → account auto-provision → `200 welcome`; `101 reauth`; 90 s hard deadline (intents rejected post-grace, then disconnect). Tests with forged/expired tokens. Spec: §6.2, §11.
 - [x] **M3-T3a** Character creation/domain + PostgreSQL persistence: name/NFC/policy validation; stats + 45-point ability validation behind an injected creation-content seam; transactional root + abilities + starter inventory; list/find/delete persistence primitives; Testcontainers including concurrent double-create race. No WS semantics. Spec: §6.1, §8, §9.
 - [x] **M3-T3b** Character WS handler: 121 list, 122 create, 123 delete + 216/217/202 mappings; per-account deletion/in-use serialization; 126 leave_world via fake WorldExit seam with flush-before-unbind; real WebSocket integration tests. Opcode 124 belongs wholly to M3-T4. Spec: §6.1, §8, §9.
-- [ ] **M3-T4** `enter_world` (opcode 124, wholly owned here) against a fake `BaselineProvider`/`WorldStream` interface (NOT the real world): decode slot, lookup character, account lifecycle arbitration, bind character, `AUTHENTICATED → CHARACTER_SELECTED`, `217 {enter_world,1}`, snapshots + paced `218`s + `220`s → `219 world_ready` barrier, `CHARACTER_SELECTED → IN_WORLD`. Duplicate-login/takeover: kick-old, quiesce/flush-before-baseline, per-account serialization test. M10-T4 swaps the fake for real cells/chunks/vendors. Spec: §6.1.
+- [ ] **M3-T4a** Enter-world baseline lifecycle: opcode 124 decode/lookup; atomic AUTHENTICATED→CHARACTER_SELECTED+bind; 217 enter OK; fake streaming BaselineProvider emits ordered 203/218/220; 219 world_ready barrier; atomic CHARACTER_SELECTED→IN_WORLD; baseline failure rollback; full per-account serialization. No duplicate-login kick yet: an existing same-account CHARACTER_SELECTED/IN_WORLD session returns retry as explicit staging. Spec: §6.1, §7.1.
+- [ ] **M3-T4b** Duplicate-login/takeover: replace T4a retry staging with final kick-old semantics; quiesce/flush old world state before new baseline; atomically release old binding; best-effort 202 kicked + forced close; refactor session Connection so all normal and cross-session binary writes share one writer serialization; same/different character takeover and simultaneous-enter tests. Spec: §6.1, §7.
 - [ ] **M3-T5** Backpressure: two-lane bounded outbound queues (coalescible vs critical), `125 ack` flow control, slow-client disconnect + full-resync test, saturation metrics, cell-owner non-blocking rule (no indefinite block; fail-closed disconnect). Load-ish test with fake slow peer. Spec: §7.1.
 - [ ] **M3 exit criteria met** (lifecycle fuzz/property test: random opcode sequences never violate state table).
 
@@ -176,7 +177,7 @@ Exit: both `classic` (starter region) and `procedural` (seeded) playable; portal
 - [ ] **M10-T2b** Classic Underworld region + volume flags + respawn targeting. Spec: §4, §9 death.
 - [ ] **M10-T2c** Classic first dungeon band + portal remaps/snapshot swaps (no-loading-screen guarantee testable via session continuity). Spec: §4, D1.
 - [ ] **M10-T3** Procedural generator v1: deterministic seeded terrain (versioned algo id), same cell/volume/flag pipeline; client-regenerable from `world{mode,seed,version}`. Determinism test (same seed → identical cells). Spec: §4.
-- [ ] **M10-T4** Real baseline integration: swap M3's fake `BaselineProvider` for real cells/chunks/vendors; `world_ready` barrier + reconnect-mid-stream recovery + bandwidth-vs-low-end-budget measurement. Spec: §6.1, §6.3, §7.1.
+- [ ] **M10-T4** Real baseline integration: swap M3's fake `BaselineProvider` (completed by T4a/T4b) for real cells/chunks/vendors; `world_ready` barrier + reconnect-mid-stream recovery + bandwidth-vs-low-end-budget measurement. Spec: §6.1, §6.3, §7.1.
 - [ ] **M10 exit criteria met** (walk classic→portal→dungeon with zero session breaks, traced in test).
 
 ## M11 — Keycloak integration + auth hardening (backend-only; Godot PKCE handshake lives in a separate client plan)
@@ -211,7 +212,8 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M3-T1, T2, T5 | M1-T8 (migrate CLI), M2-T1, M2-T2 | `backend/voxilian/internal/{auth,gateway,session,store}` |
 | M3-T3a | M1-T7a (character CAS), M2-T2 | `backend/voxilian/internal/character`, `internal/store` |
 | M3-T3b | M3-T3a | `backend/voxilian/internal/{gateway,session,character}` |
-| M3-T4 | M1-T7a, M2-T3b, M2-T3c, M3-T3b | complete opcode 124 + fake baseline/world seams (real world in M10-T4) |
+| M3-T4a | M1-T7a, M2-T3b, M2-T3c, M3-T3b | `backend/voxilian/internal/{gateway,session}` |
+| M3-T4b | M3-T4a | `backend/voxilian/internal/{gateway,session}` |
 | M4-T1, T2, T5 | M2-T3a/b, M3-T1 | `backend/voxilian/internal/sim` |
 | M4-T3a…c, T4 | M1-T7a…c (CAS), M3-T1 | `backend/voxilian/internal/sim`, `internal/store` |
 | M5-T1…T6 | M4-T1, M4-T2 | `backend/voxilian/internal/sim` (combat/vitals/intents) |
@@ -223,7 +225,7 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M9-T2…T13 | M9-T1 | `backend/voxilian/seed/` content only |
 | M10-T1…T2c | M4-T1 | `backend/voxilian/internal/world`, `seed/world` |
 | M10-T3 | M10-T1 | generator only |
-| M10-T4 | M3-T4 (fake baseline), M10-T1…T2c | `backend/voxilian/internal/{gateway,world}` |
+| M10-T4 | M3-T4a/T4b (fake baseline), M10-T1…T2c | `backend/voxilian/internal/{gateway,world}` |
 | M11-T1…T3 | M3-T2 | `backend/voxilian/deploy/keycloak`, `internal/auth` |
 | M12-T1…T4 | all | compose, docs, runbook |
 
@@ -240,7 +242,7 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 114 buy | M8-T2 | vendor listings |
 | 120 respawn_ack | M5-T5 | death pipeline |
 | 121–123 char CRUD, 126 leave | M3-T3b | lifecycle |
-| 124 enter_world | M3-T4 (wholly) | lifecycle |
+| 124 enter_world | M3-T4a baseline, M3-T4b takeover | lifecycle |
 | 125 ack | M3-T5 | flow control |
 
 ## Plan history

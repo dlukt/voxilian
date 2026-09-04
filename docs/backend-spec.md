@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.10 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.11 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -277,7 +277,15 @@ permissions (anything else → `202 error{bad_state}`):
   chunk_fragment`s for classic mode, `220 shop_list`s for nearby
   vendors), then `219 world_ready {}` — and ONLY at `world_ready` does
   the session enter `IN_WORLD`. One AOI spans multiple cells, so the
-  first snapshot is NOT the boundary; `world_ready` is.
+  first snapshot is NOT the boundary; `world_ready` is. The slot must
+  be 0/1 and hold a live character of the authenticated account:
+  invalid/empty slot → `217 {op=enter_world, ok=0}` (never `bad_state`,
+  `character_in_use`, or `retry` for an ordinary missing slot), while a
+  malformed 124 payload stays `202 error{protocol_error}` and an
+  unavailable character lookup is `202 error{retry}` with the session
+  still `AUTHENTICATED`/unbound and no baseline emitted. Full
+  enter-world lifecycle, provisional-baseline, and takeover semantics
+  are frozen in §6.1.2.
 - `126 leave_world {}` → unbinds the character (AOI cleared, presence
   dropped, dirty state flushed), session back to `AUTHENTICATED`. This
   is how characters are switched WITHOUT reconnecting. Required
@@ -308,6 +316,61 @@ quiesced/flushed (or its session directly rebound) BEFORE the
 replacement finishes its baseline and receives `world_ready` — a new
 connection MUST NOT load stale PG state while the old connection still
 holds dirty in-memory state.
+
+#### 6.1.2 Enter-world baseline lifecycle (frozen, v0.3.11)
+
+Normal uncontended enter, under the per-account lifecycle guard held
+across the ENTIRE logical operation (decode → re-read → lookup →
+arbitration → bind → 217 → baseline → 219 → complete): the guard spans
+baseline emission and the `world_ready` barrier deliberately, so a
+second same-account enter, deletion, leave, or takeover cannot overlap
+a baseline. (T5 later moves delivery onto bounded queues; the logical
+serialization does not change.)
+
+- Atomic begin: `AUTHENTICATED` + unbound becomes
+  `CHARACTER_SELECTED` + bound as one registry step — never
+  `CHARACTER_SELECTED`-yet-unbound or `AUTHENTICATED`-yet-bound.
+  Preconditions: session exists and is `AUTHENTICATED`, no current
+  binding, requested character free. Any failure mutates nothing.
+- Provisional state: while the baseline streams,
+  `CHARACTER_SELECTED` + bound + indexed. Gameplay 102–120 stays
+  rejected by the lifecycle table; ack/reauth/character_list stay
+  permitted (the synchronous read loop processes no further client
+  message until the enter handler returns — no second reader).
+- Order: `217 {enter_world, ok=1}`, then baseline events in
+  provider-emitted order (203/218/220 only; the provider never emits
+  217/219/202), then `219 world_ready`. Only after the 219 write
+  succeeds does the registry atomically complete
+  `CHARACTER_SELECTED → IN_WORLD` keeping the same binding — so no
+  inbound gameplay can run before the client holds the barrier AND
+  the registry is `IN_WORLD`. A post-219 complete failure is an
+  internal invariant failure (terminate; never report success).
+- Provisional-baseline rule: anything sent before `world_ready` is
+  provisional. A baseline that never terminates in `world_ready` is
+  incomplete and MUST be discarded by the client. On operational
+  provider failure (socket still writable): roll back to
+  `AUTHENTICATED`/unbound, send `202 error{retry}`, no 219 — the same
+  socket may retry 124. On a network-write failure of any of
+  217/203/218/220/219: best-effort rollback, return the write error,
+  and let the connection terminate (never a 202 over a broken write).
+  No `baseline_cancel` opcode exists.
+- T4a staging: if another same-account session is already
+  `CHARACTER_SELECTED`/`IN_WORLD`, the new enter returns `202
+  error{retry}` with zero mutation (no kick, no flush, no baseline).
+  Same-account session discovery is deterministic and order-free; more
+  than one other world-active session is an internal invariant
+  failure, never resolved by picking one.
+- T4b final behavior (frozen now, implemented later): after guard
+  acquisition — re-read new session, resolve character, identify the
+  old same-account world session, quiesce/flush it via the takeover
+  seam, and only on flush success unbind it to `AUTHENTICATED`, send
+  best-effort `202 error{kicked}`, force-close the old socket, then
+  run the normal new-session baseline. Flush failure → new session
+  gets `retry`, old stays `IN_WORLD`/bound/unkicked, no baseline
+  begins. A broken old socket does not block takeover once its state
+  was safely flushed and unbound. Simultaneous same-account enters
+  serialize on the guard: the loser sees a completed winner and takes
+  over normally. Different accounts never block each other.
 
 #### 6.1.1 `217 character_op` numeric registry (frozen, v0.3.10)
 
@@ -1120,6 +1183,10 @@ ledger is never replayed.
 
 ## 14. Version history
 
+- v0.3.11: freeze enter-world baseline semantics — atomic selected/in-world
+  registry transitions, provisional-baseline rollback, exact world_ready
+  barrier, full account-guard serialization, deterministic account-world
+  discovery, and split M3-T4 into baseline T4a plus takeover/transport T4b.
 - v0.3.10: freeze character CRUD semantics — character_op numeric values,
   NFC/name-policy handling, creation-content staging, transactional starter
   state, character-list level source, safe delete semantics, and split the
