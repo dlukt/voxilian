@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.8 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.9 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -46,7 +46,7 @@ server-reconcile, browser/web export specifics.
 | goose | `github.com/pressly/goose/v3` **v3.27.x** | `migrations/*.sql`, embed + `voxilian migrate` cobra subcommand |
 | CLI | cobra (already `v1.10.2` in `go.mod`) | `voxilian serve / migrate / admin / seed` |
 | WS | `github.com/coder/websocket` **v1.8.15** | Pick over archived gorilla; single maintained dep |
-| OIDC/JWT | TBD at implementation (`lestrrat-go/jwx` v3 vs `golang-jwt/jwt` + JWKS fetch) | Access-token validation against Keycloak JWKS (D6) |
+| OIDC/JWT | `github.com/lestrrat-go/jwx/v4` **v4.4.0** + `github.com/jwx-go/jwkfetch/v4` **v4.0.4** | Access-token validation against Keycloak JWKS (D6); Go 1.27 stdlib `encoding/json/v2`, no `GOEXPERIMENT=jsonv2` |
 | Logging | `log/slog` (stdlib) | JSON in prod, text in dev |
 | Metrics | Prometheus client (current) + `/metrics` | Counters/histograms per §11 |
 | Testing | stdlib + `testcontainers-go` (current) for PG integration | Unit sim with fake clock/store |
@@ -303,7 +303,100 @@ holds dirty in-memory state.
 - `101 reauth {accessToken string}` over the live WS → `201 reauth_ok {}`
   or `202 error{session_expired}` (→ browser login, then full resync).
   Re-auth has a hard deadline (§11): 90 s grace after token expiry, then
-  disconnect.
+  disconnect. Exact hello/reauth/deadline semantics are frozen in
+  §6.2.2.
+
+#### 6.2.1 Access-token validator (staged: M3 baseline vs M11 hardening)
+
+The backend validates already-issued access JWTs; it never performs
+Authorization Code exchange, PKCE, browser/loopback, refresh-token, or
+ID-token flows (client/M11 concerns). Realm/client names, token TTLs,
+and deployment configuration are M11-T1 decisions. M3 receives three
+explicit trusted inputs — `issuer`, `audience`, `jwksURL` — all
+non-empty, with exact `iss` comparison and `aud`-contains matching.
+The JWKS URL comes only from trusted server configuration: it is NEVER
+derived from JWT headers, untrusted `jku`/`x5u` headers are NEVER
+honored, and there is no OIDC discovery in M3. Libraries: `jwx/v4
+v4.4.0` + `jwkfetch/v4 v4.0.4` (§2, Go 1.27 stdlib JSON, no
+`GOEXPERIMENT`).
+
+M3-T2 baseline: one real HTTP JWKS fetch at validator
+construction/startup (exact-allowlisted URL, bounded body), the fetched
+JWK set held immutable in memory, no per-token network fetch, full
+signature + core claim validation, real account auto-provisioning, real
+hello/reauth, and the deterministic 90 s authorization deadline of
+§6.2.2. M11-T2 upgrades this baseline with background cache, key
+rotation, cache TTL, retry/backoff, stale-key behavior, pre-auth
+per-IP rate limiting, and the expanded adversarial suite. The final §11
+cached-JWKS requirement stays normative; M3 is the explicitly staged
+baseline, not a full implementation of it.
+
+A valid access JWT MUST satisfy all of: (1) structurally valid signed
+JWS; (2) signature verifies against the pre-fetched trusted JWKS;
+(3) key selected by `kid` from the trusted set; (4) verification
+algorithm from trusted JWK metadata, never blindly from the JWT
+header; (5) `iss` exactly matches the configured issuer; (6) `aud`
+contains the configured audience; (7) `exp` present; (8) `exp` still
+in the future at validation time; (9) `sub` present and non-empty;
+(10) `nbf`/`iat` validity enforced when present. `jwt.ParseInsecure`,
+unverified/unvalidated parse modes, and `alg=none` are forbidden, as
+is inferring verification keys from the token itself. The 8 KiB
+`accessToken` wire cap is unchanged.
+
+The `email` claim is optional: absent, or present as a non-empty
+string. A wrong-typed `email` invalidates the token; empty string
+counts as absent. Account identity is Keycloak `sub`, not email.
+First auto-provision writes `accounts.keycloak_sub` = validated `sub`
+and `accounts.email` = validated email or NULL; an existing account
+keeps its stored email (login never re-synchronizes it) and re-auth
+performs no email persistence.
+
+Auto-provision is race-safe on the existing UNIQUE
+`accounts.keycloak_sub`: lookup by `sub`, return the existing ID when
+found, else INSERT; a concurrent UNIQUE-race loser re-reads by `sub`
+and returns the winner's ID. Two simultaneous first logins converge on
+one durable row and one ID. No migration required.
+
+#### 6.2.2 Hello, re-auth, and the 90 s authorization deadline (frozen, v0.3.9)
+
+Successful hello: `DecodeHello` → validate access JWT → obtain `{sub,
+email?, exp}` → `EnsureAccount(sub, email?)` →
+`Registry.Authenticate(sessionID, sub, accountID, exp)` → arm the hard
+authorization deadline → send `200 welcome`. The transition stays
+`CONNECTED → AUTHENTICATED`; no character is loaded and no character
+rows are queried. JWT-invalid hello (bad signature, expired, wrong
+issuer/audience, missing/empty `sub`, missing `exp`, malformed JWT) →
+`202 error{session_expired}`, session stays `CONNECTED`. JWT-valid but
+account mapping unavailable (PG down, query/insert failure) → `202
+error{retry}`, session stays `CONNECTED` (new logins are rejected while
+persistence is unavailable per §10, without blaming the JWT). No
+account row means no `AUTHENTICATED`.
+
+Re-auth over an established session: validate the new JWT exactly like
+hello (it must be currently valid — grace never extends token
+validity) → validated `sub` MUST equal the session `sub` (else `202
+error{session_expired}`, mutating nothing: no `Sub`/`AccountID`/
+`TokenExp`/deadline change, no auto-provision, no account switch) →
+update only `TokenExp` → arm a replacement deadline → send `201
+reauth_ok`. Re-auth performs no PG provisioning/query, so it keeps
+working during a temporary PG outage. A failed reauth leaves the old
+identity, old `TokenExp`, and remaining grace intact.
+
+Deadline: `ReauthGrace = 90 s`;
+`authorizationDeadline = TokenExp + ReauthGrace`. An already-expired
+token at hello is invalid immediately — no grace opens a new session.
+For an authenticated session: before `TokenExp`, normal operation; on
+`[TokenExp, TokenExp + 90 s)`, the session stays usable and a fresh
+currently-valid token may reauth; at `now >= TokenExp + 90 s` the old
+authorization is dead: no new application opcode is dispatched (not
+even reauth — validation cannot rescue the session), the server
+best-effort sends `202 error{session_expired}` and closes the WS, and
+the client must reconnect + hello. The disconnect MUST fire even when
+the client is idle, so the deadline is a scheduled timer, not merely
+an on-next-message check. Successful reauth cancels/supersedes the old
+timer: a late-firing stale callback MUST NOT disconnect the
+reauthenticated session. All expiry/deadline comparisons use an
+injectable clock (tests never wait a real 90 s).
 
 ### 6.3 Message catalog
 
@@ -832,6 +925,8 @@ ledger is never replayed.
   grants forbidden. Backend validates access JWTs against cached JWKS
   (`iss`/`aud`/expiry/signature; key rotation via cache TTL + backoff);
   rejects expired/misissued tokens with `202 error{session_expired}`.
+  Staged delivery: M3-T2 validates against an immutable startup JWKS
+  (§6.2.1); M11-T2 adds the cache/rotation/backoff layer.
 - Hard re-auth deadline: token expiry does not drop the session, but a
   **90 s grace period** starts at expiry. After grace: new gameplay
   intents are rejected, then the session is disconnected. A connected
@@ -849,7 +944,8 @@ ledger is never replayed.
 - Pre-auth rate limiting: the `hello`/JWKS-validation path is rate-limited
   per connection/IP (token bucket), independent of per-character gameplay
   limits — unauthenticated JWT verification MUST NOT be a free
-  CPU-amplification endpoint.
+  CPU-amplification endpoint. Staged: M3-T2 proves authentication
+  correctness; M11-T2 adds this abuse-resistance layer.
 - WS admin role is authorized by a Keycloak client role claim
   (`vox-admin`), never by mere authentication.
 - WS requires TLS in prod (terminate at proxy or Go — DECISION §13.6).
@@ -936,6 +1032,10 @@ ledger is never replayed.
 
 ## 14. Version history
 
+- v0.3.9: freeze M3-T2 auth staging — jwx v4 baseline, immutable
+  startup JWKS for M3 with rotation/cache hardening deferred to M11,
+  race-safe account auto-provisioning, and exact token-expiry + 90 s
+  reauth deadline semantics.
 - v0.3.8: freeze M3 gateway wire semantics — runtime msg_version starts
   at 1, stable 202 error-code registry, coder/websocket v1.8.15 pin, and
   bounded WebSocket oversize handling via transport status 1009.

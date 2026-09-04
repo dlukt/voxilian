@@ -1,6 +1,6 @@
 # Voxilian Backend — Implementation Plan (v1.2)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.8).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.9).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -87,7 +87,7 @@ Exit: every §6 opcode encodes/decodes both sides (Go done; Godot side stubs + f
 Exit: full §6.1 state machine live over real WS; char CRUD end-to-end against PG; takeover/kick/backpressure tested.
 
 - [x] **M3-T1** WS server + session registry (`sessionID → {sub,accountID,charID?,conn,state,tokenExp}`, indexed by sub+character; per-account lifecycle guard mutex). States + per-opcode permission table enforced; `bad_state` errors. Tests: illegal-state matrix. Spec: §6.1, §7.
-- [ ] **M3-T2** Auth hookup (JWT validation behind interface; test fake + real JWKS path stub for M11): `100 hello` → JWKS check → account auto-provision → `200 welcome`; `101 reauth`; 90 s hard deadline (intents rejected post-grace, then disconnect). Tests with forged/expired tokens. Spec: §6.2, §11.
+- [ ] **M3-T2** Auth hookup (JWT validation behind interface; startup-JWKS baseline: one fetch at construction, immutable key set, no cache/rotation yet): `100 hello` → JWKS check → account auto-provision → `200 welcome`; `101 reauth`; 90 s hard deadline (intents rejected post-grace, then disconnect). Tests with forged/expired tokens. Spec: §6.2, §11.
 - [ ] **M3-T3** Character CRUD over WS: `121–124` + `217` results + error codes (`name_taken/slot_occupied/bad_stats/bad_budget/character_in_use`); display-name rules per spec §9 (charset/NFC/length/blocklist — decided, no ambiguity left); `126 leave_world` (AOI clear, flush, →AUTHENTICATED); single-txn create per §8.1. Testcontainers tests incl. concurrent double-create race (one wins). Spec: §6.1, §8, §9.
 - [ ] **M3-T4** `enter_world` baseline against a fake `BaselineProvider`/`WorldStream` interface (NOT the real world): `CHARACTER_SELECTED` → snapshots + paced `218`s + `220`s → `219 world_ready` barrier verified. Duplicate-login/takeover: kick-old, quiesce/flush-before-baseline, per-account serialization test. M10-T4 swaps the fake for real cells/chunks/vendors. Spec: §6.1.
 - [ ] **M3-T5** Backpressure: two-lane bounded outbound queues (coalescible vs critical), `125 ack` flow control, slow-client disconnect + full-resync test, saturation metrics, cell-owner non-blocking rule (no indefinite block; fail-closed disconnect). Load-ish test with fake slow peer. Spec: §7.1.
@@ -183,7 +183,7 @@ Exit: both `classic` (starter region) and `procedural` (seeded) playable; portal
 Exit: E2E login → WS → world against configured realm using a headless test OAuth client; admin role enforced.
 
 - [ ] **M11-T1** Realm/client config as code (realm export JSON in repo `deploy/keycloak/`): public client, PKCE S256, loopback redirect, `openid profile email offline_access`, `vox-admin` client role, token TTLs (decide here: propose access ~5 min; record decision in spec §13.4 via spec-edit commit). Spec: §11, §13.4.
-- [ ] **M11-T2** Backend JWKS validation hardening: cache TTL + rotation backoff, `iss/aud` pinning, pre-auth per-IP rate limits, expired/misissued → `202 error{session_expired}`. Adversarial tests (none-alg, wrong iss, expired, garbage). Spec: §11.
+- [ ] **M11-T2** Backend JWKS validation hardening (upgrades the M3-T2 immutable startup key set, does not create the first validator): background cache + TTL, key rotation, retry/backoff, stale-key behavior, `iss/aud` pinning, pre-auth per-IP rate limits, expired/misissued → `202 error{session_expired}`. Expanded adversarial tests (none-alg, wrong iss, expired, garbage). Spec: §11.
 - [ ] **M11-T3** Admin path: `vox-admin` claim → WS admin role + `voxilian admin` CLI parity (kick/ban/save-now/spawn/give-logged). Negative tests (non-admin rejected). Spec: §10, §11.
 - [ ] **M11 exit criteria met** (headless test OAuth client: login against dev Keycloak container → enter_world → reauth → expiry → grace → disconnect; Godot handshake tracked in client plan, not here).
 
@@ -207,7 +207,7 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M1-T1…T5 | M0 | `backend/voxilian/migrations/` only |
 | M1-T6a…c, T7a…c, T8 | per-table predecessor migrations | `backend/voxilian/queries/`, `internal/store` |
 | M2-T1, T2, T3a…c, T4, T5 | M0 | `backend/voxilian/internal/proto`, repo-root `testdata/protocol/` |
-| M3-T1, T2, T5 | M1-T8 (migrate CLI), M2-T1, M2-T2 | `backend/voxilian/internal/{gateway,session}` |
+| M3-T1, T2, T5 | M1-T8 (migrate CLI), M2-T1, M2-T2 | `backend/voxilian/internal/{auth,gateway,session,store}` |
 | M3-T3 | M1-T7a (character CAS), M2-T2 | `backend/voxilian/internal/{gateway,session}` |
 | M3-T4 | M1-T7a, M2-T3b, M2-T3c, M3-T3 | fake baseline + barrier (real world in M10-T4) |
 | M4-T1, T2, T5 | M2-T3a/b, M3-T1 | `backend/voxilian/internal/sim` |
