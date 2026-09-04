@@ -1645,6 +1645,7 @@ func TestCharDeleteInUseWS(t *testing.T) {
 	f := newCharFixture(t, false)
 	c1 := f.dial(t)
 	accountID := f.helloChar(t, c1)
+	sid1 := f.reg.SessionsBySub("test-sub")[0]
 	sendCreate(t, c1, 2, validCharCreate(0, "Aria"))
 	if _, op := readCharOp(t, c1); op.OK != proto.CharacterOpOK {
 		t.Fatalf("create = %+v", op)
@@ -1657,11 +1658,14 @@ func TestCharDeleteInUseWS(t *testing.T) {
 
 	c2 := f.dial(t)
 	f.helloChar(t, c2)
-	ids := f.reg.SessionsBySub("test-sub")
-	if len(ids) != 2 {
+	// The owner (bound session) must be c1's session, identified
+	// deterministically: SessionsBySub order is random, and binding c2's
+	// own session would make the delete correctly report bad_state
+	// instead of character_in_use.
+	if ids := f.reg.SessionsBySub("test-sub"); len(ids) != 2 {
 		t.Fatalf("sessions = %d, want 2", len(ids))
 	}
-	owner := ids[0]
+	owner := sid1
 	if err := f.reg.BindCharacter(owner, charID); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
