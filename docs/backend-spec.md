@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.13 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.14 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -163,6 +163,279 @@ normative NOW so sharding later is a transport change, not a rewrite:
     cache covering at least the maximum internal retry/handoff window;
     entity handoff carries the recent dedupe state so a retry across a
     handoff cannot double-apply.
+
+### 5.2 Deterministic sim skeleton (frozen, v0.3.14)
+
+This section freezes the M4-T1 sim skeleton only: fixed-step tick loop,
+XZ cell grid, in-process entity registry, injectable clock/RNG, and the
+post-tick position-history ring. It adds no movement, handoff, AOI,
+saver, collision, or world-content behavior.
+
+#### 5.2.1 Fixed-step tick semantics
+
+- `config.tick_hz`: default `20`, valid range `1..120` (existing config
+  validation is unchanged), MVP production target `20 Hz`.
+- The engine uses the configured tick rate as a FIXED simulation step:
+
+```text
+dtSeconds = 1.0 / tickHz
+```
+
+- Future movement/combat systems express rates per second and scale by
+  this fixed `dt`. Physics `dt` is NEVER derived from actual
+  wall-clock elapsed time.
+- At the default 20 Hz the tick period is `50 ms`.
+- The simulation is fixed-step. Production wall-clock scheduling
+  decides WHEN a step runs; it does NOT decide the amount of simulated
+  time represented by a step.
+- One delivered ticker pulse executes exactly one simulation step. M4
+  deliberately does NOT execute burst catch-up ticks based on elapsed
+  wall time. If the process is overloaded and ticker delivery is
+  delayed/coalesced, the simulation falls behind wall time rather than
+  entering an unbounded catch-up spiral. No adaptive timestep behavior.
+
+#### 5.2.2 Tick numbering
+
+- Initial tick is `0`; the first executed simulation step is tick `1`.
+- Each executed step increments the tick exactly once.
+- Tick type is `uint32`. Wraparound is normal (`MaxUint32 -> 0`) using
+  the same conceptual modulo-2³² serial domain as the protocol header
+  tick. There is no "tick 0 means invalid" rule.
+
+#### 5.2.3 Clock seam and Run semantics
+
+- The engine depends on a minimal injectable ticker/clock seam,
+  conceptually equivalent to:
+
+```go
+type Ticker interface {
+    C() <-chan time.Time
+    Stop()
+}
+
+type Clock interface {
+    NewTicker(time.Duration) Ticker
+}
+```
+
+- Exact Go names may differ. Production wraps `time.NewTicker`;
+  tests use a manual ticker. No sleeps are required for tick-loop
+  correctness tests.
+- The engine also exposes (or internally provides) a synchronous
+  fixed-step operation usable by unit tests without wall time,
+  conceptually `Step()`. `Run` MUST call the SAME step core; there are
+  no separate test and production simulation paths.
+- `Run(ctx)` creates exactly one ticker, waits for pulses, executes
+  one `Step` per pulse, stops the ticker on exit, and returns when
+  `ctx` is cancelled. No ticker/goroutine leak. Cancellation does NOT
+  execute an extra final tick. Graceful persistence/shutdown belongs
+  to M4-T4, not here.
+
+#### 5.2.4 Server geometry (`internal/world`)
+
+- Server-side world vector (authoritative positions remain float64
+  meters):
+
+```go
+type Vec3 struct {
+    X float64
+    Y float64
+    Z float64
+}
+```
+
+- Server code MUST NOT reuse protocol `Position` (fixed-point
+  millimeters) for simulation: `proto.Position` is wire millimeters,
+  `world.Vec3` is simulation meters. Protocol conversion belongs to
+  later gateway/sim integration.
+- Canonical server geometry constants owned by `internal/world`:
+
+```text
+ChunkEdgeVoxels        = 16
+CellSizeMeters         = 32
+DefaultAOIRadiusMeters = 96
+```
+
+- M4-T1 establishes the server canonical geometry API only. It does
+  NOT create or parse `world.toml`, does NOT modify the Godot client,
+  and the existing `WorldConstantsPath` remains staged for later
+  world/content loading.
+- Cell coordinates are 2D XZ:
+
+```go
+type CellCoord struct {
+    X int32
+    Z int32
+}
+```
+
+- Y does NOT select the cell (matching the wire cell shape `i32 cx +
+  i32 cz`). Embedded interiors may use Y/volume semantics later
+  without changing the base XZ grid.
+- Position-to-cell conversion uses mathematical floor, NOT Go integer
+  truncation:
+
+```text
+cx = floor(position.X / 32)
+cz = floor(position.Z / 32)
+```
+
+- Required boundaries (same for Z):
+
+```text
+X =   0.0      -> cell  0
+X =  31.999    -> cell  0
+X =  32.0      -> cell  1
+
+X =  -0.001    -> cell -1
+X = -32.0      -> cell -1
+X = -32.001    -> cell -2
+```
+
+- Invalid simulation positions: any component `NaN`, `+Inf`, or
+  `-Inf` is rejected; X/Z whose floored cell result cannot fit `int32`
+  is rejected; Y must also be finite even though it does not select
+  the cell. Rejection uses a stable world-domain error — never panic
+  and never silent clamp.
+- Canonical cell iteration is `X` ascending, then `Z` ascending. Any
+  engine operation whose result can affect simulation state MUST NEVER
+  depend on Go map iteration order; this ordering is part of the
+  determinism contract.
+
+#### 5.2.5 Entities and registry (M4-T1 skeleton)
+
+- Internal sim entity identity is an opaque domain:
+
+```go
+type EntityID uint64
+```
+
+- Rules: `0` is invalid/reserved; the first allocated ID is `1`;
+  allocation is monotonic and never reused during one engine lifetime
+  (natural `uint64` space). This ID is NOT a PostgreSQL durable ID,
+  NOT a session-local NetEntityID, and NOT sent on the wire. Later
+  systems may associate durable/session identities with it without
+  overloading those domains.
+- The M4-T1 base entity contains only skeleton state: internal
+  `EntityID`, authoritative `Vec3` position, current `CellCoord`, and
+  position history. It MUST NOT add HP/mana/vigor/stats, combat state,
+  character DB IDs, mob protos, inventory, velocity, or movement
+  input before their owning tasks.
+- Each active sim cell owns its entity collection, conceptually
+  `CellCoord -> Cell -> EntityID -> mutable entity`. A global locator
+  maps `EntityID -> CellCoord` for lookup. No global mutable entity
+  pointer is handed to callers; inspection APIs return immutable
+  snapshots/copies containing at least `EntityID`, `Position`, and
+  `CellCoord`. Cell entity listings are deterministic in `EntityID`
+  ascending order.
+- Single-writer rule for M4-T1: ONE engine simulation loop owns
+  mutation of ALL cells, so each cell has exactly one writer. M4-T1
+  creates no per-cell goroutine, per-entity/per-cell mutex, worker
+  pool, actor framework, or external bus. The layout keeps cell
+  mutation encapsulated so M4-T3 can later split ownership/handoff
+  without rewriting gameplay state.
+- No cross-cell handoff in T1 (M4-T3a owns it): a position-mutation
+  operation whose new position belongs to another cell MUST return a
+  stable "handoff required" / cell-boundary error and leave the entity
+  unchanged, never silently move it between cell maps.
+- Add is all-or-nothing: validate position, compute cell, allocate a
+  fresh `EntityID`, lazily create the active cell if needed, insert
+  under that cell, update the global locator. An invalid position
+  allocates NO ID and mutates nothing.
+- Remove deletes the entity from its owning cell, deletes the global
+  locator entry, and discards its history. Unknown IDs return a
+  stable not-found error. Empty active cells are removed (M4-T1 cells
+  represent active sim ownership, not terrain storage; world terrain
+  cells arrive later from `WorldSource`).
+
+#### 5.2.6 Position history
+
+- History duration is `2` simulated seconds, so capacity is
+  `2 * tickHz` samples (`40` samples at the default 20 Hz; changing
+  dev/test `tickHz` preserves the 2-second simulated horizon).
+- Sample type (simulation-time data, no wall-clock timestamp):
+
+```go
+type PositionSample struct {
+    Tick     uint32
+    Position world.Vec3
+}
+```
+
+- Sampling phase: at the END of every successfully executed simulation
+  tick, exactly one sample is appended for every live entity,
+  representing that tick's final authoritative position. An entity
+  added before tick 1 has an initially empty history; after tick 1 it
+  holds one sample at tick 1. Future gameplay phases insert BEFORE
+  history sampling; gameplay MUST NOT run after the same tick's
+  historical sample.
+- The ring has fixed capacity; the oldest entry is overwritten when
+  full; steady state performs no allocations; inspection returns
+  oldest -> newest copies. At 20 Hz after 45 ticks an entity present
+  throughout holds 40 samples for ticks `6..45`. Wrapped tick numbers
+  are NOT sorted numerically — ring order itself is chronological.
+- Removing the entity removes its history. A recreated entity gets a
+  new `EntityID` and a new empty history (no ABA via ID reuse).
+
+#### 5.2.7 RNG seam
+
+- Sim receives an injected RNG dependency over a deliberately narrow
+  interface, conceptually:
+
+```go
+type RNG interface {
+    Uint64() uint64
+}
+```
+
+- M4-T1 needs no random gameplay behavior; future tasks expand/adapt
+  internal random helpers only when they require bounded
+  integer/floating-point rolls. No custom PRNG algorithm is
+  introduced; tests may use deterministic stdlib `math/rand/v2`;
+  production seeding/wiring belongs to executable/bootstrap work.
+- Package-global randomness is forbidden in sim production code
+  (`global rand` calls, time-based seeding, hidden `crypto/rand`
+  inside gameplay). All gameplay randomness MUST eventually descend
+  from the injected engine RNG.
+
+#### 5.2.8 Deterministic step ordering and contract
+
+- Each tick executes skeleton bookkeeping in this order:
+
+```text
+1. allocate/increment tick
+2. process active cells in canonical CellCoord order
+3. within a cell inspect/process entities in EntityID ascending order
+4. append each live entity's post-step position-history sample
+```
+
+- T1 has no gameplay systems, so steps 2/3 perform only skeleton
+  bookkeeping.
+- Determinism contract: given the same initial world, the same
+  sequence of submitted mutations, the same tick pulses, the same RNG
+  seed, and the same config, the observable trace MUST be
+  byte/logically identical independent of Go map iteration. The test
+  trace includes tick, ordered cells, ordered entity snapshots,
+  ordered history tails, and a deterministic RNG sample sequence when
+  the test draws through the injected RNG.
+
+#### 5.2.9 Explicit non-scope for M4-T1
+
+- No gateway integration: no `102 move`, no `205 entity_move`, no
+  gateway `TickFunc`, no session lifecycle, no AOI outbound producer.
+  M3 gateway remains untouched.
+- No `Store` dependency: sim/world production code imports stdlib
+  plus `internal/world` as needed — no `store`, `pgx`, `sqlc/gen`,
+  `gateway`, `session`, or `proto`. Architecture direction remains
+  `gateway -> sim -> Store interface`; T1 needs no `Store` interface.
+- No `WorldSource`: no classic loader, procedural generator,
+  `world.toml` parser, volumes, portals, collision, or terrain. M10
+  owns world content; M4-T2 owns the minimal `CollisionWorld` seam.
+- No M4-T2 behavior: no movement integration, walk/run speeds,
+  `inputSeq`, yaw, velocity, collision, `205 entity_move`,
+  reconciliation, or speed anomaly detection.
+- No M4-T3 behavior: no ownership generations, handoff queues,
+  migration, cross-cell `opID`, dedupe, or retry routing.
 
 ## 6. WebSocket protocol (binary, versioned — DECISION §13.8)
 
@@ -1646,6 +1919,11 @@ ledger is never replayed.
 
 ## 14. Version history
 
+- v0.3.14: freeze deterministic M4 sim skeleton — fixed-step tick semantics
+  (default 20 Hz with configured tick rate), no catch-up bursts, canonical
+  cell/entity iteration, floor-correct XZ cell mapping, opaque internal
+  EntityIDs, single-writer T1 ownership, explicit cross-cell handoff staging,
+  and a two-second post-tick position-history ring.
 - v0.3.13: clarify final M3 ACK/observability semantics — ACK epoch is
   atomically coupled to IN_WORLD lifecycle, normal write sequence allocation
   enforces max-unacked before assigning a seq, direct terminal frames remain

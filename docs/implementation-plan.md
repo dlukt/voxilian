@@ -1,6 +1,6 @@
 # Voxilian Backend — Implementation Plan (v1.2)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.13).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.14).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -100,7 +100,7 @@ Exit: full §6.1 state machine live over real WS; char CRUD end-to-end against P
 
 Exit: 20 Hz tick loop, cells, server-authoritative movement with reconciliation anchors, handoff, history ring, CAS saver.
 
-- [ ] **M4-T1** Tick loop + cell grid + entity registry. 20 Hz sim, 32 m cells, single-writer-per-cell structure (one process), injectable clock+RNG, per-entity position-history ring (2 s @ 20 Hz). Determinism test (fixed seed → identical trace). Spec: §4, §5.
+- [ ] **M4-T1** Tick loop + cell/entity skeleton: fixed-step configurable tick loop (default 20 Hz), XZ 32 m cells with floor-correct negative coordinates, one in-process sim writer, opaque monotonic EntityID registry, deterministic cell/entity iteration, injectable clock+RNG, 2-second post-tick position history. No movement/handoff/AOI. Spec: §4, §5.
 - [ ] **M4-T2** Movement integration: `102` intents → integrate (walk 3.5/run 7 m/s, vigor gate hook) → `205` with `lastProcessedInputSeq`; server-side collision against a MINIMAL `CollisionWorld` seam owned HERE (tiny interface: solid-check + volume flags at a position); anomaly tripwire (speed/teleport → correct+log). M10's richer `WorldSource` implements/embeds this seam, never replaces it. Reconciliation-anchor unit tests (processed-seq monotonicity). Spec: §5, §6.3, §11.
 - [ ] **M4-T3a** Cell ownership + entity handoff: epoch/generation, migrate-queue routing (`202 error{retry}` only on saturation). Handoff tests. Spec: §5.1.
 - [ ] **M4-T3b** Cross-cell op infrastructure: `opID` generation/delivery/dedupe/retry (bounded cache) against a SYNTHETIC aggregate operation — no real trade logic here. Spec: §5.1.
