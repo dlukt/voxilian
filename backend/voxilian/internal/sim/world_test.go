@@ -273,3 +273,72 @@ func TestDeterministicListings(t *testing.T) {
 	}
 	_ = ids
 }
+
+func TestAddEntityExhaustion(t *testing.T) {
+	r := newRegistry(40)
+	r.nextEntityID = EntityID(math.MaxUint64)
+	snap, err := r.AddEntity(world.Vec3{X: 1})
+	if err != nil {
+		t.Fatalf("final-ID add error: %v", err)
+	}
+	if snap.ID != EntityID(math.MaxUint64) {
+		t.Fatalf("ID = %d, want MaxUint64", uint64(snap.ID))
+	}
+	if r.EntityCount() != 1 || r.CellCount() != 1 {
+		t.Fatalf("counts = %d/%d, want 1/1", r.EntityCount(), r.CellCount())
+	}
+	// Allocator is now exhausted; repeated adds fail atomically.
+	for i := 0; i < 2; i++ {
+		if _, err := r.AddEntity(world.Vec3{X: 2}); !errors.Is(err, ErrEntityIDExhausted) {
+			t.Fatalf("exhausted add %d = %v, want ErrEntityIDExhausted", i, err)
+		}
+	}
+	if r.EntityCount() != 1 || r.CellCount() != 1 {
+		t.Fatalf("counts after failed adds = %d/%d, want 1/1", r.EntityCount(), r.CellCount())
+	}
+	// Zero was never issued and never exists.
+	if _, err := r.Entity(InvalidEntityID); !errors.Is(err, ErrEntityNotFound) {
+		t.Fatalf("Entity(0) = %v, want ErrEntityNotFound", err)
+	}
+	for _, c := range r.CellCoords() {
+		for _, s := range r.EntitiesInCell(c) {
+			if s.ID == InvalidEntityID {
+				t.Fatal("registry contains reserved zero ID")
+			}
+		}
+	}
+	// The MaxUint64 entity remains intact.
+	got, err := r.Entity(EntityID(math.MaxUint64))
+	if err != nil {
+		t.Fatalf("Entity(MaxUint64) error: %v", err)
+	}
+	if got != snap {
+		t.Fatalf("MaxUint64 entity = %+v, want %+v", got, snap)
+	}
+	if h, err := r.History(EntityID(math.MaxUint64)); err != nil || len(h) != 0 {
+		t.Fatalf("MaxUint64 history = %v,%v, want empty,nil", h, err)
+	}
+}
+
+func TestAddEntityExhaustionInvalidPositionFirst(t *testing.T) {
+	r := newRegistry(40)
+	r.nextEntityID = EntityID(math.MaxUint64)
+	// Invalid positions reject before ID inspection: allocator untouched.
+	if _, err := r.AddEntity(world.Vec3{X: math.NaN()}); !errors.Is(err, ErrInvalidPosition) {
+		t.Fatalf("invalid add = %v, want ErrInvalidPosition", err)
+	}
+	if r.nextEntityID != EntityID(math.MaxUint64) {
+		t.Fatalf("allocator moved on invalid add: %d", uint64(r.nextEntityID))
+	}
+	if r.EntityCount() != 0 || r.CellCount() != 0 {
+		t.Fatalf("counts = %d/%d, want 0/0", r.EntityCount(), r.CellCount())
+	}
+	// The final ID is still available afterwards.
+	snap, err := r.AddEntity(world.Vec3{X: 1})
+	if err != nil {
+		t.Fatalf("final-ID add error: %v", err)
+	}
+	if snap.ID != EntityID(math.MaxUint64) {
+		t.Fatalf("ID = %d, want MaxUint64", uint64(snap.ID))
+	}
+}

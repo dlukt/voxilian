@@ -2280,7 +2280,25 @@ func TestEnterWorldSimultaneousTakeoverWS(t *testing.T) {
 		t.Fatalf("B opcode = %d, want 219", h.Opcode)
 	}
 
-	waitFor(t, "old session cleanup", func() bool { return f.reg.Len() == 1 })
+	// B's 219 frame is written BEFORE CompleteEnterWorld runs on the
+	// handler goroutine, so after reading 219 the registry may
+	// transiently hold exactly one session (old A already removed)
+	// while B is still CHARACTER_SELECTED. Wait for the full stable
+	// condition instead of asserting immediately.
+	waitFor(t, "takeover completion", func() bool {
+		if _, ok := f.reg.Get(sidA); ok {
+			return false
+		}
+		ids := f.reg.SessionsBySub("test-sub")
+		if len(ids) != 1 {
+			return false
+		}
+		s, ok := f.reg.Get(ids[0])
+		if !ok {
+			return false
+		}
+		return s.State == session.StateInWorld && s.HasCharacter && s.CharacterID == charID
+	})
 	if _, ok := f.reg.Get(sidA); ok {
 		t.Error("winner A still registered after takeover")
 	}

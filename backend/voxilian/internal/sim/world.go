@@ -44,11 +44,20 @@ func newRegistry(historyCapacity int) *registry {
 // AddEntity validates the position, computes the cell, allocates a
 // fresh EntityID, lazily creates the active cell, inserts the entity,
 // and updates the global locator — all-or-nothing (spec §5.2.5). An
-// invalid position allocates NO ID and mutates nothing.
+// invalid position allocates NO ID and mutates nothing. Position
+// validation runs BEFORE ID inspection/allocation, so an invalid
+// position never advances or observes allocator state. Once
+// math.MaxUint64 has been issued, nextEntityID wraps to the reserved
+// zero value, which is the private exhausted sentinel: further adds
+// fail with ErrEntityIDExhausted (zero is never issued as an ID) and
+// mutate nothing.
 func (r *registry) AddEntity(pos world.Vec3) (EntitySnapshot, error) {
 	coord, err := world.CellForPosition(pos)
 	if err != nil {
 		return EntitySnapshot{}, fmt.Errorf("%w: %w", ErrInvalidPosition, err)
+	}
+	if r.nextEntityID == InvalidEntityID {
+		return EntitySnapshot{}, fmt.Errorf("%w: allocator exhausted", ErrEntityIDExhausted)
 	}
 	id := r.nextEntityID
 	c, ok := r.cells[coord]

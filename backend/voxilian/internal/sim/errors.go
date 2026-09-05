@@ -18,4 +18,9 @@ var (
 	ErrCellHandoffRequired = errors.New("sim: cell handoff required")
 	// ErrInvalidConfig marks an invalid EngineConfig/EngineDeps value.
 	ErrInvalidConfig = errors.New("sim: invalid config")
+	// ErrEntityIDExhausted marks AddEntity when the monotonic EntityID
+	// allocator is exhausted (math.MaxUint64 already issued). IDs are
+	// never reused and the reserved zero ID is never issued; the failed
+	// add mutates nothing. Match with errors.Is.
+	ErrEntityIDExhausted = errors.New("sim: entity ID exhausted")
 )
