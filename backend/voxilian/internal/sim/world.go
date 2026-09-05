@@ -65,15 +65,20 @@ func (r *registry) AddEntity(pos world.Vec3) (EntitySnapshot, error) {
 		c = &cell{coord: coord, entities: make(map[EntityID]*entity)}
 		r.cells[coord] = c
 	}
-	c.entities[id] = &entity{
+	// Movement state starts zeroed: yaw 0, speed 0, no accepted or
+	// processed input, zero held control (spec §5.3.7). Volume flags
+	// default to VolumeNone here; Engine.AddEntity samples the real
+	// collision world at the initial position afterwards.
+	e := &entity{
 		id:       id,
 		position: pos,
 		cell:     coord,
 		history:  newPositionHistory(r.historyCapacity),
 	}
+	c.entities[id] = e
 	r.entityCell[id] = coord
 	r.nextEntityID++
-	return EntitySnapshot{ID: id, Position: pos, Cell: coord}, nil
+	return e.snapshot(), nil
 }
 
 // RemoveEntity deletes the entity from its owning cell, deletes the

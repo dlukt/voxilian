@@ -95,6 +95,12 @@ func (c *manualClock) periods() []time.Duration {
 
 func mustEngine(t *testing.T, hz int, deps EngineDeps) *Engine {
 	t.Helper()
+	if deps.Collision == nil {
+		deps.Collision = openCollision{}
+	}
+	if deps.RunGate == nil {
+		deps.RunGate = staticGate{allow: true}
+	}
 	e, err := NewEngine(EngineConfig{TickHz: hz}, deps)
 	if err != nil {
 		t.Fatalf("NewEngine(%d) error: %v", hz, err)
@@ -140,8 +146,14 @@ func TestEngineConfigValidation(t *testing.T) {
 	if _, err := NewEngine(EngineConfig{TickHz: 20}, EngineDeps{Clock: clk, RNG: nil}); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("nil rng = %v, want ErrInvalidConfig", err)
 	}
+	if _, err := NewEngine(EngineConfig{TickHz: 20}, EngineDeps{Clock: clk, RNG: rng}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("nil collision = %v, want ErrInvalidConfig", err)
+	}
+	if _, err := NewEngine(EngineConfig{TickHz: 20}, EngineDeps{Clock: clk, RNG: rng, Collision: openCollision{}}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("nil run gate = %v, want ErrInvalidConfig", err)
+	}
 	for _, hz := range []int{1, 20, 120} {
-		if _, err := NewEngine(EngineConfig{TickHz: hz}, EngineDeps{Clock: newManualClock(), RNG: newTestRNG(1)}); err != nil {
+		if _, err := NewEngine(EngineConfig{TickHz: hz}, EngineDeps{Clock: newManualClock(), RNG: newTestRNG(1), Collision: openCollision{}, RunGate: staticGate{allow: true}}); err != nil {
 			t.Fatalf("NewEngine(%d) error: %v", hz, err)
 		}
 	}
