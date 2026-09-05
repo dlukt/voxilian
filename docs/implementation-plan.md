@@ -94,7 +94,7 @@ Exit: full §6.1 state machine live over real WS; char CRUD end-to-end against P
 - [x] **M3-T4b** Duplicate-login/takeover: replace T4a retry staging with final kick-old semantics; quiesce/flush old world state before new baseline; atomically release old binding; best-effort 202 kicked + forced close; refactor session Connection so all normal and cross-session binary writes share one writer serialization; same/different character takeover and simultaneous-enter tests. Spec: §6.1, §7.
 - [x] **M3-T5a** Outbound queue/backpressure core: per-session bounded two-lane writer; exact byte+message budgets; critical FIFO; explicit coalescible-state keys/newest-wins; synchronous critical SendFunc preserves physical-write barrier; non-blocking TryCritical/TryState producer seam; critical saturation/write timeout fail-closed; terminal kicked/auth-expiry bypass; config + deterministic slow-writer tests. Spec: §7.1.
 - [x] **M3-T5b** ACK + observability + resync: opcode 125 cumulative ACK flow control after world_ready; max-unacked window with modulo-2^32 tests; Prometheus saturation/depth/coalescing/ACK metrics; slow-client full reconnect+fresh-baseline test; load-ish fake slow peer. Spec: §6.1, §7.1.
-- [ ] **M3 exit criteria met** (lifecycle fuzz/property test: random opcode sequences never violate state table).
+- [x] **M3 exit criteria met** (lifecycle fuzz/property test: random opcode sequences never violate state table).
 
 ## M4 — Deterministic sim skeleton
 
