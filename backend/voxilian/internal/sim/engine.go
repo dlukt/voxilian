@@ -194,17 +194,23 @@ func (e *Engine) stepEntity(ent *entity, tick uint32) (MovementUpdate, bool) {
 	dx, dz, active := heldDirectionVector(ent.activeHeldDirs, ent.yaw)
 	if !active {
 		// Stationary: no translation, no gate/collision queries.
-		// Speed reports stopped.
-		ent.speed = 0
-		return MovementUpdate{
-			Tick:                  tick,
-			EntityID:              ent.id,
-			Position:              ent.position,
-			Yaw:                   ent.yaw,
-			Speed:                 0,
-			LastProcessedInputSeq: ent.lastProcessedSeq,
-			VolumeFlags:           ent.volumeFlags,
-		}, processedNew
+		// An idle entity (nothing newly processed) emits nothing and
+		// performs no world queries at all. A newly processed
+		// zero-direction control finalizes normally so its update
+		// carries freshly sampled volume flags.
+		if !processedNew {
+			ent.speed = 0
+			return MovementUpdate{
+				Tick:                  tick,
+				EntityID:              ent.id,
+				Position:              ent.position,
+				Yaw:                   ent.yaw,
+				Speed:                 0,
+				LastProcessedInputSeq: ent.lastProcessedSeq,
+				VolumeFlags:           ent.volumeFlags,
+			}, false
+		}
+		return e.finalize(ent, tick, 0, false, false), true
 	}
 
 	// Select walk/run. The run gate is consulted only for genuinely
@@ -240,8 +246,7 @@ func (e *Engine) stepEntity(ent *entity, tick uint32) (MovementUpdate, bool) {
 			ExpectedMaxDistance: distance,
 			ObservedDistance:    observed,
 		})
-		ent.speed = 0
-		return e.update(ent, tick, 0, false, false), true
+		return e.finalize(ent, tick, 0, false, false), true
 	}
 
 	// Cross-cell staging BEFORE collision: M4-T3a owns handoff, so an
@@ -257,12 +262,10 @@ func (e *Engine) stepEntity(ent *entity, tick uint32) (MovementUpdate, bool) {
 			ExpectedMaxDistance: distance,
 			ObservedDistance:    distance,
 		})
-		ent.speed = 0
-		return e.update(ent, tick, 0, false, false), true
+		return e.finalize(ent, tick, 0, false, false), true
 	}
 	if dest != ent.cell {
-		ent.speed = 0
-		return e.update(ent, tick, 0, false, true), true
+		return e.finalize(ent, tick, 0, false, true), true
 	}
 
 	// Deterministic collision substeps within the current cell.
@@ -287,15 +290,25 @@ func (e *Engine) stepEntity(ent *entity, tick uint32) (MovementUpdate, bool) {
 		final = candidate
 	}
 	ent.position = final
-	ent.volumeFlags = e.collision.VolumeFlagsAt(final)
 	if blocked {
 		// Partial progress is retained, but the entity ends the step
 		// stopped against the obstruction.
-		ent.speed = 0
-		return e.update(ent, tick, 0, true, false), true
+		return e.finalize(ent, tick, 0, true, false), true
 	}
-	ent.speed = wireSpeed
-	return e.update(ent, tick, wireSpeed, false, false), true
+	return e.finalize(ent, tick, wireSpeed, false, false), true
+}
+
+// finalize is the single movement finalization path (spec §5.3.6):
+// every movement-emitting outcome passes through here. It sets the
+// final speed, samples VolumeFlagsAt at the final authoritative
+// position (even when translation was held, staged, or defensively
+// corrected), updates entity volume flags, and builds the
+// MovementUpdate. A never-controlled idle entity never reaches this
+// path, so it performs no world queries merely for volume flags.
+func (e *Engine) finalize(ent *entity, tick uint32, speed uint8, blocked, handoff bool) MovementUpdate {
+	ent.speed = speed
+	ent.volumeFlags = e.collision.VolumeFlagsAt(ent.position)
+	return e.update(ent, tick, speed, blocked, handoff)
 }
 
 // update builds the MovementUpdate for the entity's current

@@ -786,6 +786,74 @@ func TestVolumeFlags(t *testing.T) {
 	}
 }
 
+func TestVolumeResampleStationaryProcessed(t *testing.T) {
+	current := world.VolumeFlags(7)
+	fc := &fakeCollision{flags: func(world.Vec3) world.VolumeFlags { return current }}
+	sink := &recordSink{}
+	e := mustEngine(t, 20, EngineDeps{Clock: newManualClock(), RNG: newTestRNG(1), Collision: fc, Movement: sink})
+	pos := world.Vec3{X: 16, Z: 16}
+	snap, _ := e.AddEntity(pos)
+	if snap.VolumeFlags != world.VolumeFlags(7) {
+		t.Fatalf("initial flags = %d, want 7", uint32(snap.VolumeFlags))
+	}
+	// The world changes under the unchanged position.
+	current = world.VolumeFlags(9)
+	submitMove(t, e, snap.ID, 1, 0, 0, 1500)
+	e.Step()
+	got, _ := e.Entity(snap.ID)
+	if got.Position != pos {
+		t.Fatalf("stationary step moved: %v", got.Position)
+	}
+	if got.Speed != 0 {
+		t.Fatalf("speed = %d, want 0", got.Speed)
+	}
+	if got.Yaw != 1500 || got.LastProcessedInputSeq != 1 {
+		t.Fatalf("yaw/anchor = %d/%d, want 1500/1", got.Yaw, got.LastProcessedInputSeq)
+	}
+	if got.VolumeFlags != world.VolumeFlags(9) {
+		t.Fatalf("snapshot flags = %d, want resampled 9", uint32(got.VolumeFlags))
+	}
+	u := sink.all()
+	if len(u) != 1 {
+		t.Fatalf("updates = %d, want 1", len(u))
+	}
+	if u[0].VolumeFlags != world.VolumeFlags(9) {
+		t.Fatalf("update flags = %d, want 9", uint32(u[0].VolumeFlags))
+	}
+}
+
+func TestVolumeResampleHandoffStaging(t *testing.T) {
+	current := world.VolumeFlags(7)
+	fc := &fakeCollision{flags: func(world.Vec3) world.VolumeFlags { return current }}
+	sink := &recordSink{}
+	e := mustEngine(t, 20, EngineDeps{Clock: newManualClock(), RNG: newTestRNG(1), Collision: fc, Movement: sink})
+	snap, _ := e.AddEntity(world.Vec3{X: 31.9, Z: 16})
+	if snap.VolumeFlags != world.VolumeFlags(7) {
+		t.Fatalf("initial flags = %d, want 7", uint32(snap.VolumeFlags))
+	}
+	// Flags change at the (about to be held) source position.
+	current = world.VolumeFlags(9)
+	submitMove(t, e, snap.ID, 1, MoveDirForward, 0, 1024) // +X toward 32
+	e.Step()
+	got, _ := e.Entity(snap.ID)
+	if got.Position.X != 31.9 {
+		t.Fatalf("staging step moved: %v", got.Position)
+	}
+	if got.Speed != 0 {
+		t.Fatalf("speed = %d, want 0", got.Speed)
+	}
+	if got.VolumeFlags != world.VolumeFlags(9) {
+		t.Fatalf("snapshot flags = %d, want resampled 9", uint32(got.VolumeFlags))
+	}
+	u := sink.all()
+	if len(u) != 1 || !u[0].HandoffRequired {
+		t.Fatalf("updates = %+v, want one handoff-staged update", sink.all())
+	}
+	if u[0].VolumeFlags != world.VolumeFlags(9) {
+		t.Fatalf("update flags = %d, want 9", uint32(u[0].VolumeFlags))
+	}
+}
+
 func TestStationaryProcessedUpdate(t *testing.T) {
 	sink := &recordSink{}
 	e := mustEngine(t, 20, EngineDeps{Clock: newManualClock(), RNG: newTestRNG(1), Movement: sink})
