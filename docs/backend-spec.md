@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.15 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.16 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -778,6 +778,245 @@ type MovementUpdate struct {
   session-local `NetEntityID u32` (no truncation/cast); M4-T5
   maps per-session handles and zeroes the anchor for non-owner
   viewers while the owner's `205` carries the real anchor.
+
+### 5.4 Cell ownership and entity handoff (frozen, v0.3.16)
+
+This section refines §5.1 for M4-T3a: per-entity cell ownership
+generations, deterministic movement-triggered handoff, and bounded
+migration-intent routing. It adds no cross-cell operations, no PG
+work, and no gateway wiring.
+
+M4-T3a owns ONLY: per-entity cell ownership generation, resident vs
+migrating ownership state, movement-triggered cross-cell handoff,
+deterministic handoff tick semantics, source quiescence, destination
+installation, bounded movement-intent queue during migration,
+generation validation/idempotent handoff delivery, and
+handoff race/determinism tests.
+
+M4-T3a does NOT own: cross-cell opID generation, cross-cell
+damage/trade operations, generic opID dedupe caches, post-commit PG
+reconciliation, the snapshot saver, gateway opcode-102 production
+wiring, NetEntityID mapping, AOI, presence, outbound 204/205/206
+fanout, or inbound token buckets. Ownership remains: M4-T3b →
+opID/dedupe/retry infrastructure; M4-T3c → post-commit durable
+reconciliation; M4-T4 → saver; M4-T5 → real gateway/AOI/rate-limit
+integration.
+
+At M4-T3a the only implemented sim gameplay intent is `MoveIntent`,
+so T3a implements migration queue/routing semantics for movement;
+future gameplay tasks MUST reuse the same ownership/migration
+concept rather than inventing a second handoff mechanism. No fake
+Attack/Trade implementations exist merely to make the queue
+"generic". M4-T3a does NOT send wire `202` itself: §5.1's "sender
+receives `202 error{retry}` on migration-queue saturation" becomes
+the domain result `ErrMigrationQueueFull`, which M4-T5 later maps to
+`proto.ErrorCodeRetry`. T3a imports neither `internal/proto` nor
+`internal/gateway` for this.
+
+#### 5.4.1 Ownership identity
+
+Every resident entity carries an ownership reference,
+conceptually:
+
+```go
+type OwnerRef struct {
+    Cell       world.CellCoord
+    Generation uint64
+}
+```
+
+Rules: Generation 0 is reserved/invalid; a new entity starts at
+Generation 1; each successful cell handoff increments Generation
+exactly once; the EntityID never changes; generation never
+decreases and never wraps to 0. The pair `{Cell, Generation}` is
+the ownership epoch. The immutable inspection snapshot exposes the
+current ownership generation alongside the existing `Cell`; no
+mutable ownership pointer escapes.
+
+If an entity at `Generation == math.MaxUint64` would need another
+handoff: do NOT wrap, transfer, change cell, or create destination
+membership. A stable internal `ErrOwnershipGenerationExhausted`
+(or equivalent) results; for movement processing, yaw and a newly
+processed reconciliation anchor may advance while translation
+holds at the source position with `speed = 0` and
+`HandoffRequired = true`. This practically-unreachable internal
+exhaustion is NOT migration queue saturation and MUST NOT become
+`202 retry`.
+
+#### 5.4.2 Resident vs migrating states
+
+A live entity is conceptually `RESIDENT` or `MIGRATING`. At normal
+tick boundaries in the local MVP all healthy live entities are
+`RESIDENT`. `MIGRATING` is the explicit handoff state between
+source quiescence and destination installation: the old source
+`OwnerRef` remains the logical authoritative owner but is QUIESCED
+and performs no further gameplay mutation; the destination accepts
+no entity gameplay yet; new movement intents go to the bounded
+migration queue. There is never a moment where both source and
+destination mutate the entity.
+
+Because all cells live in one process, begin-migration and
+destination install normally occur within the same simulation Step
+— but they MUST be distinct internal operations/state so tests
+can prove source quiescence, mid-migration intent routing,
+generation validation, queue saturation behavior, and destination
+install. Migration MUST NOT be faked by merely assigning
+`entity.cell = dest` inside movement.
+
+#### 5.4.3 Tick-start worklist and at-most-once processing
+
+At the start of every Step, after incrementing the tick, the
+engine captures the resident entity worklist in canonical order
+(CellCoord X ascending, then Z ascending, then EntityID
+ascending), each item retaining enough ownership identity to
+prove it still names the same resident epoch when processed
+(conceptually EntityID + source CellCoord + source Generation).
+The worklist is ownership identity/order only, never copied
+entity state.
+
+An entity in the tick-start worklist is processed AT MOST ONCE
+per tick: migrating into a later-sorting (or earlier-sorting)
+cell grants no second processing; a newly installed destination
+entity becomes eligible for normal cell processing on the NEXT
+tick only. Before processing an item the engine verifies it is
+still resident under the expected cell and generation; a
+legitimately removed/migrated item is skipped, never resurrected.
+
+#### 5.4.4 Collision-aware handoff flow
+
+v0.3.15's handoff-before-collision staging was temporary and is
+superseded: T3a computes the intended displacement, performs the
+normal deterministic `0.25 m` collision substeps ACROSS the path
+(the source owner MAY query `CollisionWorld` for candidates past
+the boundary — world query data, not mutable neighbor-entity
+state — but MUST NOT mutate the destination's entity collection
+except through handoff install), obtains the ACTUAL final
+authoritative position, and routes on
+`CellForPosition(actualFinal)`: same cell stays resident with no
+generation change; a different cell hands off to that computed
+cell (never a hard-coded ±1 neighbor, so diagonal corner
+crossings into `X±1, Z±1` and future portal/admin remaps work).
+
+Collision before the boundary yields the normal blocked result
+with no migration and unchanged generation. Collision after
+crossing retains the last-free position and, when that position
+is destination-side, hands off with `speed = 0`, `Blocked =
+true`. Collision never forces rollback to the source merely
+because blocking happened after crossing.
+
+Begin-handoff preconditions (entity resident, resident cell and
+generation match the expected source, destination differs,
+destination position valid, next generation representable and
+nonzero) mutate nothing on failure. All source-owned gameplay
+calculation for the tick (pending-input consumption,
+yaw/control/anchor update, run-gate decision,
+movement/collision/final-position calculation) completes BEFORE
+the handover point; afterwards only destination-owned
+installation/finalization mutates the entity.
+
+#### 5.4.5 Handoff record, install, and idempotence
+
+The internal handoff/migration record carries at minimum the
+`EntityID`, the From/To `OwnerRef`s, and the migrating
+entity/state — never database IDs, NetEntityIDs, session IDs,
+proto messages, or opID dedupe state (T3b extends handoff state
+with its own dedupe data later). Handoff preserves EntityID,
+position-history ring (transferred, never recreated: no gap, no
+loss, no ABA), yaw, speed, volume flags, active heldDirs/run
+request, accepted/processed sequence state, and any pending
+intent. Nothing resets merely because a cell changed.
+
+Destination installation atomically, under the one sim writer:
+remove source resident membership / quiesced migration
+ownership, lazily create the destination active cell, install the
+same EntityID exactly once, set destination Cell and Generation
+`G+1` (exactly one increment per successful handoff; one
+authoritative increment site, never begin+install double bumps),
+update locator/route, preserve all gameplay state, restore the
+resident route, drop the migration record, and remove an emptied
+source cell. EntityCount is unchanged; the same EntityID is never
+resident in both cell maps at once.
+
+Installation validates the ownership token (From `G` → To
+`G+1` against the same migration; wrong source/destination,
+wrong EntityID, or generation gap is a stable `errors.Is`
+ownership invariant error, never a silent repair). A duplicate
+delivery of an already-installed transfer inserts nothing,
+bumps nothing, resets nothing, and replays no queue (ownership
+generation suffices — no T3b opID). A stale (older-generation)
+delivery mutates nothing and never rolls ownership backwards; a
+future-generation gap is an invariant error.
+
+#### 5.4.6 Healthy movement output and history
+
+A successful cross-cell transfer reports the final destination
+position, the actual final movement speed (or 0 when collision
+blocked), the actual collision outcome, and
+`HandoffRequired = false` — that marker now means only a
+handoff that could NOT be performed (e.g. generation
+exhaustion/internal inability), and stays an internal field,
+never a wire field. Destination volume state is
+`VolumeFlagsAt(final destination position)`; snapshot, update,
+and history-final state agree on the same final position/flags.
+
+Tick-N crossing appends exactly ONE `PositionSample` for tick N
+holding the final destination position — never the source
+position, the boundary point, or two samples. Held movement
+continues without pause: tick N crosses one full normal
+distance, tick N+1 moves another full normal distance in the
+destination (no pause ticks, no same-tick double movement).
+
+The manual `SetPosition` API stays same-cell-only:
+cross-cell `SetPosition` still returns
+`ErrCellHandoffRequired` with zero mutation. Movement handoff
+uses its dedicated ownership path; portal/admin remaps belong
+later.
+
+#### 5.4.7 Bounded migration MoveIntent queue
+
+Each migrating entity owns a true bounded FIFO movement queue
+with `MigrationMoveQueueCapacity = 64` — generous against the
+≤10 Hz input rate and the normally sub-tick local window, with
+no unbounded growth, no external broker, no goroutine.
+
+Resident `SubmitMove` behavior is byte-for-byte v0.3.15
+(yaw/sample-tick validation, first-seq-any, dup/stale, RFC1982
+ambiguity, newest-accepted tracking, pending coalescing).
+While migrating, intents do NOT touch active control, the
+processed anchor, or the quiesced source; they route into the
+migration queue after stateless validation (`Yaw <= 4095`,
+sample-tick sanity vs the current sim tick — invalid movement
+never consumes queue capacity). Migration routing keeps its own
+sequence frontier seeded from the entity's existing accepted
+state: duplicates return `MoveDuplicate`, stale return
+`MoveStale`, half-range gaps return `ErrAmbiguousInputSeq`,
+and only newer accepted intents queue — without yet mutating
+`lastAcceptedInputSeq`, pending, active controls, or the
+processed anchor.
+
+A valid/newer intent arriving at a full 64-entry queue returns
+`ErrMigrationQueueFull` with ZERO mutation (no append, no
+frontier advance, no InputSeq consumption, queued content
+untouched), so the same InputSeq stays retryable once capacity
+frees or the handoff completes. Only this saturation maps (in
+M4-T5) to `202 error{retry}` — never mere migrating status,
+generation changes, or completed handoffs.
+
+After destination installation the queue drains FIFO through
+the SAME resident sequencing/coalescing semantics (never a
+manual final-payload copy): queued `10, 11, 12` leaves
+`lastAcceptedInputSeq == 12` with pending `12` while the
+processed anchor stays at the crossing tick's value; the queued
+newest control is processed on the NEXT simulation tick, never
+as same-tick second movement. Queueing/draining alone never
+touches position history.
+
+T3a adds no generic opID dedupe, no PG involvement, no
+per-cell goroutines/actors/buses, and no mutex-protected
+concurrent `Step`/`SubmitMove` claims: the single-sim-writer
+model stands, and M4-T5 owns real ingress serialization. The
+ownership seam is shaped so future transport can replace local
+delivery without changing gameplay rules.
 
 ## 6. WebSocket protocol (binary, versioned — DECISION §13.8)
 
@@ -2260,6 +2499,13 @@ ledger is never replayed.
    survives it.
 
 ## 14. Version history
+
+- v0.3.16: freeze M4 cell handoff semantics — {cell,generation}
+  ownership epochs, generation-1 initial ownership, canonical tick-start
+  worklists guaranteeing at-most-once entity processing per tick, real
+  collision-aware cross-cell movement transfer, explicit resident/migrating
+  route states, preserved entity/history/control state, bounded migration
+  MoveIntent routing, and queue-full-only retry semantics.
 
 - v0.3.15: freeze M4 authoritative movement semantics — held-direction bit
   assignments and Godot-friendly yaw convention, normalized horizontal

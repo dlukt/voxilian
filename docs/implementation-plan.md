@@ -1,6 +1,6 @@
 # Voxilian Backend — Implementation Plan (v1.2)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.15).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.16).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -102,7 +102,7 @@ Exit: 20 Hz tick loop, cells, server-authoritative movement with reconciliation 
 
 - [x] **M4-T1** Tick loop + cell/entity skeleton: fixed-step configurable tick loop (default 20 Hz), XZ 32 m cells with floor-correct negative coordinates, one in-process sim writer, opaque monotonic EntityID registry, deterministic cell/entity iteration, injectable clock+RNG, 2-second post-tick position history. No movement/handoff/AOI. Spec: §4, §5.
 - [x] **M4-T2** Movement semantics/integration: sim-domain MoveIntent matching 102 (inputSeq/heldDirs/run/yaw/sampleTick), RFC1982 input coalescing, fixed-step walk/run integration, minimal CollisionWorld + volume flags, vigor RunGate hook, 205-compatible MovementUpdate/reconciliation anchor, and defensive displacement anomaly hook. No gateway NetEntityID/AOI fanout; M4-T5 wires transport/rate-limits/fanout. Spec: §5, §6.3, §11.
-- [ ] **M4-T3a** Cell ownership + entity handoff: epoch/generation, migrate-queue routing (`202 error{retry}` only on saturation). Handoff tests. Spec: §5.1.
+- [ ] **M4-T3a** Cell ownership + entity handoff: per-entity {cell,generation} ownership epochs, canonical tick-start worklist preventing same-tick double processing, real movement-triggered cross-cell transfer with preserved history/control state, explicit RESIDENT/MIGRATING route state, and bounded migration MoveIntent queue (queue saturation is the sole later 202 retry condition). No opID/dedupe, PG reconciliation, gateway/AOI wiring, or saver. Spec: §5.1, §5.4.
 - [ ] **M4-T3b** Cross-cell op infrastructure: `opID` generation/delivery/dedupe/retry (bounded cache) against a SYNTHETIC aggregate operation — no real trade logic here. Spec: §5.1.
 - [ ] **M4-T3c** Post-commit reconciliation infrastructure: synthetic durable commit + dropped notification → aggregate reloaded from PG before next mutation. (Real trade semantics belong solely to M8.) Spec: §5.1, §8.1.
 - [ ] **M4-T4** Snapshot saver: 60 s dirty-queue + critical write-through paths, aggregate-root CAS writes, stale-write metric, shutdown flush with deadline. Crash-injection tests (kill mid-save → invariants hold). Spec: §8.1, §10.
