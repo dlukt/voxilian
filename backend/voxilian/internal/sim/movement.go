@@ -248,6 +248,30 @@ func checkDisplacement(base, candidate world.Vec3, maxDist float64) (bool, float
 	return observed <= maxDist+displacementEpsilonMeters, observed
 }
 
+// classifyMoveIntent orders one input sequence against accepted
+// state using only canonical serial32 arithmetic (spec §5.3.4). It is
+// shared by resident SubmitMove, migration routing, and queue drain
+// so all three apply identical semantics: first input accepts
+// anything, same is duplicate, serially-before is stale,
+// serially-after accepts, and the exact 2^31 gap is an ambiguity
+// error rather than a silent stale.
+func classifyMoveIntent(hasAccepted bool, lastAccepted, seq uint32) (MoveDisposition, error) {
+	if !hasAccepted {
+		return MoveAccepted, nil
+	}
+	if seq == lastAccepted {
+		return MoveDuplicate, nil
+	}
+	if isAmbiguousSeq(seq, lastAccepted) {
+		return MoveAccepted, fmt.Errorf("%w: input %d vs accepted %d",
+			ErrAmbiguousInputSeq, seq, lastAccepted)
+	}
+	if serial32.After(seq, lastAccepted) {
+		return MoveAccepted, nil
+	}
+	return MoveStale, nil
+}
+
 // isAmbiguousSeq reports whether two unequal sequences are exactly
 // 2^31 apart — serially neither before nor after.
 func isAmbiguousSeq(a, b uint32) bool {

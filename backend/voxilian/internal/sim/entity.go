@@ -33,6 +33,9 @@ type EntitySnapshot struct {
 	Speed                 uint8
 	VolumeFlags           world.VolumeFlags
 	LastProcessedInputSeq uint32
+	// OwnershipGeneration is the current {cell,generation} epoch's
+	// generation (spec §5.4.1): 1 at creation, +1 per handoff.
+	OwnershipGeneration uint64
 }
 
 // entity is the M4-T1 base entity (identity, authoritative position,
@@ -45,6 +48,10 @@ type entity struct {
 	position world.Vec3
 	cell     world.CellCoord
 	history  *positionHistory
+
+	// generation is the ownership epoch generation (spec §5.4.1):
+	// reserved 0 is never stored on a live entity.
+	generation uint64
 
 	yaw         uint16
 	speed       uint8
@@ -72,5 +79,6 @@ func (e *entity) snapshot() EntitySnapshot {
 		Speed:                 e.speed,
 		VolumeFlags:           e.volumeFlags,
 		LastProcessedInputSeq: e.lastProcessedSeq,
+		OwnershipGeneration:   e.generation,
 	}
 }

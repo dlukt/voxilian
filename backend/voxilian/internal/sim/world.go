@@ -15,15 +15,19 @@ type cell struct {
 	entities map[EntityID]*entity
 }
 
-// registry is the active-cell/entity container (spec §5.2.5):
-// nextEntityID allocates fresh opaque IDs, cells holds the active sim
-// ownership set, and entityCell locates every live entity. No duplicate
-// state structures may diverge: the cell map owns entities, the locator
-// only records which cell owns each ID.
+// registry is the active-cell/entity container (spec §5.2.5/§5.4):
+// nextEntityID allocates fresh opaque IDs, cells holds the active
+// sim ownership set, entityCell locates every RESIDENT entity, and
+// migrations holds every MIGRATING entity's record (which owns the
+// quiesced entity object — never a second copy). Every live EntityID
+// has exactly one route: resident XOR migrating. No duplicate state
+// structures may diverge: the cell map owns resident entities, the
+// locator only records which cell owns each ID.
 type registry struct {
 	nextEntityID    EntityID
 	cells           map[world.CellCoord]*cell
 	entityCell      map[EntityID]world.CellCoord
+	migrations      map[EntityID]*migrationRecord
 	historyCapacity int
 }
 
@@ -37,6 +41,7 @@ func newRegistry(historyCapacity int) *registry {
 		nextEntityID:    InvalidEntityID + 1,
 		cells:           make(map[world.CellCoord]*cell),
 		entityCell:      make(map[EntityID]world.CellCoord),
+		migrations:      make(map[EntityID]*migrationRecord),
 		historyCapacity: historyCapacity,
 	}
 }
@@ -66,14 +71,16 @@ func (r *registry) AddEntity(pos world.Vec3) (EntitySnapshot, error) {
 		r.cells[coord] = c
 	}
 	// Movement state starts zeroed: yaw 0, speed 0, no accepted or
-	// processed input, zero held control (spec §5.3.7). Volume flags
-	// default to VolumeNone here; Engine.AddEntity samples the real
-	// collision world at the initial position afterwards.
+	// processed input, zero held control (spec §5.3.7). Ownership
+	// starts at Generation 1 (spec §5.4.1). Volume flags default to
+	// VolumeNone here; Engine.AddEntity samples the real collision
+	// world at the initial position afterwards.
 	e := &entity{
-		id:       id,
-		position: pos,
-		cell:     coord,
-		history:  newPositionHistory(r.historyCapacity),
+		id:         id,
+		position:   pos,
+		cell:       coord,
+		history:    newPositionHistory(r.historyCapacity),
+		generation: 1,
 	}
 	c.entities[id] = e
 	r.entityCell[id] = coord
@@ -83,10 +90,17 @@ func (r *registry) AddEntity(pos world.Vec3) (EntitySnapshot, error) {
 
 // RemoveEntity deletes the entity from its owning cell, deletes the
 // global locator entry, and discards its history with it (spec
-// §5.2.5/§5.2.6). Empty active cells are removed: T1 cells represent
-// active sim ownership, not terrain storage. Unknown IDs return
-// ErrEntityNotFound. IDs are never reused.
+// §5.2.5/§5.2.6). A migrating entity is removed from its migration
+// record instead (queue and history dropped with it). Empty resident
+// cells are removed: T1 cells represent active sim ownership, not
+// terrain storage. Unknown IDs return ErrEntityNotFound. IDs are
+// never reused.
 func (r *registry) RemoveEntity(id EntityID) error {
+	if rec, ok := r.migrations[id]; ok {
+		_ = rec
+		delete(r.migrations, id)
+		return nil
+	}
 	coord, ok := r.entityCell[id]
 	if !ok {
 		return fmt.Errorf("%w: id %d", ErrEntityNotFound, uint64(id))
@@ -112,6 +126,11 @@ func (r *registry) RemoveEntity(id EntityID) error {
 // M4-T3a owns real handoff and T1 MUST NOT silently move entities
 // between cell maps.
 func (r *registry) SetPosition(id EntityID, pos world.Vec3) error {
+	if _, ok := r.migrations[id]; ok {
+		// Ownership is in flux; manual position mutation cannot apply.
+		// Movement handoff uses its dedicated ownership path.
+		return fmt.Errorf("%w: id %d migrating", ErrCellHandoffRequired, uint64(id))
+	}
 	coord, ok := r.entityCell[id]
 	if !ok {
 		return fmt.Errorf("%w: id %d", ErrEntityNotFound, uint64(id))
@@ -135,8 +154,13 @@ func (r *registry) SetPosition(id EntityID, pos world.Vec3) error {
 	return nil
 }
 
-// Entity returns an immutable snapshot copy (spec §5.2.5).
+// Entity returns an immutable snapshot copy (spec §5.2.5). A
+// migrating entity still inspects (read-only) under its quiesced
+// source ownership; inspection never mutates route state.
 func (r *registry) Entity(id EntityID) (EntitySnapshot, error) {
+	if rec, ok := r.migrations[id]; ok {
+		return rec.entity.snapshot(), nil
+	}
 	coord, ok := r.entityCell[id]
 	if !ok {
 		return EntitySnapshot{}, fmt.Errorf("%w: id %d", ErrEntityNotFound, uint64(id))
@@ -184,8 +208,12 @@ func (r *registry) EntitiesInCell(coord world.CellCoord) []EntitySnapshot {
 }
 
 // History returns a copy of the entity's retained position samples,
-// oldest -> newest. Removing the entity removes its history.
+// oldest -> newest. Removing the entity removes its history. The
+// quiesced migration record preserves history across handoff.
 func (r *registry) History(id EntityID) ([]PositionSample, error) {
+	if rec, ok := r.migrations[id]; ok {
+		return rec.entity.history.Samples(), nil
+	}
 	coord, ok := r.entityCell[id]
 	if !ok {
 		return nil, fmt.Errorf("%w: id %d", ErrEntityNotFound, uint64(id))
@@ -201,8 +229,10 @@ func (r *registry) History(id EntityID) ([]PositionSample, error) {
 	return e.history.Samples(), nil
 }
 
-// EntityCount reports the number of live entities (order-independent).
-func (r *registry) EntityCount() int { return len(r.entityCell) }
+// EntityCount reports the number of live entities, resident and
+// migrating alike (order-independent): a migrating entity is never
+// transiently lost.
+func (r *registry) EntityCount() int { return len(r.entityCell) + len(r.migrations) }
 
 // CellCount reports the number of active cells (order-independent).
 func (r *registry) CellCount() int { return len(r.cells) }

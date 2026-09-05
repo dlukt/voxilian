@@ -7,7 +7,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dlukt/voxilian/internal/serial32"
 	"github.com/dlukt/voxilian/internal/world"
 )
 
@@ -140,35 +139,38 @@ func (e *Engine) HistoryCapacity() int { return e.registry.historyCapacity }
 func (e *Engine) RandUint64() uint64 { return e.rng.Uint64() }
 
 // Step executes exactly one fixed simulation step (spec
-// §5.2.8/§5.3.7):
+// §5.2.8/§5.3.7/§5.4.3):
 //
 //  1. allocate/increment tick (0 -> 1 for the first step; u32 wrap is normal)
-//  2. process active cells in canonical CellCoord order
-//  3. within a cell inspect/process entities in EntityID ascending order
+//  2. capture the tick-start resident ownership worklist in canonical
+//     CellCoord/EntityID order with expected generations
+//  3. per work item (at most once per entity per tick): verify still
+//     resident under the expected epoch, else skip
 //  4. consume newest pending movement input into active yaw/control/anchor
 //  5. integrate horizontal movement (walk/run via RunGate)
-//  6. resolve collision substeps / cross-cell handoff staging
+//  6. resolve collision substeps across the path, then hand off on a
+//     cross-cell final position (or hold on generation exhaustion)
 //  7. sample final volume flags
 //  8. emit MovementUpdate through the sink when applicable
-//  9. append each live entity's post-step position-history sample
+//  9. append each processed entity's post-step position-history sample
 //
-// T2 adds movement phases 4-8; future systems likewise insert BEFORE
-// history sampling. Gameplay MUST NOT run after the same tick's
-// historical sample. Because T2 forbids actual handoff, movement
-// cannot mutate cell membership during iteration.
+// A migrated-in entity is absent from the tick-start worklist, so it
+// can never be processed twice in one tick; it becomes eligible on
+// the NEXT tick. Because handoff (not removal) is the only
+// membership change, iteration needs no copy-on-write. Future
+// systems insert their phase BEFORE history sampling; gameplay MUST
+// NOT run after the same tick's historical sample.
 func (e *Engine) Step() {
 	tick := e.tick.Add(1)
-	for _, coord := range e.registry.CellCoords() {
-		for _, snap := range e.registry.EntitiesInCell(coord) {
-			ent, err := e.registry.lookup(snap.ID)
-			if err != nil {
-				continue
-			}
-			if update, emit := e.stepEntity(ent, tick); emit && e.movement != nil {
-				e.movement.OnMovement(update)
-			}
-			ent.history.Append(PositionSample{Tick: tick, Position: ent.position})
+	for _, item := range e.registry.residentWorklist() {
+		ent := e.registry.verifyResident(item)
+		if ent == nil {
+			continue
 		}
+		if update, emit := e.stepEntity(ent, tick); emit && e.movement != nil {
+			e.movement.OnMovement(update)
+		}
+		ent.history.Append(PositionSample{Tick: tick, Position: ent.position})
 	}
 }
 
@@ -249,26 +251,11 @@ func (e *Engine) stepEntity(ent *entity, tick uint32) (MovementUpdate, bool) {
 		return e.finalize(ent, tick, 0, false, false), true
 	}
 
-	// Cross-cell staging BEFORE collision: M4-T3a owns handoff, so an
-	// intended final position in another cell holds translation
-	// exactly (no creep, no transfer), with yaw/anchor already
-	// updated above.
-	dest, err := world.CellForPosition(intended)
-	if err != nil {
-		e.observe(MovementAnomaly{
-			EntityID:            ent.id,
-			Tick:                tick,
-			Kind:                AnomalyInvalidCandidate,
-			ExpectedMaxDistance: distance,
-			ObservedDistance:    distance,
-		})
-		return e.finalize(ent, tick, 0, false, false), true
-	}
-	if dest != ent.cell {
-		return e.finalize(ent, tick, 0, false, true), true
-	}
-
-	// Deterministic collision substeps within the current cell.
+	// Deterministic collision substeps across the full displacement.
+	// Candidates may cross a cell boundary: collision data is world
+	// query data, and routing happens on the ACTUAL final
+	// authoritative position (spec §5.4.4). This supersedes the
+	// temporary T2 handoff-before-collision staging.
 	final := ent.position
 	blocked := false
 	substeps := int(math.Ceil(distance / MaxCollisionStepMeters))
@@ -289,13 +276,53 @@ func (e *Engine) stepEntity(ent *entity, tick uint32) (MovementUpdate, bool) {
 		}
 		final = candidate
 	}
-	ent.position = final
-	if blocked {
-		// Partial progress is retained, but the entity ends the step
-		// stopped against the obstruction.
-		return e.finalize(ent, tick, 0, true, false), true
+	dest, err := world.CellForPosition(final)
+	if err != nil {
+		e.observe(MovementAnomaly{
+			EntityID:            ent.id,
+			Tick:                tick,
+			Kind:                AnomalyInvalidCandidate,
+			ExpectedMaxDistance: distance,
+			ObservedDistance:    distance,
+		})
+		return e.finalize(ent, tick, 0, false, false), true
 	}
-	return e.finalize(ent, tick, wireSpeed, false, false), true
+	if dest == ent.cell {
+		ent.position = final
+		if blocked {
+			// Partial progress is retained, but the entity ends the step
+			// stopped against the obstruction.
+			return e.finalize(ent, tick, 0, true, false), true
+		}
+		return e.finalize(ent, tick, wireSpeed, false, false), true
+	}
+	// Cross-cell final: real ownership handoff (spec §5.4.4/§5.4.5).
+	// All source gameplay calculation is complete; begin quiesces the
+	// source and commit installs the destination in the same Step.
+	start := ent.position
+	ent.position = final
+	from := OwnerRef{Cell: ent.cell, Generation: ent.generation}
+	tok, err := e.registry.beginHandoff(ent.id, from, dest)
+	if err != nil {
+		// Generation exhaustion (or unexpected mismatch): hold the
+		// source position with zero transfer. Yaw/anchor were
+		// already consumed above and still advance.
+		ent.position = start
+		return e.finalize(ent, tick, 0, false, true), true
+	}
+	speed := wireSpeed
+	if blocked {
+		speed = 0
+	}
+	if _, err := e.registry.commitHandoff(tok); err != nil {
+		// Practically unreachable locally (the token was just
+		// issued): roll back rather than strand the entity
+		// mid-migration, then hold as above.
+		e.registry.abortHandoff(ent.id)
+		ent.position = start
+		return e.finalize(ent, tick, 0, false, true), true
+	}
+	return e.finalize(ent, tick, speed, blocked, false), true
 }
 
 // finalize is the single movement finalization path (spec §5.3.6):
@@ -335,14 +362,21 @@ func (e *Engine) observe(a MovementAnomaly) {
 }
 
 // SubmitMove queues/replaces authoritative movement CONTROL state for
-// an entity (spec §5.3.4). It does NOT immediately integrate
-// position; positions change only on Step. Validation (entity
+// an entity (spec §5.3.4/§5.4.7). When RESIDENT it does NOT
+// immediately integrate position; positions change only on Step.
+// While MIGRATING, valid newer intents route into the entity's
+// bounded migration queue without touching active control, the
+// processed anchor, or the quiesced source. Validation (entity
 // existence, yaw validity, sample-tick sanity, serial InputSeq
 // classification) is deterministic, and a rejected intent mutates
 // nothing: no pending input, active control, accepted/processed
-// sequence, position, or yaw change. In particular a rejected
-// future-tick intent does NOT consume its InputSeq.
+// sequence, position, yaw, queue content, or routing frontier change.
+// In particular a rejected future-tick intent does NOT consume its
+// InputSeq.
 func (e *Engine) SubmitMove(id EntityID, intent MoveIntent) (MoveDisposition, error) {
+	if rec, ok := e.registry.migrations[id]; ok {
+		return e.submitMigrating(rec, intent)
+	}
 	ent, err := e.registry.lookup(id)
 	if err != nil {
 		return MoveAccepted, err
@@ -353,30 +387,45 @@ func (e *Engine) SubmitMove(id EntityID, intent MoveIntent) (MoveDisposition, er
 	if err := classifySampleTick(intent.SampleTick, e.tick.Load(), e.tickHz); err != nil {
 		return MoveAccepted, err
 	}
-	if !ent.hasAccepted {
-		// First input: ANY u32 sequence is accepted.
-		ent.hasAccepted = true
-		ent.lastAcceptedSeq = intent.InputSeq
-		ent.pending = intent
-		ent.hasPending = true
-		return MoveAccepted, nil
+	d, err := classifyMoveIntent(ent.hasAccepted, ent.lastAcceptedSeq, intent.InputSeq)
+	if err != nil || d != MoveAccepted {
+		// Duplicate/stale are no-ops (a client cannot rewrite
+		// control under a seen sequence); ambiguity errors out.
+		return d, err
 	}
-	if intent.InputSeq == ent.lastAcceptedSeq {
-		// Duplicate (even with a different payload): no mutation, so
-		// a client cannot rewrite control under a seen sequence.
-		return MoveDuplicate, nil
+	ent.hasAccepted = true
+	ent.lastAcceptedSeq = intent.InputSeq
+	ent.pending = intent
+	ent.hasPending = true
+	return MoveAccepted, nil
+}
+
+// submitMigrating routes one intent into a quiesced migration's
+// bounded FIFO (spec §5.4.7). Stateless validation runs before queue
+// capacity is touched; sequencing uses the route's private frontier
+// (seeded from the entity's accepted state at begin); only newer
+// accepted intents append, advancing the frontier — never entity
+// control state. A full queue rejects with ErrMigrationQueueFull and
+// zero mutation, leaving the InputSeq retryable.
+func (e *Engine) submitMigrating(rec *migrationRecord, intent MoveIntent) (MoveDisposition, error) {
+	if intent.Yaw > MaxYaw {
+		return MoveAccepted, fmt.Errorf("%w: yaw %d", ErrInvalidMoveYaw, intent.Yaw)
 	}
-	if isAmbiguousSeq(intent.InputSeq, ent.lastAcceptedSeq) {
-		return MoveAccepted, fmt.Errorf("%w: input %d vs accepted %d",
-			ErrAmbiguousInputSeq, intent.InputSeq, ent.lastAcceptedSeq)
+	if err := classifySampleTick(intent.SampleTick, e.tick.Load(), e.tickHz); err != nil {
+		return MoveAccepted, err
 	}
-	if serial32.After(intent.InputSeq, ent.lastAcceptedSeq) {
-		ent.lastAcceptedSeq = intent.InputSeq
-		ent.pending = intent
-		ent.hasPending = true
-		return MoveAccepted, nil
+	d, err := classifyMoveIntent(rec.hasFrontier, rec.frontier, intent.InputSeq)
+	if err != nil || d != MoveAccepted {
+		return d, err
 	}
-	return MoveStale, nil
+	if len(rec.queued) >= MigrationMoveQueueCapacity {
+		return MoveAccepted, fmt.Errorf("%w: id %d len %d",
+			ErrMigrationQueueFull, uint64(rec.id), len(rec.queued))
+	}
+	rec.queued = append(rec.queued, intent)
+	rec.hasFrontier = true
+	rec.frontier = intent.InputSeq
+	return MoveAccepted, nil
 }
 
 // Run drives the fixed-step loop off the injected clock: one delivered

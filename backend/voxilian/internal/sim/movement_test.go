@@ -681,7 +681,7 @@ func TestCollisionNoTunneling(t *testing.T) {
 	}
 }
 
-func TestMovementHandoffStaging(t *testing.T) {
+func TestMovementHandoffPositiveBoundary(t *testing.T) {
 	obs := &recordObserver{}
 	sink := &recordSink{}
 	fc := &fakeCollision{}
@@ -690,65 +690,83 @@ func TestMovementHandoffStaging(t *testing.T) {
 	submitMove(t, e, snap.ID, 1, MoveDirForward, 0, 1024) // +X toward 32
 	e.Step()
 	got, _ := e.Entity(snap.ID)
-	if got.Position.X != 31.9 || got.Position.Z != 16 {
-		t.Fatalf("handoff step moved: %v", got.Position)
+	if math.Abs(got.Position.X-32.075) > 1e-9 || got.Position.Z != 16 {
+		t.Fatalf("handoff pos = %v, want (32.075,16)", got.Position)
 	}
-	if got.Speed != 0 {
-		t.Fatalf("speed = %d, want 0", got.Speed)
+	if got.Cell != (world.CellCoord{X: 1, Z: 0}) {
+		t.Fatalf("cell = %v, want {1 0}", got.Cell)
+	}
+	if got.ID != snap.ID {
+		t.Fatalf("ID changed: %d vs %d", got.ID, snap.ID)
+	}
+	if got.OwnershipGeneration != 2 {
+		t.Fatalf("generation = %d, want 2", got.OwnershipGeneration)
+	}
+	if got.Speed != 35 {
+		t.Fatalf("speed = %d, want 35", got.Speed)
 	}
 	if got.Yaw != 1024 || got.LastProcessedInputSeq != 1 {
 		t.Fatalf("yaw/anchor = %d/%d, want 1024/1", got.Yaw, got.LastProcessedInputSeq)
 	}
 	u := sink.all()
-	if len(u) != 1 || !u[0].HandoffRequired || u[0].Blocked || u[0].Speed != 0 {
-		t.Fatalf("update = %+v, want handoff-required speed-0", u)
+	if len(u) != 1 || u[0].HandoffRequired || u[0].Blocked || u[0].Speed != 35 {
+		t.Fatalf("update = %+v, want clean transfer update", u)
+	}
+	if math.Abs(u[0].Position.X-32.075) > 1e-9 {
+		t.Fatalf("update pos = %v, want destination", u[0].Position)
 	}
 	if obs.count() != 0 {
-		t.Fatalf("anomalies = %d, want 0 for ordinary handoff staging", obs.count())
+		t.Fatalf("anomalies = %d, want 0 for healthy handoff", obs.count())
 	}
-	// Handoff-staged history stores the unchanged source position.
+	// Exactly one history sample at the destination position.
 	h, _ := e.History(snap.ID)
-	if len(h) != 1 || h[0].Position.X != 31.9 {
-		t.Fatalf("history = %+v, want unchanged 31.9", h)
+	if len(h) != 1 || math.Abs(h[0].Position.X-32.075) > 1e-9 {
+		t.Fatalf("history = %+v, want one destination sample", h)
 	}
-	// No fake handoff after repeated attempts: membership, locator, and
-	// the active cell set are unchanged; no destination cell created.
-	for i := 0; i < 5; i++ {
-		e.Step()
+	// Source cell removed, destination holds the same ID once.
+	if coords := e.CellCoords(); len(coords) != 1 || coords[0] != (world.CellCoord{X: 1, Z: 0}) {
+		t.Fatalf("cells = %v, want only destination", coords)
 	}
-	again, _ := e.Entity(snap.ID)
-	if again.Position.X != 31.9 || again.Cell != (world.CellCoord{X: 0, Z: 0}) {
-		t.Fatalf("entity drifted/transferred: %+v", again)
-	}
-	coords := e.CellCoords()
-	if len(coords) != 1 || coords[0] != (world.CellCoord{X: 0, Z: 0}) {
-		t.Fatalf("cells = %v, want only source; no destination cell", coords)
+	if inCell := e.EntitiesInCell(world.CellCoord{X: 1, Z: 0}); len(inCell) != 1 || inCell[0].ID != snap.ID {
+		t.Fatalf("destination membership = %+v", inCell)
 	}
 }
 
 func TestMovementHandoffNegativeBoundary(t *testing.T) {
 	sink := &recordSink{}
 	e := mustEngine(t, 20, EngineDeps{Clock: newManualClock(), RNG: newTestRNG(1), Movement: sink})
-	// Cell -1 spans [-32,0): X=-31.9 moving -X would reach cell -2.
+	// Cell -1 spans [-32,0): X=-31.9 moving -X reaches cell -2.
 	snap, _ := e.AddEntity(world.Vec3{X: -31.9, Z: -16})
 	submitMove(t, e, snap.ID, 1, MoveDirForward, 0, 3072) // yaw3072 forward = -X
 	e.Step()
 	got, _ := e.Entity(snap.ID)
-	if got.Position.X != -31.9 {
-		t.Fatalf("negative handoff step moved: %v", got.Position)
+	if math.Abs(got.Position.X-(-32.075)) > 1e-9 {
+		t.Fatalf("negative handoff pos = %v, want -32.075", got.Position)
+	}
+	if got.Cell != (world.CellCoord{X: -2, Z: -1}) {
+		t.Fatalf("cell = %v, want {-2 -1}", got.Cell)
+	}
+	if got.OwnershipGeneration != 2 {
+		t.Fatalf("generation = %d, want 2", got.OwnershipGeneration)
 	}
 	u := sink.all()
-	if len(u) != 1 || !u[0].HandoffRequired {
-		t.Fatalf("update = %+v, want handoff-required", u)
+	if len(u) != 1 || u[0].HandoffRequired || u[0].Blocked {
+		t.Fatalf("update = %+v, want clean transfer", u)
 	}
-	// Crossing toward zero cell likewise stages: X=-0.05 moving +X.
+	// Crossing toward the zero cell likewise transfers: X=-0.05 moving
+	// +X reaches 0.125 in cell 0.
 	e2 := mustEngine(t, 20, EngineDeps{Clock: newManualClock(), RNG: newTestRNG(1)})
 	s2, _ := e2.AddEntity(world.Vec3{X: -0.05, Z: 0})
 	submitMove(t, e2, s2.ID, 1, MoveDirForward, 0, 1024) // +X to 0.125 (cell 0)
 	e2.Step()
 	g2, _ := e2.Entity(s2.ID)
-	if g2.Position.X != -0.05 || g2.Cell != (world.CellCoord{X: -1, Z: 0}) {
-		t.Fatalf("zero-crossing mutated: %+v", g2)
+	// Float yaw math leaves Z a hair below zero (cos(π/2) ≈ 6e-17),
+	// so the destination is {0,-1} by exact floor semantics.
+	if math.Abs(g2.Position.X-0.125) > 1e-9 || g2.Cell != (world.CellCoord{X: 0, Z: -1}) {
+		t.Fatalf("zero-crossing = %+v, want transfer to {0 -1}", g2)
+	}
+	if g2.OwnershipGeneration != 2 {
+		t.Fatalf("generation = %d, want 2", g2.OwnershipGeneration)
 	}
 }
 
@@ -822,7 +840,7 @@ func TestVolumeResampleStationaryProcessed(t *testing.T) {
 	}
 }
 
-func TestVolumeResampleHandoffStaging(t *testing.T) {
+func TestVolumeHandoffTransfer(t *testing.T) {
 	current := world.VolumeFlags(7)
 	fc := &fakeCollision{flags: func(world.Vec3) world.VolumeFlags { return current }}
 	sink := &recordSink{}
@@ -831,23 +849,20 @@ func TestVolumeResampleHandoffStaging(t *testing.T) {
 	if snap.VolumeFlags != world.VolumeFlags(7) {
 		t.Fatalf("initial flags = %d, want 7", uint32(snap.VolumeFlags))
 	}
-	// Flags change at the (about to be held) source position.
+	// Flags change before the crossing step.
 	current = world.VolumeFlags(9)
 	submitMove(t, e, snap.ID, 1, MoveDirForward, 0, 1024) // +X toward 32
 	e.Step()
 	got, _ := e.Entity(snap.ID)
-	if got.Position.X != 31.9 {
-		t.Fatalf("staging step moved: %v", got.Position)
-	}
-	if got.Speed != 0 {
-		t.Fatalf("speed = %d, want 0", got.Speed)
+	if math.Abs(got.Position.X-32.075) > 1e-9 || got.Cell != (world.CellCoord{X: 1, Z: 0}) {
+		t.Fatalf("transfer = %+v, want destination {1 0}", got)
 	}
 	if got.VolumeFlags != world.VolumeFlags(9) {
 		t.Fatalf("snapshot flags = %d, want resampled 9", uint32(got.VolumeFlags))
 	}
 	u := sink.all()
-	if len(u) != 1 || !u[0].HandoffRequired {
-		t.Fatalf("updates = %+v, want one handoff-staged update", sink.all())
+	if len(u) != 1 || u[0].HandoffRequired {
+		t.Fatalf("updates = %+v, want one clean transfer update", sink.all())
 	}
 	if u[0].VolumeFlags != world.VolumeFlags(9) {
 		t.Fatalf("update flags = %d, want 9", uint32(u[0].VolumeFlags))
