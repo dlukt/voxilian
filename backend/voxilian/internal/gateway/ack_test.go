@@ -228,8 +228,12 @@ func (f *ackFixture) dial(t *testing.T) *websocket.Conn {
 	return c
 }
 
-// hello authenticates and returns the connection's session ID.
-func (f *ackFixture) hello(t *testing.T, c *websocket.Conn) session.ID {
+// hello authenticates this connection and checks the welcome. It
+// deliberately returns NO session ID: SessionsBySub iterates a map, so
+// picking "the newest" by slice position would be nondeterministic when
+// other same-sub sessions are live (e.g. the takeover tests). Callers
+// that need the ID must use helloSingleSession.
+func (f *ackFixture) hello(t *testing.T, c *websocket.Conn) {
 	t.Helper()
 	sendHello(t, c, "tok", 1, 1)
 	h, _ := readFrame(t, c)
@@ -239,11 +243,20 @@ func (f *ackFixture) hello(t *testing.T, c *websocket.Conn) session.ID {
 	if h.Seq != 1 {
 		t.Fatalf("welcome seq = %d, want 1 (fresh session epoch)", h.Seq)
 	}
+}
+
+// helloSingleSession authenticates this connection and returns its
+// session ID, requiring that it is the ONLY live session under the
+// fixture sub — the deterministic ownership rule when the caller knows
+// no other same-sub session exists.
+func (f *ackFixture) helloSingleSession(t *testing.T, c *websocket.Conn) session.ID {
+	t.Helper()
+	f.hello(t, c)
 	ids := f.reg.SessionsBySub("ack-sub")
-	if len(ids) == 0 {
-		t.Fatal("no session indexed")
+	if len(ids) != 1 {
+		t.Fatalf("sessions under ack-sub = %v, want exactly 1", ids)
 	}
-	return ids[len(ids)-1]
+	return ids[0]
 }
 
 // enterWorld drives 124 and consumes the whole baseline; it returns
@@ -252,7 +265,7 @@ func (f *ackFixture) hello(t *testing.T, c *websocket.Conn) session.ID {
 // tests needing a multi-frame baseline assert their own orders.
 func (f *ackFixture) enterWorld(t *testing.T, c *websocket.Conn, seq uint32) (proto.Header, session.ID) {
 	t.Helper()
-	sid := f.hello(t, c)
+	sid := f.helloSingleSession(t, c)
 	sendEnterWorld(t, c, seq, 0)
 	if _, op := readCharOp(t, c); op.OK != proto.CharacterOpOK {
 		t.Fatalf("217 = %+v", op)
@@ -498,7 +511,7 @@ func TestAckMalformedInWorldWS(t *testing.T) {
 func TestAckCharacterSelectedRoutingWS(t *testing.T) {
 	f := newAckFixture(t, gateway.OutboundPolicy{MaxUnackedMessages: 1}, nil)
 	c := f.dial(t)
-	sid := f.hello(t, c) // 200 seq 1
+	sid := f.helloSingleSession(t, c) // 200 seq 1
 
 	// AUTHENTICATED + 125: bad_state from the gate, before any ACK logic.
 	sendAck(t, c, 2, 1)
