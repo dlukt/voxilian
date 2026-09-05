@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.14 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.15 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -436,6 +436,348 @@ type RNG interface {
   reconciliation, or speed anomaly detection.
 - No M4-T3 behavior: no ownership generations, handoff queues,
   migration, cross-cell `opID`, dedupe, or retry routing.
+
+### 5.3 Authoritative movement semantics (frozen, v0.3.15)
+
+M4-T2 owns `102` movement SEMANTICS: movement intent ordering,
+fixed-step integration, walk/run selection, yaw/held-direction
+interpretation, collision resolution, reconciliation anchor generation,
+the movement anomaly tripwire, and 205-COMPATIBLE sim movement output.
+
+M4-T2 does NOT yet own real gateway → Engine wiring, character DB ID
+→ EntityID binding, session-local NetEntityID allocation, `205`
+binary transmission, AOI subscription/fanout, movement outbound
+throttling, per-character inbound rate limiting, or presence. Those
+runtime gateway-facing concerns belong to M4-T5: M4-T2 owns
+authoritative move semantics; M4-T5 wires decoded gateway intents
+into sim and fans `205` updates to session-local NetEntityIDs/AOI.
+
+#### 5.3.1 Wire independence and the neutral serial32 home
+
+- `internal/sim` MUST NOT use `proto.Move`, `proto.EntityMove`, or
+  `proto.Position` as runtime domain types. The gateway layer later
+  translates `proto.Move → sim.MoveIntent` and
+  `sim.MovementUpdate → proto.EntityMove`. This preserves
+  `sim EntityID != session NetEntityID` and
+  `world.Vec3 meters != proto.Position millimeters`.
+- M4 needs the exact already-frozen modulo-2³² serial ordering
+  (RFC 1982 style) without sim importing the wire protocol package
+  merely to compare serials. The ONE canonical implementation lives
+  in the neutral package `internal/serial32`:
+
+```go
+After(a, b uint32) bool
+Before(a, b uint32) bool
+```
+
+  with `After(a,b)` true iff `(a - b) mod 2^32` is nonzero and
+  `< 2^31`, and `Before(a,b) = After(b,a)`. Equality is false in
+  both directions; the exact half-range (`2^31` apart) is false in
+  both directions. `proto.Serial32After` / `proto.Serial32Before`
+  remain source-compatible thin delegates to `serial32` with
+  unchanged names and behavior. Sim MUST NOT implement a rival
+  comparator. No protocol behavior changes.
+
+#### 5.3.2 Held directions and yaw
+
+- `heldDirs` lower four bits (matching the `102` bitmask):
+
+```text
+bit 0 = Forward
+bit 1 = Backward
+bit 2 = Left / strafe-left
+bit 3 = Right / strafe-right
+```
+
+- Bits `4..7` are reserved for additive future use. M4-T2 ignores
+  those reserved bits for movement semantics; it does NOT reject the
+  whole intent merely because a reserved high bit is set.
+- Opposing directions cancel: Forward + Backward cancels the
+  longitudinal component; Left + Right cancels the lateral
+  component. `Forward|Backward` yields no forward/back motion,
+  `Left|Right` yields no lateral motion, all four yield a zero
+  movement vector. Yaw still updates.
+- Diagonal normalization: when exactly one longitudinal and one
+  lateral component remain, the local XZ vector is normalized to
+  length 1, so `forward+right` does NOT move at `sqrt(2) × speed`.
+  Maximum horizontal speed is invariant in every direction.
+- Yaw uses the 12-bit domain `0..4095` (`4096` units = one full
+  turn) with the Godot-friendly XZ convention:
+
+```text
+yaw 0       -> forward -Z
+yaw 1024    -> forward +X
+yaw 2048    -> forward +Z
+yaw 3072    -> forward -X
+```
+
+- Positive yaw turns clockwise when viewed from +Y. Mathematically:
+
+```text
+theta = yaw * 2π / 4096
+
+forward = { X = sin(theta), Z = -cos(theta) }
+right   = { X = cos(theta), Z = sin(theta)  }
+```
+
+- Y never changes from walking/running.
+- Every newly processed movement input updates authoritative yaw
+  even when `heldDirs` resolves to zero, collision prevents
+  translation, run is denied, or handoff is required. Facing and
+  translation are independent.
+- The binary codec already enforces the wire angle range, but the
+  sim-domain API MUST reject `Yaw > 4095` when invoked directly,
+  returning a stable movement-domain error rather than silently
+  modulo-wrapping arbitrary values.
+
+#### 5.3.3 Walk/run speeds and the run gate
+
+- Wire `runFlag` remains raw `u8`. Movement semantics: `0` means
+  walk requested, nonzero means run requested (tolerating additive
+  future flag bits without a protocol break).
+- Exact horizontal target speeds: walk `3.5 m/s`, run `7.0 m/s`.
+  At 20 Hz that is `0.175 m` / `0.350 m` per tick; at another
+  configured TickHz, `distance = speedMetersPerSecond * fixed
+  dtSeconds` — never wall-clock elapsed time.
+- The existing `205` `u8 speed` wire semantic is frozen as
+  decimeters per second: `0` = stopped/blocked, `35` = 3.5 m/s
+  walk, `70` = 7.0 m/s run. This is a semantic clarification only:
+  the `205` wire layout does NOT change and no `msg_version` bump
+  occurs. M4-T2's internal movement update uses the same `u8`
+  scale so M4-T5 does not invent a second conversion.
+- M4-T2 does NOT implement the full vigor system. It introduces a
+  narrow sim dependency, conceptually:
+
+```go
+type RunGate interface {
+    CanRun(EntityID) bool
+}
+```
+
+- Rules: `runFlag == 0` walks; `runFlag != 0` with `CanRun ==
+  true` runs; `runFlag != 0` with `CanRun == false` falls back to
+  WALK. The move is not rejected, movement is not stopped, and no
+  vigor is mutated. The existing normative condition (run requires
+  vigor ≥ 10) stands; a later vitals task supplies that real
+  decision behind the gate. No HP/mana/vigor fields are added
+  merely to implement movement.
+
+#### 5.3.4 MoveIntent, sequencing, and sample-tick sanity
+
+- Sim-domain movement control, conceptually:
+
+```go
+type MoveIntent struct {
+    InputSeq   uint32
+    HeldDirs   uint8
+    RunFlag    uint8
+    Yaw        uint16
+    SampleTick uint32
+}
+```
+
+  `SampleTick` comes from the C→S protocol header tick; the
+  protocol Header itself never enters sim.
+- The sim-owner API, conceptually
+  `SubmitMove(entityID, intent) (MoveDisposition, error)`,
+  queues/replaces authoritative movement CONTROL state. It does
+  NOT immediately integrate position; positions change only on
+  `Step`. The disposition is at least
+  accepted/duplicate/stale; duplicate/stale are ordinary no-op
+  results, not errors.
+- First input: for an entity with no previously accepted movement
+  input, ANY `u32` inputSeq is accepted, including `0` and
+  `MaxUint32`. Zero is not a "no input ever" sentinel; an
+  explicit boolean tracks that state.
+- Subsequent inputs use only canonical `serial32` arithmetic
+  against the newest ACCEPTED sequence: same value is duplicate,
+  serially-before is stale, serially-after is accepted. Two
+  unequal values exactly `2^31` apart are serially ambiguous and
+  rejected with a stable movement-domain error — never randomly
+  classified as stale.
+- Movement inputs describe current held control state, not
+  incremental deltas, so multiple accepted inputs before the next
+  sim tick coalesce: `10 → 11 → 12` accepted in sequence leaves
+  pending control `12` only; the next Step processes control `12`
+  and `lastProcessedInputSeq` becomes `12`, letting the client
+  discard/reconcile everything through 12 without replaying
+  intermediate held-state snapshots that never reached a tick.
+  Ordering of a later Submit compares against the newest accepted
+  value even before Step processes it.
+- Active control persists: once processed, `heldDirs`, run
+  request, and yaw remain the entity's active movement control
+  until a newer accepted input is processed — so one `102` input
+  (capped at ≤10 Hz) can drive multiple 20 Hz sim ticks.
+- A newly processed input whose direction mask resolves to zero
+  stops translation, sets speed 0, updates yaw, and advances
+  `lastProcessedInputSeq`; that step still emits a reconciliation
+  movement update because the processed anchor/control changed.
+- `lastProcessedInputSeq` is updated when the sim Step actually
+  consumes the pending newest input, NOT when SubmitMove merely
+  accepts it, and stays unchanged across later ticks that
+  continue the same held control. Because `inputSeq = 0` is
+  legal, `hasProcessedInput` is tracked separately; a first
+  processed input of sequence 0 yields the wire-valid anchor 0
+  without reserving sequence zero.
+- C→S sample-tick sanity (the framing spec's "more than 5 seconds
+  in the future" rule) is implemented here in the movement
+  domain. At TickHz H, `maxFutureTicks = 5 * H`:
+  `sampleTick == currentTick + maxFutureTicks` is accepted, while
+  a sample tick serially after current by more is rejected with
+  `ErrFutureInputTick` (exact name flexible). `uint32` wrap is
+  handled; past sample ticks stay acceptable for MVP (no
+  lag-compensation rewind — the 2-second history ring is retained
+  for later use); a sample tick exactly `2^31` away is ambiguous
+  and rejected as invalid.
+- Validation (entity existence, yaw validity, sample-tick sanity,
+  serial InputSeq classification) is deterministic: a
+  malformed/future-tick request mutates nothing — no pending
+  input, active control, accepted/processed sequence, position,
+  or yaw change.
+
+#### 5.3.5 CollisionWorld seam and volume flags
+
+- M4-T2 owns the minimal consumer-defined interface,
+  conceptually:
+
+```go
+type CollisionWorld interface {
+    SolidAt(world.Vec3) bool
+    VolumeFlagsAt(world.Vec3) world.VolumeFlags
+}
+```
+
+  No richer terrain API, no world loader. The richer future
+  `WorldSource` MUST implement/embed/satisfy this minimal
+  collision/volume query seam; M10 MUST NOT replace movement
+  with a second collision abstraction.
+- `internal/world` gains the opaque base type
+  `type VolumeFlags uint32` with `const VolumeNone VolumeFlags =
+  0`. T2 assigns no gameplay flag bit numbers (safe-zone, no-PK,
+  sanctuary, interior semantics belong to later content/gameplay
+  work); T2 merely preserves/samples the opaque bitset.
+- `SolidAt` / `VolumeFlagsAt` are hot-path in-memory simulation
+  queries: no network/PG I/O, no transient persistence errors.
+  World loading failures happen before the sim is made ready.
+- Normal walking/running computes X/Z translation only; Y is
+  unchanged exactly. No gravity, jump, stairs, step-up, falling,
+  or flying in T2.
+
+#### 5.3.6 Integration, collision substeps, and cell staging
+
+- Point-sampling tunneling is prevented by the fixed ceiling
+  `MaxCollisionStepMeters = 0.25`. For intended displacement
+  distance D: `substeps = max(1, ceil(D / 0.25))`,
+  `subDelta = intendedDelta / substeps`, each substep testing
+  the next candidate with `CollisionWorld.SolidAt`.
+- From the authoritative position, each substep computes
+  `candidate = current + subDelta`; on solid, movement stops,
+  keeps the last non-solid position, marks blocked, sets final
+  speed 0, and tests no later substeps. No sliding, no
+  axis-separated resolution, no capsule sweep, no step-up, no
+  bounce — intentionally minimal. Partial progress is retained:
+  the final update carries the actual final authoritative
+  position with `speed = 0`, `blocked = true`.
+- M4-T3a still owns cell handoff. Before applying an intended
+  movement step, if its intended final position belongs to
+  another cell: do NOT transfer, do NOT partially creep toward
+  the boundary in T2, leave X/Y/Z unchanged for that tick, mark
+  the movement outcome HandoffRequired with `speed = 0`. Yaw and
+  `lastProcessedInputSeq` still update normally. Per-tick
+  ordering: compute the intended final position; if the
+  destination cell differs, apply handoff-required staging with
+  no collision traversal into the destination; else perform
+  collision substeps within the current cell. While active
+  controls point across a boundary, every tick holds position
+  with `speed 0`, `handoffRequired true` — no silent teleport,
+  no fake cross-cell ownership.
+- Volume flags are sampled at entity insertion and after every
+  movement-processing tick at the final authoritative position,
+  stored as sim state. No gameplay behavior depends on them yet.
+
+#### 5.3.7 Movement state, output, and Step order
+
+- M4-T2 may extend the internal entity with ONLY movement-owned
+  state such as yaw, speed, volumeFlags, active heldDirs/run
+  request, hasAcceptedInput/lastAcceptedInputSeq, pending latest
+  intent, and hasProcessedInput/lastProcessedInputSeq. No
+  combat/vitals/inventory fields.
+- `EntitySnapshot` may expose movement-owned authoritative
+  `Yaw`, `Speed`, `VolumeFlags`, and `LastProcessedInputSeq`
+  for later M4-T5/baseline inspection; pending-control
+  internals stay private.
+- The internal sim output (NOT `proto.EntityMove`),
+  conceptually:
+
+```go
+type MovementUpdate struct {
+    Tick                  uint32
+    EntityID              EntityID
+    Position              world.Vec3
+    Yaw                   uint16
+    Speed                 uint8
+    LastProcessedInputSeq uint32
+    Blocked               bool
+    HandoffRequired       bool
+    VolumeFlags           world.VolumeFlags
+}
+```
+
+- Updates in one Step use canonical engine ordering (CellCoord
+  X/Z, then EntityID ascending). An update emits when at least
+  one holds: nonzero active movement vector, a new movement
+  input processed this tick, authoritative position changed,
+  collision blocked, or handoff required. A never-controlled
+  stationary entity needs no 20 Hz movement update (its T1
+  history sample still applies). Held movement may therefore
+  emit at 20 Hz; M4-T5 later owns ≤10 Hz per-entity AOI fanout
+  and state-lane coalescing — the authoritative simulation is
+  never throttled to 10 Hz.
+- With movement, one Step runs: tick++ → canonical cells →
+  EntityID-sorted entities → consume newest pending movement
+  input → update active yaw/control/processed anchor →
+  integrate horizontal movement → collision / cross-cell staging
+  → sample final volume flags → emit MovementUpdate if
+  applicable → append final position-history sample. No gameplay
+  runs after the history append.
+
+#### 5.3.8 Sink, deps, and the anomaly tripwire
+
+- The narrow non-blocking future-fanout seam, conceptually
+  `MovementSink{ OnMovement(MovementUpdate) }` (or a function
+  adapter), receives already-authoritative results: it cannot
+  change position, approve run, resolve collision, or alter the
+  anchor. Implementations MUST be non-blocking/bounded (M4-T5
+  satisfies this via the existing non-blocking outbound state
+  path); T2 tests use a synchronous bounded recorder, never
+  per-session queues.
+- `EngineDeps` extends with at least `Collision` and `RunGate`
+  as required decisions (fail fast when missing); movement and
+  anomaly observers MAY default to no-ops. `NewEngine` remains
+  pure with no background movement goroutine.
+- The narrow hook `MovementObserver{ MovementAnomaly(...) }`
+  carries low-cardinality domain data (entity, tick, kind,
+  expected/observed distance); no Prometheus, gateway, or
+  session objects here.
+- Anti-teleport clarification: opcode `102` carries NO client
+  position, so direct client teleporting is impossible by
+  protocol construction. The "speed/teleport anomaly"
+  responsibility is a defensive authoritative-integration
+  tripwire: the computed candidate must remain finite and its
+  horizontal displacement may not exceed
+  `selectedSpeed * fixedDT + epsilon` (epsilon `1e-9` m for
+  floating arithmetic only — NOT 0.5 m gameplay slack). On
+  violation the engine corrects to the pre-step position with
+  `speed = 0` and reports through the observer. Ordinary
+  collision blocks, handoff staging, and run-gate denials are
+  authoritative corrections, never anomaly events. The 0.5 m
+  rule stays client-side: the client compares its prediction
+  against `205` and rewinds/reapplies; the server only supplies
+  authoritative position/yaw/speed/`lastProcessedInputSeq`.
+- Internal movement output carries `EntityID uint64`, never a
+  session-local `NetEntityID u32` (no truncation/cast); M4-T5
+  maps per-session handles and zeroes the anchor for non-owner
+  viewers while the owner's `205` carries the real anchor.
 
 ## 6. WebSocket protocol (binary, versioned — DECISION §13.8)
 
@@ -1918,6 +2260,14 @@ ledger is never replayed.
    survives it.
 
 ## 14. Version history
+
+- v0.3.15: freeze M4 authoritative movement semantics — held-direction bit
+  assignments and Godot-friendly yaw convention, normalized horizontal
+  walk/run integration, persisted/latest coalesced movement controls,
+  RFC1982 input sequencing and sample-tick sanity via the neutral serial32
+  package, minimal point-query collision with deterministic substeps,
+  run-gate/volume seams, 205-compatible sim movement results, and explicit
+  M4-T2 vs M4-T5 transport/AOI ownership.
 
 - v0.3.14: freeze deterministic M4 sim skeleton — fixed-step tick semantics
   (default 20 Hz with configured tick rate), no catch-up bursts, canonical
