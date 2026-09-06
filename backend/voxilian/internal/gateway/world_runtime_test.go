@@ -80,7 +80,17 @@ func (f *recordingSim) moveCount() int {
 	return len(f.moves)
 }
 
+// removedIDs copies the recorded entity removals (concurrent tests
+// MUST use this accessor; reap paths run on server goroutines).
+func (f *recordingSim) removedIDs() []sim.EntityID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]sim.EntityID(nil), f.removes...)
+}
+
 // recordingDownstream is a scriptable downstream WorldExit fake.
+// Concurrent tests MUST use the accessors: the teardown/reaper paths
+// call ExitWorld from server goroutines while tests poll.
 type recordingDownstream struct {
 	mu    sync.Mutex
 	calls int
@@ -96,6 +106,18 @@ func (f *recordingDownstream) ExitWorld(_ context.Context, _ session.ID, _, _ in
 		f.log.add("downstream")
 	}
 	return f.err
+}
+
+func (f *recordingDownstream) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *recordingDownstream) setErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
 }
 
 // fakeWorldEnter is a scriptable WorldEnter for handler-chain tests.
@@ -118,7 +140,7 @@ func (f *fakeWorldEnter) PrepareEnter(_ context.Context, _ session.ID, _, _ int6
 	return f.prepareErr
 }
 
-func (f *fakeWorldEnter) CommitEnter(_ session.ID) error {
+func (f *fakeWorldEnter) CommitEnter(_ context.Context, _ session.ID) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "commit")
@@ -142,6 +164,42 @@ func (f *fakeWorldEnter) callLog() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.calls...)
+}
+
+// recordingFanout is a scriptable FanoutLifecycle for runtime and
+// lifecycle tests that do not exercise fanout itself.
+type recordingFanout struct {
+	mu           sync.Mutex
+	bootstraps   []session.ID
+	removes      []fanoutRemoveCall
+	bootstrapErr error
+	removeErr    error
+}
+
+type fanoutRemoveCall struct {
+	sid    session.ID
+	entity sim.EntityID
+}
+
+func (f *recordingFanout) BootstrapSession(_ context.Context, sid session.ID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bootstraps = append(f.bootstraps, sid)
+	return f.bootstrapErr
+}
+
+func (f *recordingFanout) RemovePresence(_ context.Context, sid session.ID, entity sim.EntityID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removes = append(f.removes, fanoutRemoveCall{sid: sid, entity: entity})
+	return f.removeErr
+}
+
+// removeCalls copies the recorded removals (concurrent-safe).
+func (f *recordingFanout) removeCalls() []fanoutRemoveCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fanoutRemoveCall(nil), f.removes...)
 }
 
 // ---------------------------------------------------------------------------
@@ -249,49 +307,59 @@ func stopSimOwner(t *testing.T, cancel context.CancelFunc, done <-chan error) {
 // runtime unit tests (fake sim)
 // ---------------------------------------------------------------------------
 
-func testRuntime(t *testing.T, fakeSim *recordingSim, now time.Time) (*WorldSessionRuntime, *PresenceRegistry, *recordingDownstream) {
+func testRuntime(t *testing.T, fakeSim *recordingSim, now time.Time) (*WorldSessionRuntime, *PresenceRegistry, *recordingDownstream, *recordingFanout) {
 	t.Helper()
 	presence, err := NewPresenceRegistry(testPolicy())
 	if err != nil {
 		t.Fatal(err)
 	}
+	sessions := session.NewRegistry()
 	downstream := &recordingDownstream{}
+	fanout := &recordingFanout{}
 	spawn := SpawnResolverFunc(func(context.Context, int64, int64) (world.Vec3, error) {
 		return world.Vec3{X: 4}, nil
 	})
-	rt, err := NewWorldSessionRuntime(fakeSim, presence, spawn, func() time.Time { return now }, downstream)
+	rt, err := NewWorldSessionRuntime(fakeSim, presence, sessions, spawn, func() time.Time { return now }, downstream, fanout)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return rt, presence, downstream
+	return rt, presence, downstream, fanout
 }
 
 func TestWorldSessionRuntimeRequiresDeps(t *testing.T) {
 	presence, _ := NewPresenceRegistry(testPolicy())
+	sessions := session.NewRegistry()
 	fakeSim := &recordingSim{}
 	spawn := SpawnResolverFunc(func(context.Context, int64, int64) (world.Vec3, error) { return world.Vec3{}, nil })
 	now := func() time.Time { return worldRuntimeBase }
 	downstream := WorldExitFunc(func(context.Context, session.ID, int64, int64) error { return nil })
-	if _, err := NewWorldSessionRuntime(nil, presence, spawn, now, downstream); err == nil {
+	fanout := &recordingFanout{}
+	if _, err := NewWorldSessionRuntime(nil, presence, sessions, spawn, now, downstream, fanout); err == nil {
 		t.Error("nil sim accepted")
 	}
-	if _, err := NewWorldSessionRuntime(fakeSim, nil, spawn, now, downstream); err == nil {
+	if _, err := NewWorldSessionRuntime(fakeSim, nil, sessions, spawn, now, downstream, fanout); err == nil {
 		t.Error("nil presence accepted")
 	}
-	if _, err := NewWorldSessionRuntime(fakeSim, presence, nil, now, downstream); err == nil {
+	if _, err := NewWorldSessionRuntime(fakeSim, presence, nil, spawn, now, downstream, fanout); err == nil {
+		t.Error("nil sessions accepted")
+	}
+	if _, err := NewWorldSessionRuntime(fakeSim, presence, sessions, nil, now, downstream, fanout); err == nil {
 		t.Error("nil spawn accepted")
 	}
-	if _, err := NewWorldSessionRuntime(fakeSim, presence, spawn, nil, downstream); err == nil {
+	if _, err := NewWorldSessionRuntime(fakeSim, presence, sessions, spawn, nil, downstream, fanout); err == nil {
 		t.Error("nil clock accepted")
 	}
-	if _, err := NewWorldSessionRuntime(fakeSim, presence, spawn, now, nil); err == nil {
+	if _, err := NewWorldSessionRuntime(fakeSim, presence, sessions, spawn, now, nil, fanout); err == nil {
 		t.Error("nil downstream accepted")
+	}
+	if _, err := NewWorldSessionRuntime(fakeSim, presence, sessions, spawn, now, downstream, nil); err == nil {
+		t.Error("nil fanout accepted")
 	}
 }
 
 func TestRuntimePrepareStagesWithoutPresence(t *testing.T) {
 	fakeSim := &recordingSim{}
-	rt, presence, _ := testRuntime(t, fakeSim, worldRuntimeBase)
+	rt, presence, _, _ := testRuntime(t, fakeSim, worldRuntimeBase)
 	ctx := context.Background()
 	if err := rt.PrepareEnter(ctx, 1, 11, 101); err != nil {
 		t.Fatalf("PrepareEnter: %v", err)
@@ -320,7 +388,7 @@ func TestRuntimePrepareSpawnFailure(t *testing.T) {
 	spawn := SpawnResolverFunc(func(context.Context, int64, int64) (world.Vec3, error) {
 		return world.Vec3{}, boom
 	})
-	rt, err := NewWorldSessionRuntime(fakeSim, presence, spawn, func() time.Time { return worldRuntimeBase }, downstream)
+	rt, err := NewWorldSessionRuntime(fakeSim, presence, session.NewRegistry(), spawn, func() time.Time { return worldRuntimeBase }, downstream, &recordingFanout{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +405,7 @@ func TestRuntimePrepareSpawnFailure(t *testing.T) {
 
 func TestRuntimePrepareIngressFullRetry(t *testing.T) {
 	fakeSim := &recordingSim{addErr: sim.ErrSimIngressFull}
-	rt, presence, _ := testRuntime(t, fakeSim, worldRuntimeBase)
+	rt, presence, _, _ := testRuntime(t, fakeSim, worldRuntimeBase)
 	if err := rt.PrepareEnter(context.Background(), 1, 11, 101); !errors.Is(err, ErrWorldEntryRetry) {
 		t.Fatalf("ingress-full prepare = %v, want ErrWorldEntryRetry", err)
 	}
@@ -353,7 +421,7 @@ func TestRuntimePrepareIngressFullRetry(t *testing.T) {
 
 func TestRuntimeAbortRemovesStaged(t *testing.T) {
 	fakeSim := &recordingSim{}
-	rt, presence, _ := testRuntime(t, fakeSim, worldRuntimeBase)
+	rt, presence, _, _ := testRuntime(t, fakeSim, worldRuntimeBase)
 	ctx := context.Background()
 	if err := rt.PrepareEnter(ctx, 1, 11, 101); err != nil {
 		t.Fatal(err)
@@ -378,7 +446,7 @@ func TestRuntimeAbortRemovesStaged(t *testing.T) {
 
 func TestRuntimeAbortRemovalFailureRetains(t *testing.T) {
 	fakeSim := &recordingSim{}
-	rt, _, _ := testRuntime(t, fakeSim, worldRuntimeBase)
+	rt, _, _, _ := testRuntime(t, fakeSim, worldRuntimeBase)
 	ctx := context.Background()
 	if err := rt.PrepareEnter(ctx, 1, 11, 101); err != nil {
 		t.Fatal(err)
@@ -400,12 +468,12 @@ func TestRuntimeAbortRemovalFailureRetains(t *testing.T) {
 func TestRuntimeCommitActivatesPresence(t *testing.T) {
 	fakeSim := &recordingSim{}
 	now := worldRuntimeBase.Add(time.Minute)
-	rt, presence, _ := testRuntime(t, fakeSim, now)
+	rt, presence, _, _ := testRuntime(t, fakeSim, now)
 	ctx := context.Background()
 	if err := rt.PrepareEnter(ctx, 1, 11, 101); err != nil {
 		t.Fatal(err)
 	}
-	if err := rt.CommitEnter(1); err != nil {
+	if err := rt.CommitEnter(context.Background(), 1); err != nil {
 		t.Fatalf("CommitEnter: %v", err)
 	}
 	snap, err := presence.Snapshot(1)
@@ -426,7 +494,7 @@ func TestRuntimeCommitActivatesPresence(t *testing.T) {
 		t.Fatalf("CenterCell = %v, want %v", snap.CenterCell, wantCell)
 	}
 	// Pending gone: second Commit and Abort are terminal no-ops.
-	if err := rt.CommitEnter(1); !errors.Is(err, ErrWorldEntryNoPending) {
+	if err := rt.CommitEnter(context.Background(), 1); !errors.Is(err, ErrWorldEntryNoPending) {
 		t.Fatalf("second CommitEnter = %v, want ErrWorldEntryNoPending", err)
 	}
 	if err := rt.AbortEnter(ctx, 1); err != nil {
@@ -439,7 +507,7 @@ func TestRuntimeCommitActivatesPresence(t *testing.T) {
 
 func TestRuntimeCommitConflictKeepsStaged(t *testing.T) {
 	fakeSim := &recordingSim{}
-	rt, presence, _ := testRuntime(t, fakeSim, worldRuntimeBase)
+	rt, presence, _, _ := testRuntime(t, fakeSim, worldRuntimeBase)
 	ctx := context.Background()
 	if err := rt.PrepareEnter(ctx, 1, 11, 101); err != nil {
 		t.Fatal(err)
@@ -448,7 +516,7 @@ func TestRuntimeCommitConflictKeepsStaged(t *testing.T) {
 	if _, err := presence.Activate(1, 101, 999, world.CellCoord{}, worldRuntimeBase); err != nil {
 		t.Fatal(err)
 	}
-	err := rt.CommitEnter(1)
+	err := rt.CommitEnter(context.Background(), 1)
 	if err == nil || errors.Is(err, ErrWorldEntryRetry) {
 		t.Fatalf("conflicting CommitEnter = %v, want internal (not retry)", err)
 	}
@@ -466,10 +534,11 @@ func TestRuntimeExitDownstreamFirst(t *testing.T) {
 	fakeSim := &recordingSim{}
 	presence, _ := NewPresenceRegistry(testPolicy())
 	downstream := &recordingDownstream{log: log}
+	fanout := &recordingFanout{}
 	spawn := SpawnResolverFunc(func(context.Context, int64, int64) (world.Vec3, error) {
 		return world.Vec3{X: 4}, nil
 	})
-	rt, err := NewWorldSessionRuntime(fakeSim, presence, spawn, func() time.Time { return worldRuntimeBase }, downstream)
+	rt, err := NewWorldSessionRuntime(fakeSim, presence, session.NewRegistry(), spawn, func() time.Time { return worldRuntimeBase }, downstream, fanout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -477,7 +546,7 @@ func TestRuntimeExitDownstreamFirst(t *testing.T) {
 	if err := rt.PrepareEnter(ctx, 1, 11, 101); err != nil {
 		t.Fatal(err)
 	}
-	if err := rt.CommitEnter(1); err != nil {
+	if err := rt.CommitEnter(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	// recordingSim removal also logs so order is observable.
@@ -494,6 +563,11 @@ func TestRuntimeExitDownstreamFirst(t *testing.T) {
 	if len(fakeSim.removes) != origRemoves+1 || fakeSim.removes[origRemoves] != 1 {
 		t.Fatalf("removes = %v, want staged entity after flush", fakeSim.removes)
 	}
+	// Fanout removal ran exactly once, after sim removal, before
+	// Presence teardown (which succeeded).
+	if len(fanout.removes) != 1 || fanout.removes[0].sid != 1 || fanout.removes[0].entity != 1 {
+		t.Fatalf("fanout removes = %+v, want [{1 1}]", fanout.removes)
+	}
 	if _, err := presence.Snapshot(1); !errors.Is(err, ErrPresenceNotFound) {
 		t.Fatalf("presence survives successful exit: %v", err)
 	}
@@ -501,12 +575,12 @@ func TestRuntimeExitDownstreamFirst(t *testing.T) {
 
 func TestRuntimeExitDownstreamFailureIntact(t *testing.T) {
 	fakeSim := &recordingSim{}
-	rt, presence, downstream := testRuntime(t, fakeSim, worldRuntimeBase)
+	rt, presence, downstream, fanout := testRuntime(t, fakeSim, worldRuntimeBase)
 	ctx := context.Background()
 	if err := rt.PrepareEnter(ctx, 1, 11, 101); err != nil {
 		t.Fatal(err)
 	}
-	if err := rt.CommitEnter(1); err != nil {
+	if err := rt.CommitEnter(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	downstream.err = errors.New("flush unavailable")
@@ -516,6 +590,9 @@ func TestRuntimeExitDownstreamFailureIntact(t *testing.T) {
 	if len(fakeSim.removes) != 0 {
 		t.Fatalf("sim remove ran despite flush failure: %v", fakeSim.removes)
 	}
+	if len(fanout.removes) != 0 {
+		t.Fatalf("fanout removal ran despite flush failure: %+v", fanout.removes)
+	}
 	if _, err := presence.Snapshot(1); err != nil {
 		t.Fatalf("presence lost on failed exit: %v", err)
 	}
@@ -523,31 +600,102 @@ func TestRuntimeExitDownstreamFailureIntact(t *testing.T) {
 
 func TestRuntimeExitSimRemoveFailureRetains(t *testing.T) {
 	fakeSim := &recordingSim{}
-	rt, presence, _ := testRuntime(t, fakeSim, worldRuntimeBase)
+	rt, presence, _, fanout := testRuntime(t, fakeSim, worldRuntimeBase)
 	ctx := context.Background()
 	if err := rt.PrepareEnter(ctx, 1, 11, 101); err != nil {
 		t.Fatal(err)
 	}
-	if err := rt.CommitEnter(1); err != nil {
+	if err := rt.CommitEnter(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	fakeSim.removeErr = errors.New("sim unavailable")
 	if err := rt.ExitWorld(ctx, 1, 11, 101); err == nil {
 		t.Fatalf("failing ExitWorld returned nil")
 	}
+	if len(fanout.removes) != 0 {
+		t.Fatalf("fanout removal ran despite failed sim remove: %+v", fanout.removes)
+	}
 	if _, err := presence.Snapshot(1); err != nil {
 		t.Fatalf("presence lost on failed sim remove: %v", err)
 	}
 }
 
+// B39: reliable fanout removal failing AFTER real sim removal falls
+// back to closing/resyncing every indexed viewer with retired handles
+// while local Presence teardown continues.
+func TestRuntimeRemovePresenceFallbackAfterSimRemoval(t *testing.T) {
+	fakeSim := &recordingSim{}
+	presence, _ := NewPresenceRegistry(testPolicy())
+	reg := session.NewRegistry()
+	downstream := &recordingDownstream{}
+	fanout := &recordingFanout{removeErr: errors.New("fanout infrastructure down")}
+	spawn := SpawnResolverFunc(func(context.Context, int64, int64) (world.Vec3, error) {
+		return world.Vec3{X: 4}, nil
+	})
+	rt, err := NewWorldSessionRuntime(fakeSim, presence, reg, spawn, func() time.Time { return worldRuntimeBase }, downstream, fanout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := rt.PrepareEnter(ctx, 1, 11, 500); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.CommitEnter(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	// A viewer session sees the source entity through a recorded
+	// connection; its mapping must retire even though the 206 lane is
+	// gone (infrastructure failure).
+	srcConn, viewConn := newTakeoverConn(), newTakeoverConn()
+	if sid := reg.Create(srcConn); sid != 1 {
+		t.Fatalf("source sid = %d", sid)
+	}
+	if err := reg.Authenticate(1, "sub-a", 11, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if sid := reg.Create(viewConn); sid != 2 {
+		t.Fatalf("viewer sid = %d", sid)
+	}
+	if err := reg.Authenticate(2, "sub-b", 12, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := presence.Activate(2, 501, 9, world.CellCoord{}, worldRuntimeBase); err != nil {
+		t.Fatal(err)
+	}
+	h, _, err := presence.EnsureVisible(2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exit: downstream + sim removal succeed, reliable fanout removal
+	// fails, fallback must still complete teardown.
+	if err := rt.ExitWorld(ctx, 1, 11, 500); err != nil {
+		t.Fatalf("ExitWorld after fanout-remove failure: %v", err)
+	}
+	if len(fakeSim.removes) != 1 || fakeSim.removes[0] != 1 {
+		t.Fatalf("sim removes = %v", fakeSim.removes)
+	}
+	if viewConn.closeNowCount() == 0 || srcConn.closeNowCount() == 0 {
+		t.Fatalf("indexed viewers not closed by fallback")
+	}
+	if _, ok := presence.ResolveHandle(2, h); ok {
+		t.Fatalf("stale viewer handle survives fallback")
+	}
+	if _, err := presence.Snapshot(1); !errors.Is(err, ErrPresenceNotFound) {
+		t.Fatalf("source presence teardown blocked by fanout failure: %v", err)
+	}
+	if _, err := presence.Snapshot(2); err != nil {
+		t.Fatalf("viewer presence disturbed by fallback: %v", err)
+	}
+}
+
 func TestRuntimeExitCharacterMismatch(t *testing.T) {
 	fakeSim := &recordingSim{}
-	rt, _, _ := testRuntime(t, fakeSim, worldRuntimeBase)
+	rt, _, _, _ := testRuntime(t, fakeSim, worldRuntimeBase)
 	ctx := context.Background()
 	if err := rt.PrepareEnter(ctx, 1, 11, 101); err != nil {
 		t.Fatal(err)
 	}
-	if err := rt.CommitEnter(1); err != nil {
+	if err := rt.CommitEnter(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := rt.ExitWorld(ctx, 1, 11, 999); err == nil {
@@ -567,7 +715,7 @@ func TestRuntimeInvalidTrustedSpawn(t *testing.T) {
 	nanSpawn := SpawnResolverFunc(func(context.Context, int64, int64) (world.Vec3, error) {
 		return world.Vec3{X: math.NaN(), Y: 0, Z: 0}, nil
 	})
-	rt, err := NewWorldSessionRuntime(e, presence, nanSpawn, func() time.Time { return worldRuntimeBase }, downstream)
+	rt, err := NewWorldSessionRuntime(e, presence, session.NewRegistry(), nanSpawn, func() time.Time { return worldRuntimeBase }, downstream, &recordingFanout{})
 	if err != nil {
 		t.Fatal(err)
 	}

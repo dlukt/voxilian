@@ -146,6 +146,16 @@ func (w *wsConnection) CloseNow() error {
 	return w.conn.CloseNow()
 }
 
+// Ping implements the gateway-local Pinger seam (spec §7.4.7): it
+// sends one WebSocket Ping and waits for the matching Pong while the
+// normal reader processes control frames. Control frames carry no
+// opcode, seq, or tick, create no ACK debt, consume no outbound queue
+// budget, and never touch the application writer gate — the websocket
+// library owns control-frame synchronization.
+func (w *wsConnection) Ping(ctx context.Context) error {
+	return w.conn.Ping(ctx)
+}
+
 // ServerDeps wires a gateway. Registry is required; every nil seam gets
 // a safe default (failing validator/provisioner, zero welcome/tick,
 // wall clock, AfterFunc scheduling, no-op handler) so tests only set
@@ -166,6 +176,13 @@ type ServerDeps struct {
 	Outbound         OutboundPolicy
 	OutboundObserver OutboundObserver
 
+	// Liveness is the optional T5b2 transport-liveness composition
+	// (spec §7.4.7): 30 s stale sweep, per-connection heartbeat ping
+	// loops, and the reaper-aware disconnect teardown. nil keeps the
+	// gateway world-free for frame/auth/ACK tests: no ping loop, no
+	// sweep goroutine, and plain registry teardown on disconnect.
+	Liveness *TransportLiveness
+
 	Handler MessageHandler
 }
 
@@ -185,10 +202,13 @@ type Server struct {
 	schedule  ScheduleFunc
 	outbound  OutboundPolicy
 	observer  OutboundObserver
+	liveness  *TransportLiveness
 	handler   MessageHandler
 }
 
-// NewServer builds a gateway from deps.
+// NewServer builds a gateway from deps. When Liveness is configured it
+// also starts the 30 s stale-sweep goroutine; pair with Close in that
+// case.
 func NewServer(deps ServerDeps) *Server {
 	s := &Server{
 		Registry:  deps.Registry,
@@ -200,6 +220,7 @@ func NewServer(deps ServerDeps) *Server {
 		schedule:  deps.Schedule,
 		outbound:  deps.Outbound,
 		observer:  deps.OutboundObserver,
+		liveness:  deps.Liveness,
 		handler:   deps.Handler,
 	}
 	// Per-field policy defaulting (spec §7.1.1): every unset bound
@@ -231,7 +252,19 @@ func NewServer(deps ServerDeps) *Server {
 	if s.schedule == nil {
 		s.schedule = prodSchedule
 	}
+	if s.liveness != nil {
+		s.liveness.Start()
+	}
 	return s
+}
+
+// Close stops the transport-liveness sweep goroutine and waits for its
+// exit (spec §7.4.7). Idempotent; it touches no session or
+// connection. Servers built without Liveness close trivially.
+func (s *Server) Close() {
+	if s.liveness != nil {
+		s.liveness.Close()
+	}
 }
 
 // prodSchedule is the production ScheduleFunc.
@@ -262,8 +295,10 @@ type connAuth struct {
 // ServeHTTP accepts one WebSocket connection and serves it until it
 // terminates, then stops its outbound queue (failing any pending
 // synchronous waiters and ending the writer pump), cancels its deadline
-// timer, and removes its session from the registry (idempotent cleanup
-// of sub/character indexes and connection references).
+// timer, stops its heartbeat ping loop, and tears the session down
+// through the reaper-aware path (spec §7.4.7): with Liveness
+// configured an IN_WORLD session gets flush-first world cleanup before
+// registry removal; otherwise removal is direct as before.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, nil)
 	if err != nil {
@@ -293,10 +328,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	sid := s.Registry.Create(out)
 	ca := &connAuth{}
+	// T5b2 (spec §7.4.7): at most ONE heartbeat ping goroutine per
+	// accepted WebSocket, stopped with the connection lifetime (the
+	// read loop unblocks on CloseNow — including a forced takeover —
+	// into this teardown).
+	var stopPing func()
+	if s.liveness != nil {
+		stopPing = s.liveness.StartPinger(sid, wsConn)
+	}
 	defer func() {
 		out.StopOutbound("client disconnected")
 		s.cancelDeadline(ca)
-		s.Registry.Remove(sid)
+		if stopPing != nil {
+			stopPing()
+		}
+		s.teardownSession(sid)
 	}()
 
 	for {
@@ -324,6 +370,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err := s.handleBinary(ctx, ca, sid, data); err != nil {
 			return
 		}
+	}
+}
+
+// teardownSession is the reaper-aware connection teardown (spec
+// §7.4.7): outbound and deadline are already stopped by the caller.
+// With Liveness configured, an IN_WORLD session gets flush-first
+// world cleanup (sim entity, fanout, Presence) before its registry
+// removal; a failed cleanup retains the registry entry as
+// world-cleanup-pending for the next sweep or a same-account takeover
+// rather than orphaning world state. Without Liveness the gateway
+// stays world-free and removes directly as before.
+func (s *Server) teardownSession(sid session.ID) {
+	if s.liveness == nil {
+		s.Registry.Remove(sid)
+		return
+	}
+	if err := s.liveness.reaper.Reap(sid, "disconnect"); err != nil {
+		slog.Warn("gateway: disconnect world cleanup retained for retry",
+			"session", uint64(sid), "err", err)
 	}
 }
 

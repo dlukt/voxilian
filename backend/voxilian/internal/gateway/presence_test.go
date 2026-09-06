@@ -798,3 +798,211 @@ func TestPresenceConcurrencySameSession(t *testing.T) {
 	checkInvariants(t, r, map[session.ID]NetEntityID{1: snap.OwnNetID},
 		map[session.ID]time.Time{1: presenceTestBase}, map[session.ID]map[NetEntityID]bool{})
 }
+
+func TestViewersOwnIndexedAtActivate(t *testing.T) {
+	r := mustPresenceRegistry(t, testPolicy())
+	mustActivate(t, r, 1, 101, 1001, world.CellCoord{}, presenceTestBase)
+	if got := r.Viewers(1001); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("Viewers(own) = %v, want [1]", got)
+	}
+	if sid, ok := r.Controller(1001); !ok || sid != 1 {
+		t.Fatalf("Controller(own) = %d,%v; want 1,true", sid, ok)
+	}
+	if _, ok := r.Controller(9999); ok {
+		t.Fatalf("Controller(unknown) = true")
+	}
+}
+
+func TestViewersEnsureHide(t *testing.T) {
+	r := mustPresenceRegistry(t, testPolicy())
+	mustActivate(t, r, 1, 101, 1001, world.CellCoord{}, presenceTestBase)
+	mustActivate(t, r, 2, 102, 1002, world.CellCoord{}, presenceTestBase)
+	mustActivate(t, r, 3, 103, 1003, world.CellCoord{}, presenceTestBase)
+	for _, sid := range []session.ID{1, 2, 3} {
+		if _, _, err := r.EnsureVisible(sid, 2001); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := r.Viewers(2001); len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
+		t.Fatalf("Viewers = %v, want [1 2 3] sorted", got)
+	}
+	if _, _, err := r.HideVisible(2, 2001); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.Viewers(2001); len(got) != 2 || got[0] != 1 || got[1] != 3 {
+		t.Fatalf("Viewers after hide = %v, want [1 3]", got)
+	}
+	// Re-show allocates a new handle but the same viewer set shape.
+	h, created, err := r.EnsureVisible(2, 2001)
+	if err != nil || !created || h == 2 {
+		t.Fatalf("re-show = %d,%v,%v", h, created, err)
+	}
+	if got := r.Viewers(2001); len(got) != 3 {
+		t.Fatalf("Viewers after re-show = %v", got)
+	}
+	// Returned slices are immutable copies.
+	got := r.Viewers(2001)
+	got[0] = 99
+	if again := r.Viewers(2001); again[0] != 1 {
+		t.Fatalf("viewer copy aliases registry: %v", again)
+	}
+}
+
+func TestViewersDeactivateClearsAll(t *testing.T) {
+	r := mustPresenceRegistry(t, testPolicy())
+	mustActivate(t, r, 1, 101, 1001, world.CellCoord{}, presenceTestBase)
+	mustActivate(t, r, 2, 102, 1002, world.CellCoord{}, presenceTestBase)
+	for _, ent := range []sim.EntityID{1002, 2001, 2002} {
+		if _, _, err := r.EnsureVisible(1, ent); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := r.EnsureVisible(2, 2001); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Deactivate(1); err != nil {
+		t.Fatal(err)
+	}
+	for _, ent := range []sim.EntityID{1001, 1002, 2001, 2002} {
+		for _, sid := range r.Viewers(ent) {
+			if sid == 1 {
+				t.Fatalf("entity %d retains ghost viewer 1", uint64(ent))
+			}
+		}
+	}
+	if got := r.Viewers(2001); len(got) != 1 || got[0] != 2 {
+		t.Fatalf("Viewers(2001) = %v, want [2]", got)
+	}
+	r.mu.RLock()
+	n := len(r.viewers)
+	r.mu.RUnlock()
+	if n != 2 { // 1002 (owner 2) + 2001 (viewer 2)
+		t.Fatalf("reverse index has %d entities, want 2 (no empties)", n)
+	}
+}
+
+func TestVisibleEntitiesAndHandle(t *testing.T) {
+	r := mustPresenceRegistry(t, testPolicy())
+	mustActivate(t, r, 1, 101, 1001, world.CellCoord{}, presenceTestBase)
+	if _, _, err := r.EnsureVisible(1, 2002); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.EnsureVisible(1, 2001); err != nil {
+		t.Fatal(err)
+	}
+	ents, err := r.VisibleEntities(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 3 || ents[0] != 1001 || ents[1] != 2001 || ents[2] != 2002 {
+		t.Fatalf("VisibleEntities = %v, want sorted [1001 2001 2002]", ents)
+	}
+	ents[0] = 9
+	if again, _ := r.VisibleEntities(1); again[0] != 1001 {
+		t.Fatalf("entities copy aliases registry")
+	}
+	h, ok, err := r.VisibleHandle(1, 2001)
+	if err != nil || !ok || h != 3 {
+		t.Fatalf("VisibleHandle(2001) = %d,%v,%v; want 3,true,nil", h, ok, err)
+	}
+	if _, ok, err := r.VisibleHandle(1, 2999); err != nil || ok {
+		t.Fatalf("VisibleHandle(absent) = %v,%v", ok, err)
+	}
+	if _, _, err := r.VisibleHandle(9, 2001); !errors.Is(err, ErrPresenceNotFound) {
+		t.Fatalf("VisibleHandle unknown = %v", err)
+	}
+	if _, err := r.VisibleEntities(9); !errors.Is(err, ErrPresenceNotFound) {
+		t.Fatalf("VisibleEntities unknown = %v", err)
+	}
+}
+
+func TestPresenceVisibilityProperty(t *testing.T) {
+	for seed := 0; seed < 128; seed++ {
+		rng := rand.New(rand.NewSource(int64(seed)))
+		r := mustPresenceRegistry(t, testPolicy())
+		for step := 0; step < 128; step++ {
+			sid := session.ID(rng.Intn(3) + 1)
+			char := int64(sid) + 100
+			ctrl := sim.EntityID(1000 + uint64(sid))
+			vis := sim.EntityID(2000 + uint64(rng.Intn(5)))
+			switch rng.Intn(6) {
+			case 0:
+				_, _ = r.Activate(sid, char, ctrl, world.CellCoord{}, presenceTestBase)
+			case 1:
+				_, _ = r.Deactivate(sid)
+			case 2:
+				_, _, _ = r.EnsureVisible(sid, vis)
+			case 3:
+				_, _, _ = r.HideVisible(sid, vis)
+			case 4:
+				_ = r.Viewers(vis)
+				_, _ = r.VisibleEntities(sid)
+			case 5:
+				_, _, _ = r.VisibleHandle(sid, vis)
+				_, _ = r.Controller(vis)
+			}
+			// Triple-agreement invariant after every action.
+			r.mu.RLock()
+			rebuilt := make(map[sim.EntityID]map[session.ID]struct{})
+			for s, p := range r.bySess {
+				for ent, h := range p.forward {
+					if p.reverse[h] != ent {
+						r.mu.RUnlock()
+						t.Fatalf("seed %d: sid %d forward/reverse disagree", seed, s)
+					}
+					set := rebuilt[ent]
+					if set == nil {
+						set = make(map[session.ID]struct{})
+						rebuilt[ent] = set
+					}
+					set[s] = struct{}{}
+				}
+				if p.forward[p.entityID] != 1 {
+					r.mu.RUnlock()
+					t.Fatalf("seed %d: sid %d own not pinned", seed, s)
+				}
+			}
+			if len(rebuilt) != len(r.viewers) {
+				r.mu.RUnlock()
+				t.Fatalf("seed %d: viewer index size %d, forward implies %d", seed, len(r.viewers), len(rebuilt))
+			}
+			for ent, want := range rebuilt {
+				got := r.viewers[ent]
+				if len(got) != len(want) {
+					r.mu.RUnlock()
+					t.Fatalf("seed %d: entity %d viewers %d, want %d", seed, uint64(ent), len(got), len(want))
+				}
+				for s := range want {
+					if _, ok := got[s]; !ok {
+						r.mu.RUnlock()
+						t.Fatalf("seed %d: entity %d missing viewer %d", seed, uint64(ent), s)
+					}
+				}
+			}
+			r.mu.RUnlock()
+		}
+	}
+}
+
+func TestViewersConcurrentEnsureHide(t *testing.T) {
+	r := mustPresenceRegistry(t, testPolicy())
+	mustActivate(t, r, 1, 101, 1001, world.CellCoord{}, presenceTestBase)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := 0; w < 6; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			<-start
+			ent := sim.EntityID(2000 + uint64(w%3))
+			for i := 0; i < 50; i++ {
+				_, _, _ = r.EnsureVisible(1, ent)
+				_ = r.Viewers(ent)
+				_, _ = r.VisibleEntities(1)
+				_, _, _ = r.HideVisible(1, ent)
+			}
+		}(w)
+	}
+	close(start)
+	wg.Wait()
+}

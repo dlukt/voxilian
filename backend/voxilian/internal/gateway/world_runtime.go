@@ -49,14 +49,15 @@ func (f SpawnResolverFunc) ResolveSpawn(ctx context.Context, accountID int64, ch
 }
 
 // WorldEnter is the staged world-entry seam EnterWorldHandler needs
-// (spec §7.3.4). PrepareEnter stages the sim entity without
+// (spec §7.3.4/§7.4.4). PrepareEnter stages the sim entity without
 // activating Presence; CommitEnter activates Presence after the
-// physical 219 + CompleteEnterWorld barrier; AbortEnter removes a
-// staged entity. The same concrete WorldSessionRuntime also
-// implements WorldExit, so leave and takeover share one composition.
+// physical 219 + CompleteEnterWorld barrier and bootstraps fanout
+// visibility; AbortEnter removes a staged entity. The same concrete
+// WorldSessionRuntime also implements WorldExit, so leave and
+// takeover share one composition.
 type WorldEnter interface {
 	PrepareEnter(ctx context.Context, sid session.ID, accountID int64, characterID int64) error
-	CommitEnter(sid session.ID) error
+	CommitEnter(ctx context.Context, sid session.ID) error
 	AbortEnter(ctx context.Context, sid session.ID) error
 }
 
@@ -70,16 +71,19 @@ type pendingEntry struct {
 	staged      bool
 }
 
-// WorldSessionRuntime composes SimIngress, PresenceRegistry,
-// SpawnResolver, NowFunc, and the downstream WorldExit
-// quiesce/flush seam into one staged world-presence lifecycle
-// (spec §7.3.4–§7.3.6). It is safe for concurrent use; the small
+// WorldSessionRuntime composes SimIngress, PresenceRegistry, the
+// session Registry (for fail-closed transport cleanup), FanoutLifecycle,
+// SpawnResolver, NowFunc, and the downstream WorldExit quiesce/flush
+// seam into one staged world-presence lifecycle (spec
+// §7.3.4–§7.3.6, §7.4.6). It is safe for concurrent use; the small
 // pending-entry mutex is never held across SpawnResolver calls,
-// sim Enqueue*, downstream WorldExit calls, socket writes, or
-// PresenceRegistry calls.
+// sim Enqueue*, downstream WorldExit calls, fanout controls, socket
+// writes, or PresenceRegistry calls.
 type WorldSessionRuntime struct {
 	sim        SimIngress
 	presence   *PresenceRegistry
+	sessions   *session.Registry
+	fanout     FanoutLifecycle
 	spawn      SpawnResolver
 	now        NowFunc
 	downstream WorldExit
@@ -89,14 +93,19 @@ type WorldSessionRuntime struct {
 }
 
 // NewWorldSessionRuntime wires a WorldSessionRuntime. Every
-// dependency is required: a missing sim, presence, spawn, clock, or
-// downstream flush seam must never silently succeed.
-func NewWorldSessionRuntime(simIngress SimIngress, presence *PresenceRegistry, spawn SpawnResolver, now NowFunc, downstream WorldExit) (*WorldSessionRuntime, error) {
+// dependency is required: a missing sim, presence, sessions,
+// fanout, spawn, clock, or downstream flush seam must never
+// silently succeed. Tests that do not exercise fanout pass a
+// no-op/recording FanoutLifecycle fake.
+func NewWorldSessionRuntime(simIngress SimIngress, presence *PresenceRegistry, sessions *session.Registry, spawn SpawnResolver, now NowFunc, downstream WorldExit, fanout FanoutLifecycle) (*WorldSessionRuntime, error) {
 	if simIngress == nil {
 		return nil, errors.New("gateway: sim ingress is required")
 	}
 	if presence == nil {
 		return nil, errors.New("gateway: presence registry is required")
+	}
+	if sessions == nil {
+		return nil, errors.New("gateway: session registry is required")
 	}
 	if spawn == nil {
 		return nil, errors.New("gateway: spawn resolver is required")
@@ -107,9 +116,14 @@ func NewWorldSessionRuntime(simIngress SimIngress, presence *PresenceRegistry, s
 	if downstream == nil {
 		return nil, errors.New("gateway: downstream world exit is required")
 	}
+	if fanout == nil {
+		return nil, errors.New("gateway: fanout lifecycle is required")
+	}
 	return &WorldSessionRuntime{
 		sim:        simIngress,
 		presence:   presence,
+		sessions:   sessions,
+		fanout:     fanout,
 		spawn:      spawn,
 		now:        now,
 		downstream: downstream,
@@ -191,11 +205,16 @@ func (r *WorldSessionRuntime) AbortEnter(ctx context.Context, sid session.ID) er
 }
 
 // CommitEnter activates Presence from the staged entry AFTER the
-// physical 219 write and CompleteEnterWorld (spec §7.3.4). Buckets
-// start at commit time via Now(). On activation failure the staged
-// entry is retained so AbortEnter still removes the sim entity; on
-// success pending metadata is dropped. No wire message is emitted.
-func (r *WorldSessionRuntime) CommitEnter(sid session.ID) error {
+// physical 219 write and CompleteEnterWorld (spec §7.3.4), then
+// bootstraps fanout visibility (spec §7.4.4). Buckets start at
+// commit time via Now(). On activation failure the staged entry is
+// retained so AbortEnter still removes the sim entity. On bootstrap
+// failure Presence is deactivated, source-session fanout bookkeeping
+// is cleared with ready=false, the staged entry is retained, and the
+// existing post-219 handler path aborts the entity and rolls back
+// the binding. On success pending metadata is dropped. No wire
+// message is emitted by CommitEnter itself.
+func (r *WorldSessionRuntime) CommitEnter(ctx context.Context, sid session.ID) error {
 	r.mu.Lock()
 	p, ok := r.pending[sid]
 	r.mu.Unlock()
@@ -205,15 +224,24 @@ func (r *WorldSessionRuntime) CommitEnter(sid session.ID) error {
 	if _, err := r.presence.Activate(sid, p.characterID, p.entity, p.cell, r.now()); err != nil {
 		return fmt.Errorf("gateway: commit presence: %w", err)
 	}
+	if err := r.fanout.BootstrapSession(ctx, sid); err != nil {
+		_, _ = r.presence.Deactivate(sid)
+		return fmt.Errorf("gateway: commit bootstrap: %w", err)
+	}
 	r.dropPending(sid)
 	return nil
 }
 
 // ExitWorld implements WorldExit for a healthy active presence
-// (spec §7.3.6): verify the sid/character match, run the existing
-// downstream quiesce/flush seam FIRST, then remove the sim entity,
-// then deactivate Presence. Any failure stops with prior state
-// intact so the caller can retry safely.
+// (spec §7.3.6/§7.4.6): verify the sid/character match, run the
+// existing downstream quiesce/flush seam FIRST, then remove the sim
+// entity, then remove fanout visibility, then deactivate Presence.
+// Downstream failure stops with everything intact (retry-safe);
+// pre-mutation sim-remove failure skips fanout entirely
+// (retry-safe). Reliable fanout-removal failure after real sim
+// removal falls back to closing/resyncing every indexed viewer with
+// mapping retirement while local teardown continues — never
+// resurrecting the entity or leaving stale addressable handles.
 func (r *WorldSessionRuntime) ExitWorld(ctx context.Context, sid session.ID, accountID int64, characterID int64) error {
 	snap, err := r.presence.Snapshot(sid)
 	if err != nil {
@@ -228,10 +256,33 @@ func (r *WorldSessionRuntime) ExitWorld(ctx context.Context, sid session.ID, acc
 	if err := r.sim.EnqueueRemoveEntity(ctx, snap.EntityID); err != nil {
 		return fmt.Errorf("gateway: exit remove entity: %w", err)
 	}
+	if err := r.fanout.RemovePresence(ctx, sid, snap.EntityID); err != nil {
+		r.removePresenceFallback(sid, snap.EntityID)
+	}
 	if _, err := r.presence.Deactivate(sid); err != nil {
 		return fmt.Errorf("gateway: exit deactivate presence: %w", err)
 	}
 	return nil
+}
+
+// removePresenceFallback runs when the reliable fanout removal
+// cannot complete after real sim removal (spec §7.4.6): every
+// currently indexed viewer of the entity is closed/resynced with
+// non-source visibility mappings retired, and local Presence
+// teardown continues afterwards. A stale fanout ready flag for the
+// source is harmless: Deactivate removes its subscriptions and
+// mappings, so no future fanout set can include it, and the pump
+// only targets live presence state.
+func (r *WorldSessionRuntime) removePresenceFallback(sid session.ID, entity sim.EntityID) {
+	for _, v := range r.presence.Viewers(entity) {
+		if s, ok := r.sessions.Get(v); ok && s.Conn != nil {
+			_ = s.Conn.CloseNow()
+		}
+		if v == sid {
+			continue
+		}
+		_, _, _ = r.presence.HideVisible(v, entity)
+	}
 }
 
 // dropPending removes the pending reservation unconditionally.

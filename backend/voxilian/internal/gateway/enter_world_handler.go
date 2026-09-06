@@ -356,7 +356,7 @@ func (h *EnterWorldHandler) enter(
 	// invariant: abort the staged entity, roll back the just-completed
 	// binding where still owned, and fail closed with no enter
 	// success.
-	if err := h.WorldEnter.CommitEnter(sid); err != nil {
+	if err := h.WorldEnter.CommitEnter(ctx, sid); err != nil {
 		_ = h.WorldEnter.AbortEnter(ctx, sid)
 		_ = h.Registry.CompleteLeaveWorld(sid, desc.ID)
 		unlock()

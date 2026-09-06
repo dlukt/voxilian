@@ -68,9 +68,9 @@ func (l *loggingWorld) PrepareEnter(ctx context.Context, sid session.ID, acct, c
 	return l.inner.PrepareEnter(ctx, sid, acct, char)
 }
 
-func (l *loggingWorld) CommitEnter(sid session.ID) error {
+func (l *loggingWorld) CommitEnter(ctx context.Context, sid session.ID) error {
 	l.log.add("commit")
-	return l.inner.CommitEnter(sid)
+	return l.inner.CommitEnter(ctx, sid)
 }
 
 func (l *loggingWorld) AbortEnter(ctx context.Context, sid session.ID) error {
@@ -113,6 +113,7 @@ type lifecycleFixture struct {
 	fakeSim    *recordingSim
 	spawn      *countingSpawn
 	downstream *recordingDownstream
+	fanout     *recordingFanout
 	runtime    *WorldSessionRuntime
 	world      *loggingWorld
 	provider   *emptyBaseline
@@ -132,7 +133,8 @@ func newLifecycleFixture(t *testing.T, spawnPos world.Vec3, now time.Time) *life
 	fakeSim := &recordingSim{}
 	spawn := &countingSpawn{pos: spawnPos}
 	downstream := &recordingDownstream{}
-	runtime, err := NewWorldSessionRuntime(fakeSim, presence, spawn, func() time.Time { return now }, downstream)
+	fanout := &recordingFanout{}
+	runtime, err := NewWorldSessionRuntime(fakeSim, presence, reg, spawn, func() time.Time { return now }, downstream, fanout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +159,7 @@ func newLifecycleFixture(t *testing.T, spawnPos world.Vec3, now time.Time) *life
 	}
 	return &lifecycleFixture{
 		reg: reg, presence: presence, fakeSim: fakeSim, spawn: spawn,
-		downstream: downstream, runtime: runtime, world: lw,
+		downstream: downstream, fanout: fanout, runtime: runtime, world: lw,
 		provider: provider, now: now, h: enter, chars: chars,
 		sends: &sendRecorder{},
 	}
@@ -399,8 +401,8 @@ func TestLifecycleNormalLeave(t *testing.T) {
 	if got := f.world.log.slice(); !equalStrings(got, []string{"prepare", "commit", "exit"}) {
 		t.Fatalf("world calls = %v", got)
 	}
-	if f.downstream.calls != 1 {
-		t.Fatalf("downstream flush calls = %d, want 1", f.downstream.calls)
+	if f.downstream.callCount() != 1 {
+		t.Fatalf("downstream flush calls = %d, want 1", f.downstream.callCount())
 	}
 	if _, err := f.presence.Snapshot(sid); !errors.Is(err, ErrPresenceNotFound) {
 		t.Fatalf("presence survives leave: %v", err)
@@ -635,5 +637,103 @@ func TestGatewayRealEngineMovementProof(t *testing.T) {
 	}
 	if got.LastProcessedInputSeq != 1 {
 		t.Fatalf("anchor = %d, want 1", got.LastProcessedInputSeq)
+	}
+}
+
+// TestGatewayRealEngineFanoutProof is the B42 composition: the REAL
+// FanoutRuntime is the real Engine's MovementSink; a 102 through the
+// real GameplayIngressHandler travels Engine Step -> OnMovement ->
+// pump -> 205 TryState -> real outbound queue -> physical binary
+// frame. No synthetic MovementSink invocation is involved.
+func TestGatewayRealEngineFanoutProof(t *testing.T) {
+	clk := new(gwTestClock)
+	reg := session.NewRegistry()
+	presence, err := NewPresenceRegistry(testPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := newFakePresentation()
+	fanout, err := NewFanoutRuntime(presence, reg, source, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(fanout.Close)
+	e, err := sim.NewEngine(sim.EngineConfig{TickHz: 20}, sim.EngineDeps{
+		Clock: clk, RNG: &gwTestRNG{}, Collision: gwOpenCollision{},
+		RunGate: gwStaticGate{allow: true}, Movement: fanout,
+	})
+	if err != nil {
+		t.Fatalf("sim.NewEngine: %v", err)
+	}
+	cancel, done := runSimOwner(t, e)
+	defer stopSimOwner(t, cancel, done)
+	ctx := context.Background()
+	// A queue-capable session over a fake transport.
+	tr := newFakeOutTransport()
+	ob := &recordingObserver{}
+	oc := newOutboundConn(OutboundDeps{
+		Conn: tr, Registry: reg,
+		Tick: func() uint32 { return 1000 }, Policy: DefaultOutboundPolicy(), Observer: ob,
+	})
+	sid := reg.Create(oc)
+	// The world stages one entity and brings the session world-ready.
+	snap, err := e.EnqueueAddEntity(ctx, world.Vec3{})
+	if err != nil {
+		t.Fatalf("stage entity: %v", err)
+	}
+	source.put(EntityPresentation{EntityID: snap.ID, Position: world.Vec3{}, Kind: 2, Proto: 7})
+	if _, err := presence.Activate(sid, 500, snap.ID, snap.Cell, worldRuntimeBase); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	if err := fanout.BootstrapSession(ctx, sid); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	// The 102 travels the real handler into the real engine.
+	h, err := NewGameplayIngressHandler(presence, e, func() time.Time { return worldRuntimeBase }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := encodeMove(t, proto.Header{Opcode: proto.OpcodeMove, MsgVersion: 1, Seq: 9, Tick: 0},
+		proto.Move{InputSeq: 1, HeldDirs: sim.MoveDirForward, Yaw: 0})
+	header, dec, err := proto.DecodeFrame(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Handle(ctx, sid, header, dec, nil); err != nil {
+		t.Fatalf("102 through handler: %v", err)
+	}
+	// Drive engine ticks; the movement update fans out through the
+	// real queue onto the physical transport.
+	for i := 0; i < 3; i++ {
+		clk.current().pulse(worldRuntimeBase)
+	}
+	waitSimTick(t, e, 3)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var last *proto.EntityMove
+		for _, raw := range tr.recorded() {
+			fh, fdec, err := proto.DecodeFrame(raw)
+			if err != nil || fh.Opcode != proto.OpcodeEntityMove {
+				continue
+			}
+			m, err := proto.DecodeEntityMove(fdec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mm := m
+			last = &mm
+		}
+		if last != nil && last.LastProcessedInputSeq == 1 && last.Entity == 1 {
+			if last.Pos.Z >= 0 {
+				t.Fatalf("205 position = %+v, want authoritative -Z walk", last.Pos)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no authoritative 205 reached the transport (last=%v)", last)
+		}
+	}
+	if fanout.DroppedMovementUpdates() != 0 {
+		t.Fatalf("movement updates dropped in a healthy pipeline: %d", fanout.DroppedMovementUpdates())
 	}
 }

@@ -167,6 +167,31 @@ type PresenceRegistry struct {
 	byEntity map[sim.EntityID]*presence
 	// subs maps each subscribed cell to its live subscriber sessions.
 	subs map[world.CellCoord]map[session.ID]struct{}
+	// viewers maps each currently-visible entity to its live viewer
+	// sessions (spec §7.4.1): the reverse of every presence's
+	// forward visibility table, updated atomically under this same
+	// lock. Empty sets are deleted; Deactivate leaves no ghost.
+	viewers map[sim.EntityID]map[session.ID]struct{}
+}
+
+// addViewer records sid as a viewer of entity, creating the set.
+func (r *PresenceRegistry) addViewer(entity sim.EntityID, sid session.ID) {
+	set := r.viewers[entity]
+	if set == nil {
+		set = make(map[session.ID]struct{})
+		r.viewers[entity] = set
+	}
+	set[sid] = struct{}{}
+}
+
+// removeViewer drops sid from entity's viewer set, deleting empties.
+func (r *PresenceRegistry) removeViewer(entity sim.EntityID, sid session.ID) {
+	if set := r.viewers[entity]; set != nil {
+		delete(set, sid)
+		if len(set) == 0 {
+			delete(r.viewers, entity)
+		}
+	}
 }
 
 // NewPresenceRegistry returns an empty presence registry enforcing
@@ -182,6 +207,7 @@ func NewPresenceRegistry(policy RateLimitPolicy) (*PresenceRegistry, error) {
 		byChar:   make(map[int64]*presence),
 		byEntity: make(map[sim.EntityID]*presence),
 		subs:     make(map[world.CellCoord]map[session.ID]struct{}),
+		viewers:  make(map[sim.EntityID]map[session.ID]struct{}),
 	}, nil
 }
 
@@ -233,6 +259,7 @@ func (r *PresenceRegistry) Activate(sid session.ID, characterID int64, entity si
 	r.bySess[sid] = p
 	r.byChar[characterID] = p
 	r.byEntity[entity] = p
+	r.addViewer(entity, sid)
 	for _, c := range cells {
 		set := r.subs[c]
 		if set == nil {
@@ -260,6 +287,9 @@ func (r *PresenceRegistry) Deactivate(sid session.ID) (PresenceSnapshot, error) 
 	delete(r.bySess, sid)
 	delete(r.byChar, p.characterID)
 	delete(r.byEntity, p.entityID)
+	for entity := range p.forward {
+		r.removeViewer(entity, sid)
+	}
 	for _, c := range p.cells {
 		if set := r.subs[c]; set != nil {
 			delete(set, sid)
@@ -384,6 +414,7 @@ func (r *PresenceRegistry) EnsureVisible(sid session.ID, entity sim.EntityID) (N
 	}
 	p.forward[entity] = h
 	p.reverse[h] = entity
+	r.addViewer(entity, sid)
 	return h, true, nil
 }
 
@@ -410,6 +441,7 @@ func (r *PresenceRegistry) HideVisible(sid session.ID, entity sim.EntityID) (Net
 	}
 	delete(p.forward, entity)
 	delete(p.reverse, h)
+	r.removeViewer(entity, sid)
 	return h, true, nil
 }
 
@@ -432,6 +464,70 @@ func (r *PresenceRegistry) ResolveHandle(sid session.ID, net NetEntityID) (sim.E
 		return sim.InvalidEntityID, false
 	}
 	return entity, true
+}
+
+// Viewers returns the live sessions currently seeing entity
+// (spec §7.4.1), sorted numerically ascending, as a copy. Unknown
+// entities yield an empty result.
+func (r *PresenceRegistry) Viewers(entity sim.EntityID) []session.ID {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	set := r.viewers[entity]
+	ids := make([]session.ID, 0, len(set))
+	for sid := range set {
+		ids = append(ids, sid)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// VisibleEntities returns every sim entity sid currently sees
+// (including its own controlled entity), sorted numerically
+// ascending, as a copy. Unknown sessions report
+// ErrPresenceNotFound.
+func (r *PresenceRegistry) VisibleEntities(sid session.ID) ([]sim.EntityID, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	p, ok := r.bySess[sid]
+	if !ok {
+		return nil, ErrPresenceNotFound
+	}
+	ids := make([]sim.EntityID, 0, len(p.forward))
+	for entity := range p.forward {
+		ids = append(ids, entity)
+	}
+	slices.Sort(ids)
+	return ids, nil
+}
+
+// VisibleHandle returns sid's current session-local handle for
+// entity. Unknown sessions report ErrPresenceNotFound; entities
+// outside sid's visibility report visible=false.
+func (r *PresenceRegistry) VisibleHandle(sid session.ID, entity sim.EntityID) (NetEntityID, bool, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	p, ok := r.bySess[sid]
+	if !ok {
+		return InvalidNetEntityID, false, ErrPresenceNotFound
+	}
+	h, ok := p.forward[entity]
+	if !ok {
+		return InvalidNetEntityID, false, nil
+	}
+	return h, true, nil
+}
+
+// Controller returns the session currently controlling entity (the
+// reverse controlled-entity index), or false for uncontrolled/unknown
+// entities. No scan over sessions is performed.
+func (r *PresenceRegistry) Controller(entity sim.EntityID) (session.ID, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	p, ok := r.byEntity[entity]
+	if !ok {
+		return 0, false
+	}
+	return p.sessionID, true
 }
 
 // TouchHeartbeat advances sid's heartbeat to now when now is strictly

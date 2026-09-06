@@ -139,7 +139,7 @@ Exit: 20 Hz tick loop, cells, server-authoritative movement with reconciliation 
   Deterministic/race/real-WS integration tests. NO AOI 204/205/206
   fanout yet. NO heartbeat runtime yet.
   Spec: §5.2.10, §5.3–§5.4, §6.3, §7, §7.2, §7.3.
-- [ ] **M4-T5b2** AOI fanout + transport liveness:
+- [x] **M4-T5b2** AOI fanout + transport liveness:
   Presence entity->viewer reverse index; in-memory EntityPresentation
   source; one bounded 1024-event fanout pump over sim MovementUpdate
   (non-blocking sink, drop-counted); post-world-ready deterministic

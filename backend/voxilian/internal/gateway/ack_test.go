@@ -134,7 +134,7 @@ func (stubWorldEnter) PrepareEnter(context.Context, session.ID, int64, int64) er
 	return nil
 }
 
-func (stubWorldEnter) CommitEnter(session.ID) error { return nil }
+func (stubWorldEnter) CommitEnter(context.Context, session.ID) error { return nil }
 
 func (stubWorldEnter) AbortEnter(context.Context, session.ID) error { return nil }
 

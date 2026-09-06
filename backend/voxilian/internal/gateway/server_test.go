@@ -2672,6 +2672,14 @@ func (f *wsSimFake) EnqueueMove(_ context.Context, id sim.EntityID, intent sim.M
 
 func (f *wsSimFake) CurrentTick() uint32 { return 777 }
 
+// wsFanoutFake is a no-op FanoutLifecycle for WS chains that do not
+// exercise fanout visibility.
+type wsFanoutFake struct{}
+
+func (wsFanoutFake) BootstrapSession(context.Context, session.ID) error { return nil }
+
+func (wsFanoutFake) RemovePresence(context.Context, session.ID, sim.EntityID) error { return nil }
+
 func sendMoveWS(t *testing.T, c *websocket.Conn, seq uint32, tick uint32, inputSeq uint32) {
 	t.Helper()
 	sendFrame(t, c,
@@ -2701,7 +2709,7 @@ func TestMovementIngressWS(t *testing.T) {
 		return world.Vec3{X: 4}, nil
 	})
 	downstream := gateway.WorldExitFunc(func(context.Context, session.ID, int64, int64) error { return nil })
-	runtime, err := gateway.NewWorldSessionRuntime(fakeSim, presence, spawn, nowFunc, downstream)
+	runtime, err := gateway.NewWorldSessionRuntime(fakeSim, presence, reg, spawn, nowFunc, downstream, wsFanoutFake{})
 	if err != nil {
 		t.Fatal(err)
 	}
