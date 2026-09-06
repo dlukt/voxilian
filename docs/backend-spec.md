@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.21 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.22 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -437,6 +437,92 @@ type RNG interface {
 - No M4-T3 behavior: no ownership generations, handoff queues,
   migration, cross-cell `opID`, dedupe, or retry routing.
 
+#### 5.2.10 Runtime command ingress (frozen, v0.3.22)
+
+Once `Engine.Run(ctx)` is active, mutable Engine state may be changed
+ONLY by the Run goroutine itself — including movement submission,
+entity add, and entity remove. External goroutines (gateway handlers)
+never call the direct mutation methods concurrently with Run. The
+existing `AddEntity` / `RemoveEntity` / `SubmitMove` / `Step`
+signatures do NOT change: they remain owner-local synchronous
+primitives, documented as safe only when the caller owns simulation
+execution. The concurrent gateway-facing APIs below are separate.
+
+Ingress mailbox: exactly one bounded channel per Engine, capacity
+`SimIngressCapacity = 256` commands, constructed in `NewEngine` (no
+lazy nil-channel path). No per-entity or per-command-type capacity.
+The mailbox carries exactly three typed command kinds — add, remove,
+move. Gateway MUST NOT gain a generic `func(*Engine)` callback
+command: arbitrary sim mutations can never be injected. Future M5+
+typed gameplay commands may extend the internal command union.
+
+Conceptual concurrent API (exact Go names may differ):
+
+```go
+EnqueueAddEntity(ctx context.Context, pos world.Vec3) (EntitySnapshot, error)
+EnqueueRemoveEntity(ctx context.Context, id EntityID) error
+EnqueueMove(ctx context.Context, id EntityID, intent MoveIntent) (MoveDisposition, error)
+```
+
+`CurrentTick() uint32` remains direct concurrent observation and is
+NOT routed through the mailbox.
+
+Stable `errors.Is` errors (separate conditions, no string parsing):
+`ErrSimIngressFull` (mailbox full at admission),
+`ErrEngineNotRunning` (no Run owns the engine),
+`ErrEngineAlreadyRunning` (second concurrent Run),
+`ErrEngineStopped` (Run exited with the command still queued).
+
+Run-state semantics: before Run owns the engine, `Enqueue*` returns
+`ErrEngineNotRunning` with zero mutation. While one Run is active, a
+second concurrent Run returns `ErrEngineAlreadyRunning` (no second
+ticker owner). After Run exits, `Enqueue*` returns
+`ErrEngineNotRunning`. A later sequential Run MAY start after the
+previous one fully exited; no queued command survives into the new
+generation.
+
+Admission is immediate and bounded: a free slot publishes exactly one
+command; a full mailbox returns `ErrSimIngressFull` immediately with
+no command published, no sim mutation, and no `inputSeq` consumption.
+If `ctx.Err() != nil` before publication, the call returns the
+context error and publishes/mutates nothing — a cancelled caller is
+never randomly admitted; the cancellation check before publication is
+explicit and deterministic. Once admitted, the command is
+authoritative: later caller cancellation does NOT retract it, and the
+caller waits for that exact command's definitive result (mirroring
+the outbound critical principle: abandon before publication,
+complete-or-teardown after).
+
+Each command owns exactly one buffered result channel of capacity 1
+(or an equivalent bounded completion primitive): no goroutine per
+command, no shared global waiter map, and the sim owner never blocks
+because a caller stopped reading. When Run exits it marks the engine
+non-running and fails every queued-but-not-executed command with
+`ErrEngineStopped` — no waiter stays parked. Already-executing
+owner-local work completes normally before Run exits that iteration.
+
+Tick priority: ingress MUST NOT starve fixed-step ticks. Before
+blocking for another command, Run checks whether a ticker pulse is
+already ready; a ready tick wins before another queued command (e.g.
+`select` ticker-ready first, then `select` ctx/ticker/command). When
+a tick is already ready, the loop cannot drain an arbitrary backlog
+of commands first. No command-burst catch-up replaces ticks. Run
+executes one command to completion on the sim owner goroutine, then
+returns to scheduling — no internal command worker, no parallel
+execution.
+
+Execution delegates to the SAME existing semantics: move commands
+call `SubmitMove`, add commands call `AddEntity`, remove commands
+call `RemoveEntity`. No duplicate movement/registry implementation
+lives in ingress code. `EnqueueMove` only updates pending control;
+positions still change only during `Step`. T5b1 adds no Prometheus
+metric for command depth.
+
+Only command admission/run-state coordination may lock across
+goroutines (a short ingress/run-state mutex is allowed). That lock
+MUST NOT become a broad mutex around `Step`/`SubmitMove`/entity
+state: mutable sim remains single-owner.
+
 ### 5.3 Authoritative movement semantics (frozen, v0.3.15)
 
 M4-T2 owns `102` movement SEMANTICS: movement intent ordering,
@@ -448,9 +534,11 @@ M4-T2 does NOT yet own real gateway → Engine wiring, character DB ID
 → EntityID binding, session-local NetEntityID allocation, `205`
 binary transmission, AOI subscription/fanout, movement outbound
 throttling, per-character inbound rate limiting, or presence. Those
-runtime gateway-facing concerns belong to M4-T5: M4-T2 owns
-authoritative move semantics; M4-T5 wires decoded gateway intents
-into sim and fans `205` updates to session-local NetEntityIDs/AOI.
+runtime gateway-facing concerns belong to M4-T5b1 (owner-mailbox
+ingress, 102 routing, rate enforcement, staged lifecycle) and M4-T5b2
+(AOI fanout, heartbeat runtime): M4-T2 owns authoritative move
+semantics; M4-T5b1 wires decoded gateway intents into sim; M4-T5b2
+fans `205` updates to session-local NetEntityIDs/AOI.
 
 #### 5.3.1 Wire independence and the neutral serial32 home
 
@@ -2678,6 +2766,248 @@ label series — ignoring an unknown internal value is preferable to
 accidental high-cardinality metric creation. No user-provided
 diagnostic string ever becomes a metric label.
 
+### 7.3 Gateway-to-sim ingress and world-presence lifecycle
+(frozen, v0.3.22)
+
+T5b1 composes the T5a presence core with the §5.2.10 owner mailbox:
+real `102` routing, inbound rate enforcement, and staged
+world-presence lifecycle. It sends no AOI fanout (no 204/205/206, no
+MovementSink adapter, no 10 Hz throttler) and runs no heartbeat
+runtime (no Ping/Pong timers, no stale sweep, no raw-disconnect
+cleanup — those are T5b2).
+
+#### 7.3.1 Gateway sim seam
+
+Gateway depends on a narrow structural interface (conceptual; exact
+Go names may differ):
+
+```go
+type SimIngress interface {
+    EnqueueAddEntity(context.Context, world.Vec3) (sim.EntitySnapshot, error)
+    EnqueueRemoveEntity(context.Context, sim.EntityID) error
+    EnqueueMove(context.Context, sim.EntityID, sim.MoveIntent) (sim.MoveDisposition, error)
+    CurrentTick() uint32
+}
+```
+
+`*sim.Engine` satisfies it. Gateway does NOT expose sim registry
+internals.
+
+#### 7.3.2 Gameplay ingress handler
+
+A gateway handler/wrapper (suggested name `GameplayIngressHandler`)
+owns `102` transport/routing plus the general inbound rate gate for
+`103..120` only — it implements NO gameplay semantics for
+`103..120`. It requires `PresenceRegistry`, `SimIngress`, and an
+injected `NowFunc` wall clock (never a hidden `time.Now`, never the
+sim tick, never the header tick); `Next` may be nil; a nil required
+dependency fails construction.
+
+Chaining: `102` is consumed completely. `103..120` charge the
+general intent bucket and, if allowed, delegate the UNCHANGED
+header/decoder/send to `Next`. All other opcodes delegate unchanged.
+Opcode ownership: `100/101` Server, `121/122/123/126`
+CharacterHandler, `124` EnterWorldHandler, `125` Server ACK, `102`
+T5b1 transport into M4-T2 movement semantics, `103..120` future
+gameplay owners. M4-T2 remains the sole owner of authoritative
+movement rules; M4-T5b2 owns `205` AOI transport fanout.
+
+For `102` the order is fixed: `DecodeMove` → resolve active
+Presence → charge the movement bucket → build `sim.MoveIntent` →
+`EnqueueMove` → map disposition/error. A malformed `102` yields
+`202 protocol_error` with no movement token consumed and no sim
+submission. The conversion is exact:
+
+```go
+sim.MoveIntent{
+    InputSeq:   move.InputSeq,
+    HeldDirs:   move.HeldDirs,
+    RunFlag:    move.RunFlag,
+    Yaw:        move.Yaw,
+    SampleTick: header.Tick,
+}
+```
+
+Never use C→S header `seq` as `InputSeq`; never overwrite
+`SampleTick` with the server tick; never accept client positions.
+Routing uses the active `PresenceSnapshot`'s controlled
+`sim.EntityID` — never a characterID cast, NetEntityID cast, or
+global client-data lookup. A missing presence for an allowed
+IN_WORLD `102` is an INTERNAL invariant failure (not
+`invalid_handle`, not a silent no-op).
+
+Every structurally valid `102` consumes one movement token BEFORE
+sim submission — accepted, duplicate, stale, future-tick-invalid,
+RFC1982-ambiguous, migration-full, and ingress-full alike. Only
+malformed payloads fail before charging, so semantically bad but
+structurally valid requests cannot bypass ingress limits. Denial
+yields `202 error{rate_limited}` (numeric 11) with no `EnqueueMove`;
+the connection stays alive.
+
+For `103..120` T5b1 charges `PresenceRegistry.AllowIntent` WITHOUT
+decoding them (owning M5/M7/M8 tasks keep semantic handling):
+denied → `202 rate_limited` with `Next` never invoked; allowed →
+delegate the original decoder unchanged. `100/101/121..126` are
+never charged, so rate limiting cannot block reauth, ACK, or
+leave_world.
+
+Result mappings: `MoveAccepted`/`MoveDuplicate`/`MoveStale` are all
+silent (no success reply, connection alive; duplicate/stale stay
+normal no-ops). `sim.ErrMigrationQueueFull` → `202 retry` (numeric
+6; the same `inputSeq` stays retryable per zero-mutation guarantee;
+ordinary migrating state is NOT retry). `sim.ErrSimIngressFull` →
+`202 retry` (distinct gateway-to-owner overload domain).
+`ErrEngineNotRunning`/`ErrEngineStopped` → `202 retry` as
+operational availability failures while the connection stays valid.
+`ErrInvalidMoveYaw`/`ErrFutureInputTick`/`ErrAmbiguousInputSeq`/
+`ErrAmbiguousSampleTick` → `202 protocol_error` with no disconnect.
+`sim.ErrEntityNotFound` for an IN_WORLD presence's EntityID means
+gateway/sim diverged: internal fail-closed, never `invalid_handle`.
+
+#### 7.3.3 Spawn seam
+
+The staged entry needs an authoritative initial position, but
+`character.Descriptor` carries no complete persisted position and
+M10 has no world source yet. No Store import, no silent `{0,0,0}`.
+The narrow injected seam (conceptual):
+
+```go
+type SpawnResolver interface {
+    ResolveSpawn(ctx context.Context, accountID, characterID int64) (world.Vec3, error)
+}
+```
+
+Tests use deterministic fakes; future real world/durable
+composition supplies it. The resolver decides ONLY the initial
+`world.Vec3` — it never adds the entity, binds presence, sends a
+baseline, or changes session state. No Store/query/schema changes.
+
+#### 7.3.4 World session runtime
+
+One gateway world-session runtime (suggested name
+`WorldSessionRuntime`) composes `SimIngress`, `PresenceRegistry`,
+`SpawnResolver`, `NowFunc`, and the existing downstream `WorldExit`
+quiesce/flush seam. EnterWorldHandler needs a staged entry
+interface (conceptual):
+
+```go
+type WorldEnter interface {
+    PrepareEnter(ctx context.Context, sid session.ID, accountID, characterID int64) error
+    CommitEnter(sid session.ID) error
+    AbortEnter(ctx context.Context, sid session.ID) error
+}
+```
+
+The SAME concrete runtime also implements the existing `WorldExit`,
+so normal leave and takeover share one composition.
+
+`PrepareEnter` stages but does NOT activate Presence. The runtime
+retains bounded ephemeral pending metadata (`sid`, `accountID`,
+`characterID`, `entityID`, spawn/current cell) — at most one pending
+entry per session, no history, no persisted table. The pending map
+may use a small mutex that is NEVER held across `SpawnResolver`
+calls, sim `Enqueue*`, downstream `WorldExit` calls, socket writes,
+or `PresenceRegistry` calls. Binding order: reserve the pending
+slot → `ResolveSpawn` → `EnqueueAddEntity` through the sim owner →
+retain the returned `EntityID` + authoritative cell. No 204/205/206
+is sent.
+
+Prepare failure: spawn resolution failure removes the reservation
+(no entity, no presence); sim-add failure before mutation likewise;
+invalid trusted spawn rejected by `AddEntity` is an internal
+trusted-data/world invariant (never silently rewritten);
+operational resolver/engine-unavailable/ingress-saturation failures
+are world-entry retry classifications (stable errors, no message
+parsing). A second `PrepareEnter` for the same sid while pending is
+a stable invariant/conflict error with no second entity.
+`AbortEnter` after a prepared entry does `EnqueueRemoveEntity` then
+drops pending metadata (no Presence existed, so none is
+deactivated); if sim removal fails before mutation, pending state
+is retained for retry/cleanup; no prepared entry → nil (frozen
+idempotent choice for rollback simplicity).
+
+`CommitEnter` runs only after the physical `219` write AND
+`CompleteEnterWorld`, then `PresenceRegistry.Activate(sid,
+characterID, entityID, cell, Now())` and drops pending metadata.
+Buckets therefore start at COMMIT time, not prepare time. No wire
+message is emitted. This ordering is safe because the WebSocket read
+loop handles one message synchronously: while the enter_world
+handler still runs, the same client cannot dispatch a `102` through
+that loop — so `219` → `CompleteEnterWorld` → Presence commit →
+handler return creates no playable gap, and a baseline failure
+never leaves an active Presence.
+
+T5b1 does NOT rewrite the `203`/`218`/`220` baseline: M10-T4 owns
+the real sim/world baseline. Integration tests combining real sim
+entry with the existing M3 `BaselineProvider` use an EMPTY entity
+baseline. T5b2 adds post-world-ready incremental live visibility;
+M10-T4 later unifies the real baseline with the same Presence
+handle namespace. Never duplicate fake baseline entity IDs.
+
+#### 7.3.5 EnterWorldHandler final ordering
+
+Takeover arbitration stays before new world staging. Successful
+order for the new session: account guard acquired → character
+lookup → old-session takeover/`WorldExit` if needed →
+`BeginEnterWorld` → `WorldEnter.PrepareEnter` → `217 enter OK` →
+`BaselineProvider.StreamBaseline` → `219 world_ready` physically
+written → `CompleteEnterWorld` → `WorldEnter.CommitEnter` →
+account guard released → handler returns. If `PrepareEnter` cannot
+stage the entity: `AbortEnterWorld` + `202 retry` BEFORE any
+successful `217` — the client never hears enter OK without a
+staged runtime entity.
+
+After `BeginEnterWorld`, every pre-commit failure cleans BOTH the
+staged world entry and the session binding via one explicit
+rollback helper (no rollback goroutine): `217` write failure →
+`AbortEnter` + `AbortEnterWorld` + original error, connection
+terminates; operational baseline failure → both aborts + `202
+retry` (baseline write failure → both aborts + write failure,
+connection terminates); `219` write failure → both aborts, no
+Presence; `CompleteEnterWorld` failure after a physically written
+`219` → `AbortEnter` + `AbortEnterWorld` where still applicable,
+fail closed with NO contradictory retry sequence (the client may
+have seen `219`; reconnect/full baseline recovers);
+`CommitEnter` failure after completion → `AbortEnter` +
+`CompleteLeaveWorld` if the session still owns the just-completed
+IN_WORLD binding, fail closed, no enter success. Presence
+activation conflicts (`ErrSessionAlreadyPresent`,
+`ErrCharacterAlreadyPresent`,
+`ErrControlledEntityAlreadyPresent`, `ErrAOICellRange` on trusted
+spawn) at commit are internal invariants — fail closed and clean
+up, never `character_in_use` (takeover arbitration already settled
+ownership).
+
+#### 7.3.6 Runtime ExitWorld
+
+The runtime's `WorldExit` for a healthy active presence: verify
+sid/account/character match the active Presence → call the existing
+downstream `WorldExit` quiesce/flush seam → on failure STOP and
+return (sim entity + Presence intact) → `EnqueueRemoveEntity`
+through the sim owner → on pre-mutation failure return with
+Presence intact → `PresenceRegistry.Deactivate` → nil. The
+flush/quiesce barrier stays FIRST: if downstream fails, the old
+session remains IN_WORLD with binding, presence, and entity, and
+replacement does not proceed. For normal success: remove sim
+entity, then deactivate Presence, then the existing caller runs
+`CompleteLeaveWorld`. Presence-maps-to-X-but-sim-says-missing is
+an internal fail-closed invariant, never silent success. Raw
+transport disconnect / heartbeat-timeout / stale-sweep cleanup is
+explicitly T5b2: after T5b1, enter/leave/takeover lifecycles are
+implemented while raw disconnect cleanup is not. No Ping/Pong, no
+Server-teardown changes here.
+
+#### 7.3.7 T5b1 non-scope (binding)
+
+No `cmd/serve.go` bootstrap (stays a stub: no PG/Keycloak,
+WorldSource, supervision, or SIGTERM work). No new config values
+(existing `VOX_RATE_MOVE_PER_SEC`/`VOX_RATE_INTENT_PER_SEC` only;
+ingress capacity is a frozen internal constant). No protocol
+changes (`proto` and `testdata/protocol` unchanged; the existing
+102 codec suffices). `outbound.go` unchanged. T5b1 sends no
+204/205/206 and implements no MovementSink adapter, viewer index,
+presentation lookup, fanout throttler, heartbeat, or sweep.
+
 T5a exposes only a narrow no-op-by-default observer seam — sufficient
 to observe queue depth messages/bytes per lane, state dropped, state
 coalesced, session slow-drop reason, and (T5b) current ACK lag — so T5b
@@ -3979,6 +4309,16 @@ pgx/generated sqlc; tests may use pgx/raw SQL for fixtures only.
    survives it.
 
 ## 14. Version history
+
+- v0.3.22: freeze real gateway-to-sim ingress and staged world-presence
+  lifecycle — one bounded 256-command Engine owner mailbox serializes
+  gateway Add/Remove/Move without a broad sim mutex; 102 is decoded,
+  rate-limited and routed through the active Presence EntityID with exact
+  retry/protocol mappings; enter stages the sim entity before 217 and
+  activates Presence only after the physical 219 + CompleteEnterWorld
+  barrier; existing WorldExit remains the mandatory flush-first barrier
+  for leave/takeover. Split remaining T5b into T5b1 ingress/lifecycle and
+  T5b2 AOI fanout/heartbeat.
 
 - v0.3.21: freeze M4 ephemeral presence/AOI core — gateway-owned
   active-presence epochs, exact 3-cell/49-cell base subscriptions,

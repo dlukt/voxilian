@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.5)
+# Voxilian Backend — Implementation Plan (v1.6)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.21).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.22).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -129,15 +129,25 @@ Exit: 20 Hz tick loop, cells, server-authoritative movement with reconciliation 
   stale-handle, rate, property, and concurrency tests. No WebSocket,
   sim-ingress, protocol fanout, or runtime lifecycle wiring.
   Spec: §4, §7, §7.2.
-- [ ] **M4-T5b** Gateway↔sim runtime integration:
-  serialize real 102 movement ingress through the sim owner; config
-  token-bucket enforcement and 202 mappings; enter/leave/takeover
-  presence lifecycle; WS Ping/Pong + stale sweep; sim MovementSink
-  into AOI-filtered 204/205/206 fanout using session-local NetEntityIDs,
-  TryCritical/TryState backpressure, own-character reconciliation
-  anchors, and real WebSocket subscription-churn tests.
-  No M5 gameplay.
-  Spec: §4, §5.3–§5.4, §6.3, §7, §7.1, §7.2.
+- [ ] **M4-T5b1** Sim-owner ingress + movement/rate/lifecycle:
+  bounded single-writer Engine command mailbox; concurrency-safe queued
+  AddEntity / RemoveEntity / SubmitMove; real opcode 102 decode and sim
+  routing; existing per-presence move/intent rate enforcement with exact
+  202 mappings; staged sim world entry; presence activation after
+  world_ready/CompleteEnterWorld; normal leave and duplicate-takeover
+  runtime cleanup through the existing WorldExit barrier.
+  Deterministic/race/real-WS integration tests. NO AOI 204/205/206
+  fanout yet. NO heartbeat runtime yet.
+  Spec: §5.2.10, §5.3–§5.4, §6.3, §7, §7.2, §7.3.
+- [ ] **M4-T5b2** AOI fanout + transport liveness:
+  visibility reverse-index extension needed for fanout; live AOI
+  subscription transitions; entity presentation seam; initial
+  post-world-ready live visibility bootstrap; 204 create; ≤10 Hz 205
+  movement fanout; own-anchor vs observer-anchor=0; 206 remove;
+  TryCritical/TryState integration; raw disconnect cleanup; WebSocket
+  Ping/Pong cadence; 30 s stale sweep; slow-client/subscription
+  churn/full WS integration.
+  Spec: §4, §6.3, §7, §7.1, §7.2.
 - [ ] **M4 exit criteria met** (movement + handoff race tests green; saver property tests green).
 
 ## M5 — Combat + vitals + death
@@ -250,7 +260,8 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M3-T5b | M3-T5a | `backend/voxilian/internal/{gateway,session,observe}` |
 | M4-T1, T2 | M2-T3a/b, M3-T1 | `backend/voxilian/internal/sim` |
 | M4-T5a | M2-T3a/b, M3-T1 | `backend/voxilian/internal/gateway` |
-| M4-T5b | M4-T5a | `backend/voxilian/internal/gateway` + `backend/voxilian/internal/sim` |
+| M4-T5b1 | M4-T5a | `backend/voxilian/internal/{sim,gateway}` |
+| M4-T5b2 | M4-T5b1 | `backend/voxilian/internal/gateway` (+ minimal sim output shape only if spec demands) |
 | M4-T3a…c, T4a, T4b | M1-T7a…c (CAS), M3-T1 | `backend/voxilian/internal/sim`, `internal/store` |
 | M5-T1…T6 | M4-T1, M4-T2 | `backend/voxilian/internal/sim` (combat/vitals/intents) |
 | M6-T1…T3 | M5-T1…T5 | `backend/voxilian/internal/sim` (progression) |
@@ -270,7 +281,7 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | Opcode(s) | Owner task | Notes |
 |---|---|---|
 | 100/101 hello/reauth | M3-T2 (+M11-T2 hardening) | auth plane |
-| 102 move | M4-T2 | M4-T2 owns authoritative move semantics; M4-T5b owns decoded transport ingress/serialization and AOI fanout; it does NOT reimplement movement rules. |
+| 102 move | M4-T2 | M4-T2 owns authoritative move semantics; M4-T5b1 owns wire decode/rate/owner-mailbox routing; M4-T5b2 owns 205 AOI transport fanout; none reimplement movement rules. |
 | 103/104 attack/cast | M5-T1…T3 | combat plane |
 | 105 use, 115 rest, 116 eat, 119 safety, 117/118 chat | M5-T6 | personal intents |
 | 106/107/108/109 get/drop/put/give | M7-T4 | world items |
@@ -283,6 +294,14 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 
 ## Plan history
 
+- v1.6: split oversized M4-T5b into ingress/lifecycle T5b1
+  (bounded 256-command Engine owner mailbox, real 102 decode/routing,
+  per-presence rate enforcement with exact 202 mappings, staged world
+  entry with Presence activation after the 219 + CompleteEnterWorld
+  barrier, WorldExit flush-first leave/takeover) plus AOI
+  fanout/heartbeat T5b2 (204/205/206, visibility bootstrap, Ping/Pong,
+  stale sweep, disconnect cleanup); freeze semantics in spec §5.2.10 +
+  §7.3 (+spec v0.3.22).
 - v1.5: split oversized M4-T5 into AOI/presence core T5a
   (gateway-owned registry, 49-cell subscriptions, session-local
   NetEntityIDs, token buckets, heartbeat primitives; no runtime
