@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.16 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.17 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -918,13 +918,13 @@ installation/finalization mutates the entity.
 
 The internal handoff/migration record carries at minimum the
 `EntityID`, the From/To `OwnerRef`s, and the migrating
-entity/state — never database IDs, NetEntityIDs, session IDs,
-proto messages, or opID dedupe state (T3b extends handoff state
-with its own dedupe data later). Handoff preserves EntityID,
+entity/state — never database IDs, NetEntityIDs, session IDs, or
+proto messages. Handoff preserves EntityID,
 position-history ring (transferred, never recreated: no gap, no
 loss, no ABA), yaw, speed, volume flags, active heldDirs/run
-request, accepted/processed sequence state, and any pending
-intent. Nothing resets merely because a cell changed.
+request, accepted/processed sequence state, any pending
+intent, and the recent-opID dedupe cache (§5.5). Nothing resets
+merely because a cell changed.
 
 Destination installation atomically, under the one sim writer:
 remove source resident membership / quiesced migration
@@ -1017,6 +1017,345 @@ concurrent `Step`/`SubmitMove` claims: the single-sim-writer
 model stands, and M4-T5 owns real ingress serialization. The
 ownership seam is shaped so future transport can replace local
 delivery without changing gameplay rules.
+
+### 5.5 Cross-cell operation delivery and deduplication (frozen, v0.3.17)
+
+This section freezes M4-T3b cross-cell operation infrastructure:
+the opaque `OpID` domain, its deterministic Snowflake-style
+generator, owner-addressed routing metadata, the retry-safe
+delivery contract, receiver-side apply-once semantics, the bounded
+recent-`OpID` cache, handoff preservation of dedupe state, and a
+test-only synthetic aggregate proof.
+
+M4-T3b owns ONLY: the opaque `OpID` domain, the
+deterministic/testable `OpID` generator, target ownership routing
+metadata, the retry-safe delivery contract, the receiver-side
+exactly-once application guard, the bounded recent-`OpID` cache,
+handoff preservation of dedupe state, and the synthetic aggregate
+proof.
+
+M4-T3b does NOT own: real damage, combat formulas, trade, give,
+inventory transfer, the PG transaction, post-commit reload,
+gateway behavior, wire messages, AOI, presence, or the saver.
+Ownership remains: M4-T3c → post-commit durable reconciliation;
+M4-T4 → saver; M4-T5 → real gateway/AOI/rate-limit integration;
+M5 → combat; M8 → real trade.
+
+Synthetic means synthetic: T3b MUST NOT implement fake
+production trade/combat semantics. Tests prove delivery with a
+test-only synthetic aggregate (for example a deterministic
+integer/counter mutation: one op, multiple deliveries, exactly
+one mutation). Production infrastructure stays domain-neutral.
+
+#### 5.5.1 OpID domain
+
+The cross-cell operation identity is an opaque domain,
+conceptually:
+
+```go
+type OpID uint64
+```
+
+Rules: `0` is invalid/reserved; one generator never reuses an
+ID; an `OpID` is NOT a PostgreSQL ID, NOT an `EntityID`, NOT a
+session-local NetEntityID, and NOT a protocol sequence. There is
+no numeric relationship between those domains.
+
+#### 5.5.2 Exact Snowflake-style layout
+
+The 64-bit layout is frozen as:
+
+```text
+[ 41-bit timestamp-ms delta ][ 10-bit worker ][ 12-bit sequence ]
+```
+
+The high bit remains zero. Constants: timestamp bits `41`,
+worker bits `10`, sequence bits `12`; max worker `1023`; max
+sequence `4095`. Packing is:
+
+```text
+id = (timestampDelta << 22) | (workerID << 12) | sequence
+```
+
+#### 5.5.3 Custom epoch
+
+The custom epoch is frozen as `2026-01-01T00:00:00.000Z`. The
+timestamp portion is `unixMillis(now) - unixMillis(epoch)`. The
+usable 41-bit window is roughly 69 years.
+
+#### 5.5.4 Worker IDs
+
+Worker `0` is reserved/invalid; valid workers are `1..1023`.
+This guarantees generated `OpID` 0 is impossible even at the
+exact epoch with sequence zero. No random worker ID, no hostname
+hashing. Later executable/deployment configuration chooses a
+worker ID; the T3b constructor receives it explicitly.
+
+#### 5.5.5 Generator clock seam
+
+The generator uses an injected millisecond clock, conceptually:
+
+```go
+type OpIDNow func() int64
+```
+
+returning Unix milliseconds (exact type may differ). No hidden
+`time.Now()` in generator tests. A production helper may wrap
+`time.Now().UnixMilli()`, but no `cmd/serve` wiring happens yet.
+
+#### 5.5.6 Sequence behavior and exhaustion
+
+For a new millisecond `sequence = 0`; each additional ID in the
+SAME millisecond increments the sequence, up to `4095` — thus up
+to 4096 IDs per worker per millisecond. The 4097th requested ID
+in the same millisecond returns a stable
+`ErrOpIDSequenceExhausted` error with zero generator-state
+corruption. The generator does NOT sleep, busy-spin, wait for
+the clock, wrap the sequence, or borrow a future timestamp; the
+caller may retry once time advances. This keeps tests and sim
+ownership deterministic.
+
+#### 5.5.7 Clock regression
+
+If observed milliseconds move backward below the last emitted
+timestamp, generation returns a stable
+`ErrOpIDClockRegression` error: no ID is emitted, no state rolls
+back. Once the clock catches up to the last timestamp or
+advances, generation may resume safely.
+
+#### 5.5.8 Timestamp validity
+
+Before the custom epoch the generator returns a stable
+`ErrOpIDTimeBeforeEpoch` error; beyond the 41-bit representable
+delta it returns a stable `ErrOpIDTimestampExhausted` error. No
+truncation, no wrap.
+
+#### 5.5.9 Generator concurrency model
+
+T3b keeps the current sim architecture: one owning writer per
+generator. No generator mutex is required. One generator
+instance is NOT claimed safe for arbitrary concurrent callers;
+future workers each use their own worker ID/generator.
+
+#### 5.5.10 OpID ordering
+
+Generated IDs are roughly sortable by timestamp, worker, and
+sequence, but gameplay correctness MUST NOT depend on numeric
+`OpID` ordering. `OpID` means identity/idempotence, not causal
+order.
+
+#### 5.5.11 Cross-cell envelope
+
+The minimal routing metadata is frozen conceptually as:
+
+```go
+type CrossCellOp struct {
+    ID          OpID
+    Target      EntityID
+    TargetOwner OwnerRef
+}
+```
+
+No production payload or operation kind is required yet; the
+synthetic test supplies its apply behavior separately. A sender
+makes its routing decision against a committed ownership
+snapshot, so the envelope names both the target `EntityID` and
+its expected `TargetOwner {Cell, Generation}`. A receiver MUST
+NOT mutate an entity merely because the `EntityID` still exists
+if ownership no longer matches.
+
+#### 5.5.12 Delivery ownership gate
+
+Before apply, the target must be RESIDENT and its current
+`OwnerRef` must exactly equal the envelope's `TargetOwner`;
+otherwise no mutation occurs:
+
+- Target currently MIGRATING and op not already known-applied: a
+  stable retryable `ErrCrossCellTargetMigrating` domain error
+  (or equivalent). No apply, no dedupe insertion. The caller
+  retries the SAME `OpID` later. No wire `202`.
+- Target resident but current owner differs from the envelope's
+  `TargetOwner`: a stable `ErrCrossCellStaleRoute` domain error
+  (or equivalent). No mutation. The caller refreshes the current
+  `OwnerRef` and retries the SAME `OpID`; it does NOT allocate a
+  replacement `OpID`.
+- Unknown/removed `EntityID`: `ErrEntityNotFound`. No dedupe
+  record. This is not silently converted into route-stale.
+- Invalid `OpID` (`OpID(0)`): a stable `ErrInvalidOpID` error.
+  No mutation, no cache insertion.
+
+#### 5.5.13 Receiver-side exactly-once primitive
+
+Production sim exposes one internal apply-once primitive,
+conceptually:
+
+```go
+deliverCrossCellOp(
+    op CrossCellOp,
+    apply func(*entity) error,
+) (OpDisposition, error)
+```
+
+Exact signature/name may differ; it remains internal to sim if
+appropriate. For an ownership-matching resident target the
+ordering is binding:
+
+```text
+1. validate OpID
+2. check recent-op cache
+3. if seen -> duplicate, apply not called
+4. invoke apply
+5. only after successful apply -> record OpID
+6. return applied
+```
+
+If `apply` returns an error, the `OpID` MUST NOT enter the
+dedupe cache; a retry with the SAME envelope/`OpID` may invoke
+apply again, and the infrastructure does not invent a new ID.
+Because T3b is in-memory infrastructure, the supplied apply
+function must obey: on error, no partial authoritative mutation
+— future real sim operations validate first and make an
+in-memory mutation that cannot subsequently fail. T3c separately
+handles durable PG commit/reconciliation; T3b does not roll back
+arbitrary partially-mutating callbacks.
+
+Lost acknowledgement: if apply succeeds, dedupe records the
+`OpID`, and the sender fails to observe success and retries the
+same envelope, the retry is a duplicate and apply is not called
+again. This is the core exactly-once receiver property.
+
+Dispositions are at least `Applied` and `Duplicate`; a normal
+duplicate is not an error. Route/migrating/invalid/apply
+failures remain errors.
+
+#### 5.5.14 No automatic background retry scheduler
+
+T3b's `retry` contract means retry by resubmitting the exact same
+`CrossCellOp` with the same `OpID` after a transient apply
+failure, target migration completion, route refresh, or
+transport/lost-ack uncertainty. T3b does NOT add a retry
+goroutine, timer wheel, exponential backoff, external bus, or
+persistent outbox. Future sharding transport may schedule
+retries while preserving this exact identity contract.
+
+#### 5.5.15 Bounded recent-op cache
+
+Each entity that receives cross-cell operations owns a bounded
+recent-op cache with `RecentOpIDCapacity = 256`. No unbounded
+set. The cache tracks the most recent 256 SUCCESSFULLY APPLIED
+distinct `OpID`s for that entity. Duplicate delivery does not
+reorder the cache and does not insert a second entry; failed
+applies do not enter it. Implementation uses O(1) membership
+with bounded FIFO/ring eviction (no full linear scan per
+cross-cell operation); lazy initialization is preferred so
+entities that never receive cross-cell operations do not
+allocate a 256-entry structure, and steady-state operation does
+not grow without bound after initialization/fill.
+
+This bounded cache covers the internal retry, lost
+acknowledgement, handoff, and short transport redelivery window
+only — not permanent event sourcing. Once an `OpID` has aged out
+of the bounded recent cache, T3b no longer promises indefinite
+replay suppression, and internal transports MUST NOT retain
+retry deliveries indefinitely. The ledger remains audit/durable
+facts but is NOT an event-sourced replay log; cross-cell op
+dedupe is ephemeral sim safety, and a restart restores
+materialized PG state rather than rebuilding an infinite
+cross-cell op history.
+
+#### 5.5.16 Handoff interplay
+
+The entity's recent-op cache is part of handoff-owned state.
+Because T3a transfers the same entity object locally, the cache
+transfers automatically with that entity — it is not reset, and
+the handoff contract (§5.4.5) lists recent op dedupe state among
+preserved state. When T3a's local handoff is someday serialized
+across workers, the recent-op cache (or semantically equivalent
+dedupe state) MUST travel in the handoff payload, preserving
+duplicate suppression across ownership transfer.
+
+Required semantics:
+
+```text
+op X applied in cell A
+entity hands off A -> B
+same op X redelivered with stale owner A
+    -> route stale, no apply
+sender refreshes owner B, retries SAME OpID X
+    -> Duplicate, no second mutation
+```
+
+If op X has NOT yet applied and the target is MIGRATING, the
+delivery fails with the migrating error (no apply, no cache
+insert); after handoff completes the sender refreshes the owner
+and retries the SAME `OpID`, which applies exactly once.
+
+The synthetic aggregate operation targets an entity, so T3b
+instantiates the bounded cache per entity; the cache type should
+be reusable by future cell-scoped receivers, but no unused
+per-cell cache is created before a real cell-scoped operation
+exists. Ownership-generation duplicate handoff delivery and
+cross-cell `OpID` duplicate operation delivery stay distinct:
+T3a handoff idempotence remains generation-based; T3b operation
+idempotence is `OpID`-based.
+
+#### 5.5.17 Synthetic aggregate proof
+
+Tests use a synthetic mutable aggregate (for example `value
+int64` plus an apply-call count) associated with the target
+`EntityID`; a synthetic operation conceptually performs `value
++= delta`. Production entities gain NO fake synthetic-value
+field, and no production `SyntheticDamage` / `SyntheticTrade` /
+`SyntheticCounter` types are necessary unless they live
+exclusively in `_test.go`. Production infrastructure remains
+reusable; because no real cross-cell gameplay operation exists
+yet, T3b invents no operation-kind registry (`OpKindDamage`,
+`OpKindTrade`, and the like arrive with their owning tasks).
+
+The synthetic sender/coordinator obtains the target `OwnerRef`
+and a fresh `OpID`, then creates a `CrossCellOp`; it never
+obtains a mutable neighbor entity pointer, and the receiver-owned
+delivery primitive performs the authoritative mutation. This
+preserves: the coordinator cell NEVER mutates the neighbor
+directly. No API such as `GetMutableEntityInOtherCell(...)` is
+added, and `*entity` is not exported; all mutation goes through
+the owner-side apply primitive. The infrastructure need not
+artificially reject an operation whose source and target happen
+to resolve to the same process/cell — T3b proves receiver
+idempotence, while later coordinator rules decide when a
+cross-cell envelope is necessary.
+
+#### 5.5.18 Removal, history, and timing
+
+Removing an entity discards its recent-op cache with the entity;
+a newly allocated `EntityID` begins with an empty cache, and
+`EntityID` is never reused, so no ABA collision with old `OpID`s
+occurs. Cross-cell dedupe operations that do not alter position
+do not append position history by themselves — history remains
+Step-owned. A synthetic operation may be delivered synchronously
+between Steps in tests; T3b invents no separate operation tick
+queue, and the exactly-once primitive itself is independent of
+that scheduling decision (future gameplay systems may route
+intents into their owner-step phase as needed).
+
+#### 5.5.19 Generator properties
+
+Receiver dedupe treats `OpID` as opaque equality identity: it
+does not rely on unpacking timestamp/worker/sequence from an
+`OpID`. `serial32` arithmetic is NOT used for `OpID` (no wrap
+semantics; generator exhaustion/error is explicit), and clock
+regression or sequence exhaustion must never cause duplicate
+IDs — after an error and valid forward time, generation resumes
+from safe state. Same timestamp and sequence on different
+workers must produce different IDs (no collision). A test-only
+or production inspection helper may unpack `OpID` fields for
+tests, but gameplay never depends on unpacked
+timestamp/worker/sequence. The generator uses time plus the
+explicit worker plus a counter only: no RNG (it does not consume
+engine RNG), no sleeps, no busy waits, no goroutines. Two
+generators with the same worker and the same explicit time
+script produce byte-for-byte identical ID sequences; a different
+worker produces different IDs.
 
 ## 6. WebSocket protocol (binary, versioned — DECISION §13.8)
 
@@ -2499,6 +2838,11 @@ ledger is never replayed.
    survives it.
 
 ## 14. Version history
+
+- v0.3.17: freeze cross-cell operation infrastructure — opaque
+  Snowflake-style OpIDs, explicit owner routing, same-ID retry semantics,
+  receiver apply-once ordering, bounded recent-op cache, handoff-preserved
+  dedupe state, and synthetic aggregate proof; no real gameplay or PG.
 
 - v0.3.16: freeze M4 cell handoff semantics — {cell,generation}
   ownership epochs, generation-1 initial ownership, canonical tick-start
