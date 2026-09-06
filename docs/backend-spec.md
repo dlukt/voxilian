@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.18 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.19 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -2937,7 +2937,261 @@ ledger is never replayed.
   `A → B` / `B → A` could both pass root CAS (different rows) against
   the same acyclic pre-state. Non-container moves need no lock (they
   remove edges). No triggers, no recursive SQL constraints, no
-  distributed locks, no migration.
+   distributed locks, no migration.
+
+### 8.3 Snapshot saver runtime semantics (frozen, v0.3.19)
+
+This section freezes the snapshot-saver runtime contract and splits
+M4-T4 into saver core (M4-T4a) and persistence/operations proof
+(M4-T4b). §8.1 remains authoritative for the PG CAS form, the
+aggregate rule, and restart semantics; this section clarifies how the
+saver schedules and serializes those CAS writes without violating
+§8.1.
+
+M4-T4a owns ONLY the generic saver machinery: a tracked durable
+aggregate registry, one latest immutable full snapshot per dirty
+aggregate, persisted-revision ownership, dirty coalescing, serialized
+per-aggregate CAS attempts, a periodic 60 s scheduling seam, a
+synchronous critical write-through path, stale/reconciliation
+blocking, a context-bounded flush/shutdown primitive, and
+deterministic/concurrency tests. M4-T4a does NOT own real character
+gameplay state, vitals, abilities, inventory semantics, trade,
+combat, death, gateway, AOI, presence, rate limits, PG adapter
+wiring, Prometheus saver metrics, crash injection against real PG,
+`cmd/serve` wiring, or SIGTERM process orchestration. Those remain
+later tasks / M4-T4b. M4-T4a MUST NOT import `internal/store`,
+`pgx`, `pgtype`, or `sqlc/gen`; its tests use synthetic
+`SnapshotWrite` closures with no testcontainers and no Prometheus.
+
+#### 8.3.1 Persisted revision is the CAS domain
+
+Saver revisions are `int64 >= 0`: the PostgreSQL aggregate-root
+revisions of §8.1. They are NOT `EntityID`, `OwnerRef.Generation`,
+`OpID`, tick, `inputSeq`, or a dirty generation — those domains are
+never compared against persisted revisions. A saver aggregate MUST
+first be registered from a known authoritative load, conceptually
+`Track(key, knownRevision)`: the known revision MUST be the actual
+persisted revision from PG or another already-authoritative
+operation. Unknown durable state is never silently initialized to
+zero; a negative revision is an error with zero registration.
+
+#### 8.3.2 Aggregate identity
+
+The saver coordinates persistence with a small internal comparable
+key, conceptually:
+
+```go
+type AggregateKind uint8
+
+const (
+    AggregateCharacter AggregateKind = ...
+    AggregateItem
+    AggregateBank
+)
+
+type AggregateKey struct {
+    Kind  AggregateKind
+    ID    int64
+    Scope string
+}
+```
+
+Exact numeric constants may differ. Semantics: character uses the
+durable character root ID with empty `Scope`; item uses the durable
+item root ID with empty `Scope`; bank uses the durable character ID
+with a non-empty bank-system `Scope`. Rules: `ID > 0`, unknown kinds
+rejected, character/item with non-empty `Scope` rejected, bank with
+empty `Scope` rejected. This key is INTERNAL persistence
+coordination only — NOT `EntityID`, `NetEntityID`, or wire data —
+and MUST NOT become a high-cardinality metric label. Trusted string
+names for future T4b metrics are exactly `character`, `item`,
+`bank`; no IDs, names, bank systems, session IDs, or user data
+become metric labels.
+
+#### 8.3.3 Immutable full snapshots; execution-time ExpectedRevision
+
+The saver MUST never retain a pointer to live mutable sim state. A
+queued job captures a COMPLETE immutable aggregate snapshot behind a
+write seam, conceptually:
+
+```go
+type SnapshotWrite func(
+    ctx context.Context,
+    expectedRevision int64,
+) (newRevision int64, err error)
+```
+
+The closure captures snapshot CONTENT but does NOT freeze
+`ExpectedRevision`: the saver supplies the current authoritative
+known persisted revision only when that write actually owns the
+aggregate's save slot. Example: PG at revision 4, snapshot A goes
+dirty, periodic save A starts with `expected=4`; while A is
+in-flight a later mutation produces full snapshot B; A commits so PG
+moves to 5; B later saves with `expected=5`. B is a COMPLETE newer
+snapshot containing all state that should survive; the saver does
+NOT re-read PG before B, it uses the revision acknowledged from A.
+The invariant stands: never re-read-and-blind-write, while avoiding
+a guaranteed stale CAS for every mutation during an in-flight save.
+This is safe ONLY because queued jobs are COMPLETE resulting
+snapshots — no patch semantics. Future real producers MUST copy
+JSON bytes, slices, child rows, and location values before
+enqueueing; no live slice/map/pointer may be mutated after capture
+in a way that alters the queued write.
+
+#### 8.3.4 Dirty generation, coalescing, and queue bound
+
+Each tracked entry owns an internal monotonically increasing dirty
+generation (enqueue sequence). It is NOT the PG revision: it exists
+only to tell whether a newer dirty snapshot arrived while an older
+save was in flight. It is never persisted or sent anywhere; on
+explicitly handled `uint64` exhaustion the saver fails closed, never
+wraps. Per aggregate the saver retains at most ONE queued pending
+snapshot plus at most ONE snapshot currently being saved.
+`MarkDirty(key, snapshot)` increments the dirty generation, replaces
+any queued-but-not-in-flight older snapshot, and returns promptly
+without PG I/O — 10,000 mutations to one aggregate do NOT queue
+10,000 snapshots; only the newest complete pending state matters.
+The dirty queue is therefore bounded by the number of currently
+tracked dirty aggregate roots, not the number of mutations. No
+unbounded slice/channel of snapshots; no goroutine per dirty mark.
+
+#### 8.3.5 Per-aggregate serialization; no global lock over I/O
+
+For one `AggregateKey`, periodic save, manual flush, critical
+write-through, and shutdown flush MUST NEVER execute its
+persistence callback concurrently: one aggregate has exactly ONE
+saver write owner at a time, via a context-aware per-key gate or
+equivalent. A short global metadata mutex is allowed for entry
+lookup, dirty replacement, and revision bookkeeping, but it MUST
+NOT remain held while the `SnapshotWrite` callback runs: a slow save
+for A MUST NOT prevent `MarkDirty` for unrelated B, and a blocked
+save for A MUST NOT prevent a synchronous critical write-through
+for B.
+
+#### 8.3.6 Periodic scheduling
+
+Production target is exactly 60 seconds, taken from the existing
+`config.SnapshotIntervalSeconds` (default 60, validation `>= 1`,
+env `VOX_SNAPSHOT_INTERVAL_SECONDS`); the T4a saver receives a
+duration value and MUST NOT import config into sim. Constructor
+validation: `interval > 0`, `clock != nil`. The existing sim
+`Clock`/`Ticker` seam is reused; no `Now` seam is introduced —
+scheduling is ticker pulses only, and T4b owns operational lag
+instrumentation. `Saver.Run(ctx)` blocks, creates exactly one
+ticker, maps one delivered pulse to one `FlushDirty` pass with no
+catch-up bursts, stops the ticker on exit, and performs no extra
+flush on context cancellation. `Run` starts no hidden worker pool;
+the caller runs it in one owned goroutine. One transient snapshot
+failure MUST NOT terminate periodic saving; `Run` continues to later
+pulses. A narrow optional error-observer/sink may exist; no
+Prometheus import in sim.
+
+#### 8.3.7 Save execution and revision validation
+
+At save selection: `expected = entry.knownRevision`, with the
+selected immutable pending snapshot and its dirty generation. The
+call `newRevision, err := job(ctx, expected)` succeeds ONLY when
+`newRevision == expected + 1`, because every current §8.1 aggregate
+CAS advances exactly one revision. If seq N succeeds and no newer
+dirt arrived, `knownRevision = newRevision`, pending clears, the
+aggregate is clean. If seq N succeeds but seq N+1 arrived while N
+was in flight, `knownRevision = newRevision` while the newer pending
+snapshot remains; the next save uses the new revision. If a
+`SnapshotWrite` returns nil error but `newRevision !=
+expectedRevision + 1`, the saver cannot infer durable state: it
+returns a stable `ErrSaverRevisionInvariant` (or equivalent) and
+reconcile-blocks the aggregate — never accepting the strange
+revision, retrying blindly, or pretending success. If
+`knownRevision == math.MaxInt64`, a new CAS `+1` cannot be
+represented: fail closed before invoking the writer. An ordinary
+transient (non-stale) write error leaves `knownRevision` unchanged,
+retains the latest pending snapshot, keeps the aggregate dirty and
+unblocked; the next periodic/manual flush may retry, with the
+underlying error discoverable via `errors.Is`. An ambiguous commit
+(transport error after PG committed but before success was
+observed) is handled by NOT guessing: a retry at the same expected
+revision surfaces as stale CAS and transitions into
+reconciliation-required state. No outbox is invented.
+
+#### 8.3.8 Stale classification and reconciliation blocking
+
+Because T4a MUST NOT import `store`, the saver domain freezes its
+own sentinel, `ErrSnapshotStale` (or equivalent); a future T4b
+composition closure maps `store.ErrStaleRevision` into it while
+preserving the original cause if useful. When a selected save
+returns `ErrSnapshotStale`: `knownRevision` does NOT advance, the
+entry becomes reconcile-blocked, automatic periodic retries stop
+for that key, and pending state is not written again — the saver
+MUST NOT hammer PG with the same stale CAS every 60 s. Saver
+stale-blocking is persistence coordination; T3c (§5.6) remains the
+gameplay mutation fence. While reconcile-blocked,
+`MarkDirty`/`WriteThrough` return `ErrSaverReconciledRequired`-class
+reconcile-required errors (exact name flexible); stale-memory
+snapshots are never silently accepted for later persistence. The
+owning layer reconciles (reloads/replaces memory from authoritative
+PG under the T3c fence) and then calls, conceptually,
+`ResolveReconciled(ctx, key, authoritativeRevision)`: it waits for
+this key's saver write ownership, requires `authoritativeRevision
+>= knownRevision` (no backward revision), sets `knownRevision` to
+the authoritative revision, clears the stale block, discards ALL
+pre-reconciliation pending jobs (they describe stale pre-reload
+memory and MUST NOT overwrite freshly reconciled PG state), and
+marks the aggregate clean. The owning sim MUST serialize PG reload,
+memory replacement, `ResolveReconciled`, and the next mutation so
+no new mutation races the discard window; T4a does not implement
+that owner orchestration.
+
+#### 8.3.9 Critical write-through
+
+The synchronous single-root primitive, conceptually `WriteThrough(ctx,
+key, snapshot) (newRevision, error)`, serves future critical
+operations (logout flush, death, milestone advancement). It
+serializes through the SAME per-key write gate as periodic saves —
+no second persistence path. On invocation it allocates a dirty
+generation for the critical snapshot. On success it clears pending
+snapshots with generation `<=` the critical generation and retains
+any newer snapshot that arrived while it waited/ran; an older queued
+snapshot is thereby superseded and MUST NOT later overwrite the
+critical state. If the critical write fails transiently with no
+newer pending snapshot, the critical full snapshot
+remains/re-enters pending dirty state so it is not lost; if a newer
+full snapshot already exists, the newer one supersedes it.
+`ErrSnapshotStale` from `WriteThrough` reconcile-blocks the key,
+returns the stale error, advances nothing, and auto-retries
+nothing. Multi-party transactions (trade, multi-bank transfer,
+multi-item, death composition, ledger composition) remain M5/M8;
+T3c supplies the post-commit multi-owner recovery model.
+
+#### 8.3.10 Manual flush, shutdown flush, and lifecycle
+
+The deterministic manual operation, conceptually `FlushDirty(ctx)
+error`, captures the currently dirty unblocked key set, sorts keys
+canonically (`Kind` ascending, `ID` ascending, `Scope` lexical
+ascending — never Go map order), attempts each key at most once per
+pass, continues to unrelated keys after one ordinary failure, and
+returns `errors.Join(...)` or equivalent preserving `errors.Is`. A
+reconcile-blocked aggregate is NOT automatically written during
+periodic/manual/shutdown flush (no PG call is burned); its
+reconcile-required condition is returned/reported as appropriate.
+The shutdown primitive, conceptually `FlushAll(ctx)`, runs under the
+caller contract: producer/sim mutation is quiesced first, then
+`FlushAll` with a deadline context (matching §10: quiesce sim, then
+flush dirty entities with deadline). T4a implements the bounded
+primitive, not process SIGTERM wiring. Every per-key gate wait,
+`SnapshotWrite` callback, and remaining iteration MUST respect the
+caller context; `FlushAll` attempts each eligible dirty key once —
+no infinite retry spin, no tight loop until the deadline. Failures
+remain dirty and are returned; process-level policy belongs later.
+Lifecycle: `Untrack(key)` (or equivalent) removes a clean tracked
+aggregate and rejects dirty, in-flight, or reconcile-blocked keys
+unless first flushed/reconciled, so unsaved state is never silently
+abandoned. At each periodic pulse ONLY dirty aggregates save; clean
+tracked roots produce zero callbacks. T4a MUST NOT modify
+production `entity` with character IDs, PG revisions, vitals,
+inventory, or bank fields. T4b reuses the existing
+`voxilian_store_stale_revision_total{aggregate}` counter for actual
+Store CAS stale writes and adds the saver-lag Prometheus
+instrumentation (exact names frozen in T4b, not here).
 
 ## 9. Gameplay services (what sim MUST enforce; numbers in `meridian59.md`)
 
@@ -3163,6 +3417,12 @@ ledger is never replayed.
    survives it.
 
 ## 14. Version history
+
+- v0.3.19: freeze snapshot-saver semantics — tracked persisted revisions,
+  latest-wins immutable full snapshots, per-aggregate serialized CAS writes,
+  periodic 60 s scheduling, critical write-through ordering, stale-CAS
+  reconciliation blocking, and context-bounded shutdown flush; split M4-T4
+  into saver core T4a and PG/observability/crash proof T4b.
 
 - v0.3.18: freeze post-commit reconciliation — successful durable
   transactions fence every affected in-memory aggregate before notification

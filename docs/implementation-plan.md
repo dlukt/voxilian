@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.2)
+# Voxilian Backend — Implementation Plan (v1.3)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.18).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.19).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -105,7 +105,20 @@ Exit: 20 Hz tick loop, cells, server-authoritative movement with reconciliation 
 - [x] **M4-T3a** Cell ownership + entity handoff: per-entity {cell,generation} ownership epochs, canonical tick-start worklist preventing same-tick double processing, real movement-triggered cross-cell transfer with preserved history/control state, explicit RESIDENT/MIGRATING route state, and bounded migration MoveIntent queue (queue saturation is the sole later 202 retry condition). No opID/dedupe, PG reconciliation, gateway/AOI wiring, or saver. Spec: §5.1, §5.4.
 - [x] **M4-T3b** Cross-cell op infrastructure: opaque Snowflake-style u64 OpID generation (41 ms / 10 worker / 12 sequence), owner-addressed retry-safe delivery, apply-once receiver semantics, bounded per-entity recent-OpID cache preserved across handoff, and synthetic aggregate delivery/lost-ACK/retry tests. No real combat/trade, PG reconciliation, gateway, or bus. Spec: §5.1, §5.5.
 - [x] **M4-T3c** Post-commit reconciliation infrastructure: persisted-revision reconciliation fence installed only after successful PG commit and before commit notifications; sequential notifications may advance memory directly, dropped/gapped/failed notification forces a complete materialized-PG reload before the aggregate's next mutation. Synthetic multi-owner proof + PG18 integration using existing revisioned bank roots only as test fixtures; no real trade/bank gameplay or saver. Spec: §5.1, §5.6, §8.1.
-- [ ] **M4-T4** Snapshot saver: 60 s dirty-queue + critical write-through paths, aggregate-root CAS writes, stale-write metric, shutdown flush with deadline. Crash-injection tests (kill mid-save → invariants hold). Spec: §8.1, §10.
+- [ ] **M4-T4a** Snapshot saver core: revision-tracked durable aggregate
+  registry; latest-wins immutable full-snapshot dirty coalescing; per-root
+  serialized CAS callback execution; 60 s periodic Clock-driven flush;
+  synchronous critical write-through; stale-CAS reconcile block; and
+  context-bounded manual/shutdown flush. Store-independent deterministic
+  tests; no pgx, Prometheus, gameplay fields, or runtime wiring.
+  Spec: §8.1, §8.3.
+- [ ] **M4-T4b** Saver persistence/operations proof: compose T4a with the
+  existing character/item/bank Store CAS APIs against PG18; map
+  ErrStaleRevision into the saver/T3c reconciliation path; real saver-lag
+  observability while reusing the existing Store stale metric; graceful
+  shutdown flush with deadline; and crash/commit-ambiguity/property tests.
+  No gameplay/trade/AOI work.
+  Spec: §5.6, §8.1, §8.3, §10.
 - [ ] **M4-T5** AOI + presence + inbound limits: cell enter/exit subscriptions, `204/205/206` fanout to subscribers, presence registry updates, per-character inbound token buckets (movement/intent caps). Subscription-churn tests. Spec: §4, §7.
 - [ ] **M4 exit criteria met** (movement + handoff race tests green; saver property tests green).
 
@@ -218,7 +231,7 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M3-T5a | M3-T4b | `backend/voxilian/internal/{gateway,config}` |
 | M3-T5b | M3-T5a | `backend/voxilian/internal/{gateway,session,observe}` |
 | M4-T1, T2, T5 | M2-T3a/b, M3-T1 | `backend/voxilian/internal/sim` |
-| M4-T3a…c, T4 | M1-T7a…c (CAS), M3-T1 | `backend/voxilian/internal/sim`, `internal/store` |
+| M4-T3a…c, T4a, T4b | M1-T7a…c (CAS), M3-T1 | `backend/voxilian/internal/sim`, `internal/store` |
 | M5-T1…T6 | M4-T1, M4-T2 | `backend/voxilian/internal/sim` (combat/vitals/intents) |
 | M6-T1…T3 | M5-T1…T5 | `backend/voxilian/internal/sim` (progression) |
 | M7-T1 | M9-T1 (seed pipeline) + M1-T6b | `backend/voxilian/internal/sim`, `seed/` fixtures |
@@ -250,5 +263,8 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 
 ## Plan history
 
+- v1.3: split oversized M4-T4 into saver core T4a (Store-independent) plus
+  persistence/operations proof T4b (PG/observability/crash); freeze saver
+  semantics in spec §8.3 (+spec v0.3.19).
 - v1.2: review pass — migration order (catalogs 0002), M1-T6d registry API, M2 opcode split fix, `CollisionWorld` seam, corrected M3/M9 deps, backend-only M11, bounded soaks, (+spec v0.3.5: INTEGER IDs, numeric mob/vendor IDs, `entityEntry.proto`, seed versioning, catalog cache, exact display names).
 - v1.1: review pass — working-directory rule, Dockerfile task, M0/M1 dep fix, catalog-table decision (+spec §8.2), fake-vs-real baseline split, AOI task, opcode matrix, task splits (M1/M2/M4/M7/M9/M10), corrected deps, Jala phase-2 note, backend-only M11, bounded soaks, display-name decision.
