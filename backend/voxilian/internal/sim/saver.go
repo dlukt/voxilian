@@ -108,6 +108,22 @@ type SnapshotWrite func(ctx context.Context, expectedRevision int64) (newRevisio
 // observation. Nil means discard.
 type SaverErrorObserver func(err error)
 
+// SaverNow is the operational clock seam for saver-lag measurement
+// (spec §8.3.14). It affects metrics ONLY — never correctness,
+// revision ordering, or scheduling (those stay on Clock/Ticker).
+// Nil in SaverConfig means production time.Now; tests asserting lag
+// inject a deterministic Now.
+type SaverNow func() time.Time
+
+// SaverObserver receives one snapshot-age observation per ACCEPTED
+// saver CAS success (spec §8.3.14). The aggregate string is always
+// one of AggregateKind.MetricName() values. It MUST be
+// non-blocking, has no error return, and cannot veto a successful
+// save. Nil means no observation.
+type SaverObserver interface {
+	SaverLag(aggregate string, lag time.Duration)
+}
+
 // Stable saver-domain errors. Matching MUST use errors.Is, never
 // string parsing as control flow.
 var (
@@ -142,18 +158,23 @@ var (
 // SaverConfig carries the saver's scheduling inputs (spec §8.3.6).
 // Interval is the periodic flush period (production: the existing
 // config.SnapshotIntervalSeconds as a duration); Clock is the
-// existing sim Clock/Ticker seam. OnError is optional.
+// existing sim Clock/Ticker seam. OnError is optional. Now and
+// Observer are the optional §8.3.14 lag-measurement seam.
 type SaverConfig struct {
 	Interval time.Duration
 	Clock    Clock
 	OnError  SaverErrorObserver
+	Now      SaverNow
+	Observer SaverObserver
 }
 
 // pendingJob is one queued immutable full snapshot plus the dirty
-// generation that produced it.
+// generation that produced it and the capture timestamp used ONLY
+// for saver-lag measurement (never for correctness ordering).
 type pendingJob struct {
-	gen   uint64
-	write SnapshotWrite
+	gen        uint64
+	write      SnapshotWrite
+	capturedAt time.Time
 }
 
 // saverEntry is one tracked aggregate's coordination state. The
@@ -184,10 +205,14 @@ type Saver struct {
 	interval time.Duration
 	clock    Clock
 	onError  SaverErrorObserver
+	now      SaverNow
+	observer SaverObserver
 }
 
 // NewSaver validates its scheduling inputs (interval > 0,
 // clock != nil) and returns a saver with no tracked aggregates.
+// A nil Now defaults to time.Now; a nil Observer disables lag
+// observation, so existing callers need no metric wiring.
 func NewSaver(cfg SaverConfig) (*Saver, error) {
 	if cfg.Interval <= 0 {
 		return nil, fmt.Errorf("%w: saver interval %v must be > 0", ErrInvalidConfig, cfg.Interval)
@@ -195,11 +220,17 @@ func NewSaver(cfg SaverConfig) (*Saver, error) {
 	if cfg.Clock == nil {
 		return nil, fmt.Errorf("%w: saver clock must not be nil", ErrInvalidConfig)
 	}
+	now := cfg.Now
+	if now == nil {
+		now = time.Now
+	}
 	return &Saver{
 		entries:  make(map[AggregateKey]*saverEntry),
 		interval: cfg.Interval,
 		clock:    cfg.Clock,
 		onError:  cfg.OnError,
+		now:      now,
+		observer: cfg.Observer,
 	}, nil
 }
 
@@ -258,6 +289,7 @@ func (s *Saver) MarkDirty(key AggregateKey, snapshot SnapshotWrite) error {
 	if snapshot == nil {
 		return fmt.Errorf("%w: nil write for %v", ErrInvalidSnapshot, key)
 	}
+	stamped := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e, ok := s.entries[key]
@@ -271,7 +303,9 @@ func (s *Saver) MarkDirty(key AggregateKey, snapshot SnapshotWrite) error {
 		return fmt.Errorf("%w: dirty generation exhausted for %v", ErrSaverRevisionInvariant, key)
 	}
 	e.seq++
-	e.pending = &pendingJob{gen: e.seq, write: snapshot}
+	// A superseding newer snapshot carries its own newer capture
+	// timestamp (spec §8.3.14).
+	e.pending = &pendingJob{gen: e.seq, write: snapshot, capturedAt: stamped}
 	return nil
 }
 
@@ -287,6 +321,9 @@ func (s *Saver) WriteThrough(ctx context.Context, key AggregateKey, snapshot Sna
 	if snapshot == nil {
 		return 0, fmt.Errorf("%w: nil write for %v", ErrInvalidSnapshot, key)
 	}
+	// The critical snapshot is stamped at invocation/capture time
+	// (spec §8.3.14), before any gate wait.
+	stamped := s.now()
 	s.mu.Lock()
 	e, ok := s.entries[key]
 	if !ok {
@@ -303,7 +340,7 @@ func (s *Saver) WriteThrough(ctx context.Context, key AggregateKey, snapshot Sna
 	}
 	e.seq++
 	critGen := e.seq
-	job := pendingJob{gen: critGen, write: snapshot}
+	job := pendingJob{gen: critGen, write: snapshot, capturedAt: stamped}
 	s.mu.Unlock()
 
 	release, err := e.acquire(ctx)
@@ -311,6 +348,12 @@ func (s *Saver) WriteThrough(ctx context.Context, key AggregateKey, snapshot Sna
 		return 0, err
 	}
 	defer release()
+	// A cancellation that landed during (or before) the gate wait
+	// must not run the writer: select-over-two-ready-cases is
+	// random, so re-check deterministically after ownership.
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("sim: saver write-through %v: %w", key, err)
+	}
 
 	s.mu.Lock()
 	if cur, ok := s.entries[key]; !ok || cur != e {
@@ -334,21 +377,23 @@ func (s *Saver) WriteThrough(ctx context.Context, key AggregateKey, snapshot Sna
 	newRev, werr := job.write(ctx, expected)
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	e.inflight = false
 	if werr != nil {
 		if errors.Is(werr, ErrSnapshotStale) {
 			e.blocked = true
+			s.mu.Unlock()
 			return 0, fmt.Errorf("sim: saver write-through %v: %w", key, werr)
 		}
 		if e.pending == nil || e.pending.gen <= critGen {
 			cp := job
 			e.pending = &cp
 		}
+		s.mu.Unlock()
 		return 0, fmt.Errorf("sim: saver write-through %v: %w", key, werr)
 	}
 	if newRev != expected+1 {
 		e.blocked = true
+		s.mu.Unlock()
 		return 0, fmt.Errorf("%w: write-through %v expected %d got %d",
 			ErrSaverRevisionInvariant, key, expected+1, newRev)
 	}
@@ -356,6 +401,10 @@ func (s *Saver) WriteThrough(ctx context.Context, key AggregateKey, snapshot Sna
 	if e.pending != nil && e.pending.gen <= critGen {
 		e.pending = nil
 	}
+	obs := s.lagReportLocked(e, job.capturedAt)
+	kind := e.key.Kind
+	s.mu.Unlock()
+	obs.emit(s, kind)
 	return newRev, nil
 }
 
@@ -381,6 +430,11 @@ func (s *Saver) ResolveReconciled(ctx context.Context, key AggregateKey, authori
 		return err
 	}
 	defer release()
+	// Deterministic post-ownership cancellation check (see
+	// WriteThrough): a cancelled context never runs the writer.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("sim: saver resolve %v: %w", key, err)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -425,6 +479,11 @@ func (s *Saver) saveOne(ctx context.Context, key AggregateKey) error {
 		return err
 	}
 	defer release()
+	// Deterministic post-ownership cancellation check (see
+	// WriteThrough): a cancelled context never runs the writer.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("sim: saver save %v: %w", key, err)
+	}
 
 	s.mu.Lock()
 	if cur, ok := s.entries[key]; !ok || cur != e {
@@ -454,17 +513,18 @@ func (s *Saver) saveOne(ctx context.Context, key AggregateKey) error {
 	newRev, werr := job.write(ctx, expected)
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	e.inflight = false
 	if werr != nil {
 		if errors.Is(werr, ErrSnapshotStale) {
 			e.blocked = true
+			s.mu.Unlock()
 			return fmt.Errorf("sim: saver save %v: %w", key, werr)
 		}
 		if e.pending == nil {
 			cp := job
 			e.pending = &cp
 		}
+		s.mu.Unlock()
 		return fmt.Errorf("sim: saver save %v: %w", key, werr)
 	}
 	if newRev != expected+1 {
@@ -473,11 +533,47 @@ func (s *Saver) saveOne(ctx context.Context, key AggregateKey) error {
 			cp := job
 			e.pending = &cp
 		}
+		s.mu.Unlock()
 		return fmt.Errorf("%w: save %v expected %d got %d",
 			ErrSaverRevisionInvariant, key, expected+1, newRev)
 	}
 	e.known = newRev
+	obs := s.lagReportLocked(e, job.capturedAt)
+	kind := e.key.Kind
+	s.mu.Unlock()
+	obs.emit(s, kind)
 	return nil
+}
+
+// lagReport is a prepared saver-lag observation. It is built under
+// the metadata mutex AFTER persistence bookkeeping commits, then
+// emitted with the mutex released, so the observer can safely call
+// back into Saver metadata methods without deadlock
+// (spec §8.3.14). A nil observer disables the report.
+type lagReport struct {
+	capturedAt time.Time
+	active     bool
+}
+
+// lagReportLocked prepares the observation for a just-accepted CAS
+// success. The caller MUST hold s.mu and release it before emit.
+func (s *Saver) lagReportLocked(_ *saverEntry, capturedAt time.Time) lagReport {
+	return lagReport{capturedAt: capturedAt, active: s.observer != nil}
+}
+
+// emit observes snapshot age at acknowledgement in seconds. A
+// regressed metric clock clamps to 0; metrics never fail
+// persistence. Only accepted CAS successes reach here — transient,
+// stale, invariant, and blocked outcomes never observe.
+func (r lagReport) emit(s *Saver, kind AggregateKind) {
+	if !r.active {
+		return
+	}
+	lag := s.now().Sub(r.capturedAt)
+	if lag < 0 {
+		lag = 0
+	}
+	s.observer.SaverLag(kind.MetricName(), lag)
 }
 
 // flushPass captures the currently dirty unblocked key set, sorts it

@@ -57,6 +57,7 @@ type Server struct {
 	readiness *Readiness
 	registry  *prometheus.Registry
 	outbound  *OutboundMetrics
+	saver     *SaverMetrics
 	mux       *http.ServeMux
 }
 
@@ -80,6 +81,7 @@ func New(readiness *Readiness) *Server {
 	s.registry.MustRegister(build)
 	build.WithLabelValues(Version, Revision).Set(1)
 	s.outbound = NewOutboundMetrics(s.registry)
+	s.saver = NewSaverMetrics(s.registry)
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
 	s.mux.HandleFunc("/readyz", s.handleReadyz)
 	s.mux.Handle("/metrics", promhttp.HandlerFor(s.registry, promhttp.HandlerOpts{}))
@@ -95,6 +97,12 @@ func (s *Server) Registry() *prometheus.Registry { return s.registry }
 // gateway observer interface without either package importing the
 // other.
 func (s *Server) OutboundMetrics() *OutboundMetrics { return s.outbound }
+
+// SaverMetrics exposes the frozen saver-lag observer adapter
+// (spec §8.3.14). Future executable wiring passes it as the sim
+// SaverConfig.Observer; it structurally satisfies the sim observer
+// interface without either package importing the other.
+func (s *Server) SaverMetrics() *SaverMetrics { return s.saver }
 
 // Handler returns the mux for http.Serve.
 func (s *Server) Handler() http.Handler { return s.mux }

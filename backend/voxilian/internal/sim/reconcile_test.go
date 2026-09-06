@@ -926,3 +926,117 @@ func TestReconcileDeterministicTrace(t *testing.T) {
 		}
 	}
 }
+
+// ---- M4-T4b B1: RequireReload primitive (spec §5.6.9) ----
+
+func TestRequireReloadBasics(t *testing.T) {
+	r, err := NewReconcileState(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.RequireReload()
+	snap := r.Snapshot()
+	if snap.KnownRevision != 5 || !snap.Pending || snap.RequiredRevision != 5 {
+		t.Fatalf("after RequireReload: %+v, want known5 pending req5", snap)
+	}
+	// Idempotent: again changes nothing.
+	r.RequireReload()
+	snap = r.Snapshot()
+	if snap.KnownRevision != 5 || !snap.Pending || snap.RequiredRevision != 5 {
+		t.Fatalf("after second RequireReload: %+v, want unchanged", snap)
+	}
+}
+
+func TestRequireReloadPreservesHigherRequirement(t *testing.T) {
+	r, err := NewReconcileState(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.MarkCommitted(7); err != nil {
+		t.Fatal(err)
+	}
+	r.RequireReload()
+	snap := r.Snapshot()
+	if snap.KnownRevision != 5 || !snap.Pending || snap.RequiredRevision != 7 {
+		t.Fatalf("snap = %+v, want known5 pending req7 (never lowered)", snap)
+	}
+}
+
+func TestRequireReloadForcesLoaderAndAcceptsKnown(t *testing.T) {
+	r, err := NewReconcileState(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.RequireReload()
+	called := false
+	applied := false
+	err = r.EnsureReconciled(context.Background(), func(ctx context.Context) (ReloadCandidate, error) {
+		called = true
+		return ReloadCandidate{
+			Revision: 5, // pure verify/reload at known: valid.
+			Apply:    func() error { applied = true; return nil },
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("EnsureReconciled: %v", err)
+	}
+	if !called || !applied {
+		t.Fatalf("called = %v applied = %v, want true/true", called, applied)
+	}
+	snap := r.Snapshot()
+	if snap.Pending || snap.KnownRevision != 5 {
+		t.Fatalf("snap = %+v, want clear known5", snap)
+	}
+	// Without RequireReload the loader is never invoked.
+	r2, err := NewReconcileState(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called = false
+	if err := r2.EnsureReconciled(context.Background(), func(ctx context.Context) (ReloadCandidate, error) {
+		called = true
+		return ReloadCandidate{}, nil
+	}); err != nil {
+		t.Fatalf("EnsureReconciled clear: %v", err)
+	}
+	if called {
+		t.Fatal("loader invoked while clear")
+	}
+}
+
+func TestRequireReloadBehindAndRegression(t *testing.T) {
+	r, err := NewReconcileState(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.MarkCommitted(7); err != nil {
+		t.Fatal(err)
+	}
+	r.RequireReload()
+	// Candidate 6: above known but below required 7 -> behind.
+	if err := r.EnsureReconciled(context.Background(), func(ctx context.Context) (ReloadCandidate, error) {
+		return ReloadCandidate{Revision: 6, Apply: func() error { return nil }}, nil
+	}); !errors.Is(err, ErrReconcileRevisionBehind) {
+		t.Fatalf("rev6 err = %v, want behind", err)
+	}
+	// Candidate 4: below known -> regression.
+	if err := r.EnsureReconciled(context.Background(), func(ctx context.Context) (ReloadCandidate, error) {
+		return ReloadCandidate{Revision: 4, Apply: func() error { return nil }}, nil
+	}); !errors.Is(err, ErrReconcileRevisionRegression) {
+		t.Fatalf("rev4 err = %v, want regression", err)
+	}
+	snap := r.Snapshot()
+	if !snap.Pending || snap.RequiredRevision != 7 || snap.KnownRevision != 5 {
+		t.Fatalf("snap = %+v, want still pending req7 known5", snap)
+	}
+	// Candidate 8 leaps forward and clears.
+	if err := r.EnsureReconciled(context.Background(), func(ctx context.Context) (ReloadCandidate, error) {
+		return ReloadCandidate{Revision: 8, Apply: func() error { return nil }}, nil
+	}); err != nil {
+		t.Fatalf("rev8: %v", err)
+	}
+	snap = r.Snapshot()
+	if snap.Pending || snap.KnownRevision != 8 {
+		t.Fatalf("snap = %+v, want clear known8", snap)
+	}
+}

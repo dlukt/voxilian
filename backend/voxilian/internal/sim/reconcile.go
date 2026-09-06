@@ -96,6 +96,22 @@ func (r *ReconcileState) MarkCommitted(revision int64) error {
 	return nil
 }
 
+// RequireReload forces a full materialized-PG reload without claiming
+// that any specific newer revision committed (spec §5.6.9): the saver
+// stale path knows memory diverged but may not know the actual
+// persisted revision yet. It sets pending, keeps requiredRevision at
+// least knownRevision (an existing higher requirement is preserved,
+// never lowered), leaves knownRevision unchanged, and touches no
+// gameplay state. Idempotent: repeated calls change nothing further.
+// Recovery after this call is a complete staged PG reload via
+// EnsureReconciled — never a guessed known+1.
+func (r *ReconcileState) RequireReload() {
+	r.pending = true
+	if r.required < r.known {
+		r.required = r.known
+	}
+}
+
 // DurableCommitNotice is the generic commit-notification
 // revision metadata (spec §5.6.4). ID is exactly the T3b
 // operation's OpID — no replacement on redelivery, route

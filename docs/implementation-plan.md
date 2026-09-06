@@ -112,7 +112,7 @@ Exit: 20 Hz tick loop, cells, server-authoritative movement with reconciliation 
   context-bounded manual/shutdown flush. Store-independent deterministic
   tests; no pgx, Prometheus, gameplay fields, or runtime wiring.
   Spec: §8.1, §8.3.
-- [ ] **M4-T4b** Saver persistence/operations proof: production
+- [x] **M4-T4b** Saver persistence/operations proof: production
   internal/persist composition for character/item/bank Store CAS snapshots;
   stale-CAS mapping into T4a + T3c forced-reload reconciliation; exact
   saver-lag histogram observability while reusing Store's stale counter;

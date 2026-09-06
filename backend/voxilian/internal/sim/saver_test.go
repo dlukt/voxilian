@@ -1548,3 +1548,300 @@ func TestSaverConcurrentSameKeyMaxOne(t *testing.T) {
 		t.Fatalf("snap = %+v, want known%d clean", snap, n)
 	}
 }
+
+// ---- M4-T4b B4/B5: saver-lag measurement seam (spec §8.3.14) ----
+
+type stepNow struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (s *stepNow) Now() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.t
+}
+
+func (s *stepNow) advance(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.t = s.t.Add(d)
+}
+
+type lagSample struct {
+	aggregate string
+	lag       time.Duration
+}
+
+type recordingObserver struct {
+	mu      sync.Mutex
+	samples []lagSample
+}
+
+func (o *recordingObserver) SaverLag(aggregate string, lag time.Duration) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.samples = append(o.samples, lagSample{aggregate, lag})
+}
+
+func (o *recordingObserver) all() []lagSample {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]lagSample(nil), o.samples...)
+}
+
+func mustLagSaver(t *testing.T, clk Clock, now *stepNow, obs *recordingObserver) *Saver {
+	t.Helper()
+	s, err := NewSaver(SaverConfig{
+		Interval: 60 * time.Second,
+		Clock:    clk,
+		Now:      now.Now,
+		Observer: obs,
+	})
+	if err != nil {
+		t.Fatalf("NewSaver: %v", err)
+	}
+	return s
+}
+
+func TestSaverLagSuccess(t *testing.T) {
+	now := &stepNow{t: time.Unix(100, 0)}
+	obs := &recordingObserver{}
+	s := mustLagSaver(t, newManualClock(), now, obs)
+	key := charSaverKey(1)
+	mustTrack(t, s, key, 4)
+	if err := s.MarkDirty(key, casOK); err != nil {
+		t.Fatal(err)
+	}
+	now.advance(3500 * time.Millisecond)
+	if err := s.FlushDirty(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	got := obs.all()
+	if len(got) != 1 || got[0].aggregate != "character" || got[0].lag != 3500*time.Millisecond {
+		t.Fatalf("samples = %+v, want [{character 3.5s}]", got)
+	}
+}
+
+func TestSaverLagRetryPreservesTimestamp(t *testing.T) {
+	now := &stepNow{t: time.Unix(10, 0)}
+	obs := &recordingObserver{}
+	s := mustLagSaver(t, newManualClock(), now, obs)
+	key := itemSaverKey(2)
+	mustTrack(t, s, key, 0)
+	attempt := 0
+	if err := s.MarkDirty(key, func(ctx context.Context, exp int64) (int64, error) {
+		attempt++
+		if attempt == 1 {
+			return 0, errSaverTransient
+		}
+		return exp + 1, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now.advance(10 * time.Second) // first attempt at T=20 fails.
+	if err := s.FlushDirty(context.Background()); !errors.Is(err, errSaverTransient) {
+		t.Fatalf("flush1 err = %v", err)
+	}
+	if len(obs.all()) != 0 {
+		t.Fatalf("failed attempt observed: %+v", obs.all())
+	}
+	now.advance(15 * time.Second) // retry succeeds at T=35.
+	if err := s.FlushDirty(context.Background()); err != nil {
+		t.Fatalf("flush2: %v", err)
+	}
+	got := obs.all()
+	if len(got) != 1 || got[0].aggregate != "item" || got[0].lag != 25*time.Second {
+		t.Fatalf("samples = %+v, want [{item 25s}] (original T=10 stamp)", got)
+	}
+}
+
+func TestSaverLagLatestReplacement(t *testing.T) {
+	now := &stepNow{t: time.Unix(10, 0)}
+	obs := &recordingObserver{}
+	s := mustLagSaver(t, newManualClock(), now, obs)
+	key := charSaverKey(3)
+	mustTrack(t, s, key, 0)
+	if err := s.MarkDirty(key, func(ctx context.Context, exp int64) (int64, error) {
+		t.Error("superseded snapshot A executed")
+		return exp + 1, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now.advance(10 * time.Second) // B captured at T=20.
+	if err := s.MarkDirty(key, casOK); err != nil {
+		t.Fatal(err)
+	}
+	now.advance(10 * time.Second) // B persists at T=30.
+	if err := s.FlushDirty(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	got := obs.all()
+	if len(got) != 1 || got[0].lag != 10*time.Second {
+		t.Fatalf("samples = %+v, want exactly one 10s observation (B's stamp)", got)
+	}
+}
+
+func TestSaverLagWriteThroughTimestamp(t *testing.T) {
+	now := &stepNow{t: time.Unix(50, 0)}
+	obs := &recordingObserver{}
+	s := mustLagSaver(t, newManualClock(), now, obs)
+	key := bankSaverKey(9, "tos")
+	mustTrack(t, s, key, 1)
+	now.advance(2 * time.Second) // WriteThrough invoked at T=52.
+	rev, err := s.WriteThrough(context.Background(), key, casOK)
+	if err != nil || rev != 2 {
+		t.Fatalf("WriteThrough = (%d,%v)", rev, err)
+	}
+	got := obs.all()
+	if len(got) != 1 || got[0].aggregate != "bank" || got[0].lag != 0 {
+		t.Fatalf("samples = %+v, want [{bank 0s}]", got)
+	}
+	// Failed critical that becomes pending preserves its stamp.
+	now.advance(time.Second) // T=53.
+	attempt := 0
+	if _, err := s.WriteThrough(context.Background(), key,
+		func(ctx context.Context, exp int64) (int64, error) {
+			attempt++
+			if attempt == 1 {
+				return 0, errSaverTransient
+			}
+			return exp + 1, nil
+		}); !errors.Is(err, errSaverTransient) {
+		t.Fatalf("critical err = %v", err)
+	}
+	now.advance(7 * time.Second) // periodic retry succeeds at T=60.
+	if err := s.FlushDirty(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	got = obs.all()
+	if len(got) != 2 || got[1].lag != 7*time.Second {
+		t.Fatalf("samples = %+v, want second observation 7s (T=53 stamp)", got)
+	}
+}
+
+func TestSaverLagNoObservationOnFailure(t *testing.T) {
+	now := &stepNow{t: time.Unix(0, 0)}
+	obs := &recordingObserver{}
+	s := mustLagSaver(t, newManualClock(), now, obs)
+	ctx := context.Background()
+	// Stale.
+	ks := charSaverKey(11)
+	mustTrack(t, s, ks, 0)
+	if err := s.MarkDirty(ks, func(ctx context.Context, exp int64) (int64, error) {
+		return 0, ErrSnapshotStale
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now.advance(time.Second)
+	if err := s.FlushDirty(ctx); !errors.Is(err, ErrSnapshotStale) {
+		t.Fatalf("stale flush err = %v", err)
+	}
+	// Transient.
+	kt := charSaverKey(12)
+	mustTrack(t, s, kt, 0)
+	if err := s.MarkDirty(kt, func(ctx context.Context, exp int64) (int64, error) {
+		return 0, errSaverTransient
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now.advance(time.Second)
+	if err := s.FlushDirty(ctx); !errors.Is(err, errSaverTransient) {
+		t.Fatalf("transient flush err = %v", err)
+	}
+	// Revision invariant.
+	ki := charSaverKey(13)
+	mustTrack(t, s, ki, 0)
+	if err := s.MarkDirty(ki, func(ctx context.Context, exp int64) (int64, error) {
+		return exp + 2, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now.advance(time.Second)
+	if err := s.FlushDirty(ctx); !errors.Is(err, ErrSaverRevisionInvariant) {
+		t.Fatalf("invariant flush err = %v", err)
+	}
+	if got := obs.all(); len(got) != 0 {
+		t.Fatalf("failure observations = %+v, want none", got)
+	}
+}
+
+func TestSaverLagNegativeElapsedClampsZero(t *testing.T) {
+	now := &stepNow{t: time.Unix(100, 0)}
+	obs := &recordingObserver{}
+	s := mustLagSaver(t, newManualClock(), now, obs)
+	key := charSaverKey(1)
+	mustTrack(t, s, key, 0)
+	if err := s.MarkDirty(key, casOK); err != nil {
+		t.Fatal(err)
+	}
+	now.advance(-5 * time.Second) // metric clock regressed.
+	if err := s.FlushDirty(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	got := obs.all()
+	if len(got) != 1 || got[0].lag != 0 {
+		t.Fatalf("samples = %+v, want [{character 0s}]", got)
+	}
+	snap, _ := s.Inspect(key)
+	if snap.KnownRevision != 1 {
+		t.Fatalf("regressed metric clock affected persistence: %+v", snap)
+	}
+}
+
+// TestSaverObserverOutsideMetadataLock proves the lag observer can
+// call back into Saver metadata methods without deadlock.
+func TestSaverObserverOutsideMetadataLock(t *testing.T) {
+	now := &stepNow{t: time.Unix(0, 0)}
+	key := charSaverKey(1)
+	var s *Saver
+	obs := &inspectingObserver{}
+	s = mustSaverWithObserver(t, now, obs)
+	obs.s = s
+	mustTrack(t, s, key, 0)
+	if err := s.MarkDirty(key, casOK); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.FlushDirty(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("flush: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("observer deadlocked the saver metadata lock")
+	}
+	if !obs.saw {
+		t.Fatal("observer never ran")
+	}
+}
+
+type inspectingObserver struct {
+	s   *Saver
+	saw bool
+}
+
+func (o *inspectingObserver) SaverLag(aggregate string, lag time.Duration) {
+	if _, err := o.s.Inspect(charSaverKey(1)); err != nil {
+		panic(err)
+	}
+	if o.s.DirtyCount() != 0 {
+		panic("dirty after accepted save")
+	}
+	o.saw = true
+}
+
+func mustSaverWithObserver(t *testing.T, now *stepNow, obs SaverObserver) *Saver {
+	t.Helper()
+	s, err := NewSaver(SaverConfig{
+		Interval: 60 * time.Second,
+		Clock:    newManualClock(),
+		Now:      now.Now,
+		Observer: obs,
+	})
+	if err != nil {
+		t.Fatalf("NewSaver: %v", err)
+	}
+	return s
+}
