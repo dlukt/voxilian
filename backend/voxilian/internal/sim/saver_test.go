@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -53,8 +54,7 @@ func waitSaverCond(t *testing.T, desc string, cond func() bool) {
 			t.Fatalf("timeout waiting for %s", desc)
 		}
 		// Yield, never sleep.
-		for i := 0; i < 64; i++ {
-		}
+		runtime.Gosched()
 	}
 }
 
