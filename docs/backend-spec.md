@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.19 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.20 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -1682,6 +1682,31 @@ test-owned PG transaction (bank A CAS, bank B CAS, COMMIT);
 no production `TransferBanks` / `SyntheticTrade` /
 `CommitTwoBanks` API is exposed.
 
+#### 5.6.9 Forced reload without a known newer revision
+
+`MarkCommitted(revision)` covers a KNOWN successful PG commit
+revision. A saver stale CAS (§8.3.8) is different: memory and PG
+have diverged, but the actual persisted revision may NOT be known
+yet. The fence therefore freezes a second primitive,
+conceptually `RequireReload()` (exact name flexible):
+
+```text
+pending = true
+requiredRevision remains at least knownRevision
+an existing higher requiredRevision is preserved, never lowered
+knownRevision unchanged
+no gameplay mutation, no guessed known+1, no overflow arithmetic
+```
+
+It is idempotent: repeated calls change nothing further. After
+`RequireReload`, `EnsureReconciled` MUST invoke the loader even
+when `requiredRevision == knownRevision` (a pure verify/reload is
+a valid forced reconciliation: a candidate equal to known may
+apply). All other candidate rules stand: below known is
+regression, below required is behind. The full saver-side
+recovery ordering that consumes this primitive is frozen in
+§8.3.13.
+
 ## 6. WebSocket protocol (binary, versioned — DECISION §13.8)
 
 Framing: every WS message is one binary frame (D2):
@@ -3191,7 +3216,246 @@ production `entity` with character IDs, PG revisions, vitals,
 inventory, or bank fields. T4b reuses the existing
 `voxilian_store_stale_revision_total{aggregate}` counter for actual
 Store CAS stale writes and adds the saver-lag Prometheus
-instrumentation (exact names frozen in T4b, not here).
+instrumentation frozen in §8.3.14 below.
+
+#### 8.3.11 Persistence composition boundary (frozen, v0.3.20)
+
+The production composition layer is `internal/persist` (or another
+equally clear name only with a compelling repository reason).
+Dependency direction is binding:
+
+```text
+sim     -> stdlib/world/etc (never store/pgx/sqlc)
+store   -> pgx/sqlc/Prometheus stale metric (never sim)
+persist -> sim + store (never pgx/generated sqlc directly)
+observe -> Prometheus (never persist)
+store   ->/-> persist, store ->/-> sim
+```
+
+`persist` depends on a narrow Store seam, approximately:
+
+```go
+type SnapshotStore interface {
+    SaveCharacterSnapshot(context.Context, store.CharacterSnapshot) (int64, error)
+    SaveItemSnapshot(context.Context, store.ItemSnapshot) (int64, error)
+    SaveBankBalance(context.Context, store.BankSnapshot) (int64, error)
+}
+```
+
+with bank reload on a separate narrow `BankLoader` seam over the
+existing `LoadBankBalance`. The full `store.Store` API is never
+required where the narrow seam suffices. T4b reuses the existing
+`SaveCharacterSnapshot` / `SaveItemSnapshot` / `SaveBankBalance`
+operations and the existing §8.1 CAS semantics (success returns
+exactly `expected+1`; stale/missing/conflict surfaces
+`store.ErrStaleRevision`; character saves carry spells+skills
+atomically; item saves carry the location atomically; bank CASes
+the balance). No new schema, queries, generated code, snapshot-job
+tables, outboxes, or persisted OpID caches are required.
+
+#### 8.3.12 Store snapshot adapters (frozen, v0.3.20)
+
+`persist` exposes one job factory per aggregate family, returning
+a correctly matched saver key plus write closure together so
+callers cannot pair a snapshot with the wrong key, conceptually:
+
+```go
+type SnapshotJob struct {
+    Key   sim.AggregateKey
+    Write sim.SnapshotWrite
+}
+
+NewCharacterSnapshotJob(store SnapshotStore, snap store.CharacterSnapshot)
+NewItemSnapshotJob(store SnapshotStore, snap store.ItemSnapshot)
+NewBankSnapshotJob(store SnapshotStore, snap store.BankSnapshot)
+```
+
+Bank keys are `{AggregateBank, CharacterID, System}`. Factories
+reject invalid durable identities (`character/item ID <= 0`,
+`bank CharacterID <= 0`, empty bank system) with
+`sim.ErrInvalidAggregateKey` — no rival key-validation domain.
+
+The `ExpectedRevision` carried in the input snapshot is IGNORED:
+it may hold any stale/hostile value. At execution the closure
+copies/sets `snapshot.ExpectedRevision = expectedRevision` from
+the saver immediately before invoking Store. The Saver is the
+revision owner.
+
+Capture is deep and immutable. Character snapshots copy `Vitals`
+/ `Advancement` bytes and the complete `Spells` / `Skills` slices
+(scalars copy normally). Item snapshots copy `Enchants` bytes and
+the pointed-to VALUES of every location pointer field
+(`CharacterID`, `CorpseID`, `ContainerItemID`, `VaultRegion`,
+`PosX/Y/Z`, `Slot`) into fresh storage. Bank snapshots copy by
+value. Mutating the caller's originals after factory return MUST
+NOT alter the future Store request.
+
+At the adapter boundary `store.ErrStaleRevision` becomes
+discoverable as BOTH `sim.ErrSnapshotStale` AND
+`store.ErrStaleRevision` (`errors.Join`, multi-`%w`, or
+equivalent) — the ONLY stale-CAS translation point. Non-stale
+Store errors (connection, cancellation, FK/check, container
+cycle, other persistence failures) MUST NOT become stale; their
+causes are preserved and the saver treats them as ordinary
+transient/error outcomes per T4a.
+
+#### 8.3.13 Saver-stale reconciliation bridge (frozen, v0.3.20)
+
+A saver stale result means the saver-known persisted revision can
+no longer be trusted as current. Recovery is a full materialized
+PG reload before another authoritative mutation — never blind
+retry, local revision increment, assumed `expected+1`, ledger
+replay, or notification replay.
+
+`persist` freezes a production bridge helper, conceptually:
+
+```go
+func ReconcileSaver(
+    ctx context.Context,
+    state *sim.ReconcileState,
+    saver *sim.Saver,
+    key sim.AggregateKey,
+    reload sim.ReloadFunc,
+) error
+```
+
+with binding order:
+
+```text
+1. state.RequireReload()
+2. state.EnsureReconciled(ctx, reload): the loader stages PG
+   values into temporaries, the candidate revision is validated,
+   and Apply replaces the full in-memory durable aggregate
+3. read the resulting known persisted revision
+4. saver.ResolveReconciled(ctx, key, that revision)
+5. owning gameplay continues only after both layers are clear
+```
+
+The bridge runs while the owning sim aggregate is otherwise
+serialized. Failure handling is fail-safe: if the T3c reload
+fails, the saver stays blocked, `ReconcileState` stays pending,
+and `ResolveReconciled` is never called. If the T3c reload/apply
+succeeds but `Saver.ResolveReconciled` fails or is cancelled, the
+bridge calls `RequireReload()` AGAIN before returning the error —
+memory may already hold PG state while the saver remains
+blocked, and that split state MUST NOT look jointly ready to
+gameplay. A later retry performs another full staged PG
+replacement, which is safe because reloads apply COMPLETE
+materialized state. Success requires `ReconcileState` pending
+false at the loaded PG revision AND saver unblocked, clean, and
+at the same revision; all pre-reload saver jobs are discarded by
+T4a.
+
+Bank is the proven reload family: a small staged helper,
+conceptually `BankReload(loader, characterID, system, apply)
+sim.ReloadFunc`, reads through the existing `LoadBankBalance`
+into a temporary store-domain snapshot, returns the candidate
+revision, and defers memory replacement to
+`ReloadCandidate.Apply` (no live mutation during SELECT). No
+speculative `LoadCharacterSnapshot` / `LoadItemSnapshot` APIs are
+added; character/item adapters still prove real save composition,
+stale translation, and saver blocking.
+
+#### 8.3.14 Saver-lag observability (frozen, v0.3.20)
+
+The §10 "saver lag" metric is exactly:
+
+```text
+vox_saver_lag_seconds{aggregate}   HistogramVec
+```
+
+Label `aggregate` takes EXACTLY `character`, `item`, `bank`
+(produced only via `AggregateKind.MetricName()`); no IDs,
+systems, names, sessions, cells, or entities. Buckets are
+`prometheus.ExponentialBuckets(0.25, 2, 12)` (≈ 0.25 s … 512 s +
+Inf), covering fast write-through, normal 60 s periodic saves,
+and temporary outages.
+
+One observation occurs ONLY when a `SnapshotWrite` returns nil
+error with exactly `expectedRevision+1` accepted by the saver.
+The observed value is snapshot age at successful persistence
+acknowledgement, in seconds:
+
+```text
+successful acknowledgement time - that job's capture/enqueue time
+```
+
+The saver records a capture timestamp per pending job (new
+operational seam `SaverNow func() time.Time` on `SaverConfig`;
+nil means production `time.Now`; it affects metrics ONLY, never
+correctness or revision ordering). A transiently failed snapshot
+that remains pending RETAINS its original timestamp, so lag
+grows across retries; a superseding newer snapshot carries its
+own newer timestamp; a `WriteThrough` snapshot is stamped at
+invocation (preserved if it becomes pending). No observation
+occurs for transient, cancelled, stale, invariant, MaxInt64, or
+reconcile-blocked outcomes. A regressed metric clock clamps the
+observation to 0 — metrics never fail persistence.
+
+The sim-domain observer seam uses base/stdlib types only,
+conceptually `SaverObserver { SaverLag(aggregate string, lag
+time.Duration) }`, optionally on `SaverConfig`. The saver
+commits persistence bookkeeping BEFORE invoking it and MUST NOT
+hold its global metadata mutex during the call; the observer has
+no error return and cannot veto success.
+
+The Prometheus adapter lives in `internal/observe/saver.go` as
+`SaverMetrics` / `NewSaverMetrics(registerer)` /
+`SaverLag(aggregate, lag)`, satisfying the sim observer
+structurally without importing `internal/sim`. It whitelists
+exactly the three aggregate strings (unknown ignored),
+pre-creates all three series (stable zero-series, no dynamic
+labels), and is registered on the `observe.Server`-owned
+dedicated registry (field + accessor, mirroring
+OutboundMetrics — never global registration). The registry
+therefore exposes `vox_saver_lag_seconds` alongside
+`voxilian_store_stale_revision_total` with no collision. T4b
+adds NO other saver metric: the Store stale counter stays the
+single stale-CAS counter.
+
+#### 8.3.15 Shutdown / crash / commit-ambiguity proof (frozen, v0.3.20)
+
+Graceful shutdown persistence is the existing T4a `FlushAll`
+primitive: quiesce producers, then flush with a bounded context.
+T4b proves the bounded context reaches real Store calls and can
+abort blocked persistence (row-lock + cancel), with dirty state
+retained and a later healthy flush succeeding. One `FlushAll`
+attempts each eligible key at most once — no added retry loop.
+No SIGTERM handler, process-exit policy, or production timeout
+choice belongs to T4b.
+
+Mid-save process/connection death is proved against the REAL
+`SaveCharacterSnapshot` transaction: with the worker blocked
+after its root CAS but before child replacement commits (table
+lock barrier, backend identified via `pg_stat_activity` /
+`pg_locks`, terminated with `pg_terminate_backend`), PG MUST
+roll back root, spells, and skills completely; the Store call
+returns a normal non-stale error (no stale-metric increment);
+the saver keeps its known revision, retains the dirty snapshot
+unblocked, and a retry with the same snapshot and expected
+revision commits.
+
+Commit ambiguity is proved with a REAL bank CAS whose first
+successful revision is deliberately hidden behind a synthetic
+"lost acknowledgement" error: after the first flush PG holds
+the new revision while the saver stays dirty at the old known
+revision (no guessing); the retry surfaces `ErrStaleRevision`,
+maps to saver-stale, and blocks; reconciliation reloads the
+committed revision, resolves both layers, and the next mutation
+persists against it — no double increment, blind overwrite,
+lost revision, or invented rollback.
+
+#### 8.3.16 T4b boundaries (frozen, v0.3.20)
+
+T4b does NOT own real gameplay entity persistence ownership,
+`sim.entity` durable/gameplay fields, combat, death, trade, bank
+or inventory gameplay, AOI, presence, rate limits, gateway
+ingress, runtime `cmd/serve` wiring, SIGTERM orchestration,
+PG-outage grace policy, `WorldSource`, protocol changes, config
+changes (existing `SnapshotIntervalSeconds` suffices), Store
+production changes, migrations/queries/generated code, or new
+dependencies. `persist` production code MUST NOT import
+pgx/generated sqlc; tests may use pgx/raw SQL for fixtures only.
 
 ## 9. Gameplay services (what sim MUST enforce; numbers in `meridian59.md`)
 
@@ -3417,6 +3681,13 @@ instrumentation (exact names frozen in T4b, not here).
    survives it.
 
 ## 14. Version history
+
+- v0.3.20: freeze saver persistence composition — Store-independent
+  T4a jobs bind through internal/persist to existing character/item/bank CAS
+  operations; Store stale errors become saver stale while retaining the Store
+  cause, saver stale forces T3c materialized-PG reload, saver lag is the exact
+  low-cardinality snapshot-age histogram, and real PG crash/ambiguous-commit/
+  shutdown proofs close T4b.
 
 - v0.3.19: freeze snapshot-saver semantics — tracked persisted revisions,
   latest-wins immutable full snapshots, per-aggregate serialized CAS writes,

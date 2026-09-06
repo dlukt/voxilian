@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.3)
+# Voxilian Backend — Implementation Plan (v1.4)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.19).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.20).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -112,12 +112,13 @@ Exit: 20 Hz tick loop, cells, server-authoritative movement with reconciliation 
   context-bounded manual/shutdown flush. Store-independent deterministic
   tests; no pgx, Prometheus, gameplay fields, or runtime wiring.
   Spec: §8.1, §8.3.
-- [ ] **M4-T4b** Saver persistence/operations proof: compose T4a with the
-  existing character/item/bank Store CAS APIs against PG18; map
-  ErrStaleRevision into the saver/T3c reconciliation path; real saver-lag
-  observability while reusing the existing Store stale metric; graceful
-  shutdown flush with deadline; and crash/commit-ambiguity/property tests.
-  No gameplay/trade/AOI work.
+- [ ] **M4-T4b** Saver persistence/operations proof: production
+  internal/persist composition for character/item/bank Store CAS snapshots;
+  stale-CAS mapping into T4a + T3c forced-reload reconciliation; exact
+  saver-lag histogram observability while reusing Store's stale counter;
+  real PG18 normal flush/write-through, mid-transaction crash rollback,
+  ambiguous-commit convergence, and context-bounded shutdown-flush tests.
+  No gameplay/AOI/runtime wiring.
   Spec: §5.6, §8.1, §8.3, §10.
 - [ ] **M4-T5** AOI + presence + inbound limits: cell enter/exit subscriptions, `204/205/206` fanout to subscribers, presence registry updates, per-character inbound token buckets (movement/intent caps). Subscription-churn tests. Spec: §4, §7.
 - [ ] **M4 exit criteria met** (movement + handoff race tests green; saver property tests green).
@@ -263,6 +264,11 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 
 ## Plan history
 
+- v1.4: freeze T4b persistence semantics in spec §8.3.11–16 (+§5.6.9
+  RequireReload): internal/persist composition boundary, deep-copy job
+  adapters, dual-sentinel stale mapping, T3c forced-reload bridge,
+  exact saver-lag histogram, and real PG crash/ambiguity/shutdown proofs
+  (+spec v0.3.20).
 - v1.3: split oversized M4-T4 into saver core T4a (Store-independent) plus
   persistence/operations proof T4b (PG/observability/crash); freeze saver
   semantics in spec §8.3 (+spec v0.3.19).
