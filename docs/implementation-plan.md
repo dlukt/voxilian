@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.6)
+# Voxilian Backend — Implementation Plan (v1.7)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.22).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.23).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -140,14 +140,17 @@ Exit: 20 Hz tick loop, cells, server-authoritative movement with reconciliation 
   fanout yet. NO heartbeat runtime yet.
   Spec: §5.2.10, §5.3–§5.4, §6.3, §7, §7.2, §7.3.
 - [ ] **M4-T5b2** AOI fanout + transport liveness:
-  visibility reverse-index extension needed for fanout; live AOI
-  subscription transitions; entity presentation seam; initial
-  post-world-ready live visibility bootstrap; 204 create; ≤10 Hz 205
-  movement fanout; own-anchor vs observer-anchor=0; 206 remove;
-  TryCritical/TryState integration; raw disconnect cleanup; WebSocket
-  Ping/Pong cadence; 30 s stale sweep; slow-client/subscription
-  churn/full WS integration.
-  Spec: §4, §6.3, §7, §7.1, §7.2.
+  Presence entity->viewer reverse index; in-memory EntityPresentation
+  source; one bounded 1024-event fanout pump over sim MovementUpdate
+  (non-blocking sink, drop-counted); post-world-ready deterministic
+  204 bootstrap with readiness barrier; live AOI reconciliation with
+  recipient-local non-reused NetEntityIDs (204/206 critical);
+  recipient-local ≤10 Hz 205 state fanout (own anchor vs observer 0);
+  flush-first exit/takeover with fanout remove; raw-disconnect reaper
+  with stale retention; 15 s Ping/Pong + 30 s stale sweep; real WS
+  two-client/crossing/slow-viewer proofs. No M5 gameplay, no M10
+  baseline replacement.
+  Spec: §4, §5.2.10, §6.3, §7, §7.1, §7.2, §7.3, §7.4.
 - [ ] **M4 exit criteria met** (movement + handoff race tests green; saver property tests green).
 
 ## M5 — Combat + vitals + death
@@ -261,7 +264,7 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M4-T1, T2 | M2-T3a/b, M3-T1 | `backend/voxilian/internal/sim` |
 | M4-T5a | M2-T3a/b, M3-T1 | `backend/voxilian/internal/gateway` |
 | M4-T5b1 | M4-T5a | `backend/voxilian/internal/{sim,gateway}` |
-| M4-T5b2 | M4-T5b1 | `backend/voxilian/internal/gateway` (+ minimal sim output shape only if spec demands) |
+| M4-T5b2 | M4-T5b1 | `backend/voxilian/internal/gateway` (existing observe metrics only, no new family; no sim production change beyond a compile-time assertion if needed) |
 | M4-T3a…c, T4a, T4b | M1-T7a…c (CAS), M3-T1 | `backend/voxilian/internal/sim`, `internal/store` |
 | M5-T1…T6 | M4-T1, M4-T2 | `backend/voxilian/internal/sim` (combat/vitals/intents) |
 | M6-T1…T3 | M5-T1…T5 | `backend/voxilian/internal/sim` (progression) |
@@ -294,6 +297,11 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 
 ## Plan history
 
+- v1.7: freeze M4-T5b2 AOI fanout + transport liveness in spec §7.4
+  (viewer reverse index, in-memory presentation seam, bounded 1024-event
+  pump, 204 bootstrap + readiness barrier, recipient-local ≤10 Hz 205,
+  flush-first fanout remove, raw-disconnect reaper with stale retention,
+  15 s Ping/Pong, 30 s sweep) (+spec v0.3.23).
 - v1.6: split oversized M4-T5b into ingress/lifecycle T5b1
   (bounded 256-command Engine owner mailbox, real 102 decode/routing,
   per-presence rate enforcement with exact 202 mappings, staged world

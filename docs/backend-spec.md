@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.22 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.23 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -3008,6 +3008,263 @@ changes (`proto` and `testdata/protocol` unchanged; the existing
 204/205/206 and implements no MovementSink adapter, viewer index,
 presentation lookup, fanout throttler, heartbeat, or sweep.
 
+### 7.4 AOI fanout and transport liveness (frozen, v0.3.23)
+
+T5b2 completes the M4 runtime: the Presence viewer reverse index,
+one bounded fanout pump consuming authoritative `sim.MovementUpdate`
+events, post-world-ready `204` bootstrap with a readiness barrier,
+live AOI reconciliation with recipient-local handles, `205`
+movement fanout capped at 10 Hz per recipient/entity, and
+flush-first raw-disconnect/heartbeat teardown. The sim is never
+throttled; T5b1 ingress, movement semantics, and the outbound queue
+are reused unchanged.
+
+#### 7.4.1 Presence viewer reverse index
+
+PresenceRegistry gains the gateway-owned ephemeral reverse index
+`entity -> currently-visible session IDs` alongside the existing
+per-session `entity -> NetEntityID` / `NetEntityID -> entity`
+tables, all mutated atomically under the SAME registry lock:
+Activate adds the owner sid as viewer of its own EntityID (the owner
+is therefore a viewer of its own entity and receives reconciliation
+205s); EnsureVisible adds sid on each new mapping; HideVisible
+removes sid; Deactivate removes sid from EVERY entity it sees.
+Empty reverse sets are deleted; no ghost viewer survives
+Deactivate. New read-only APIs (exact names flexible) —
+`Viewers(entity)`, `VisibleEntities(sid)`, `VisibleHandle(sid,
+entity)`, `Controller(entity)` — return sorted numerical copies;
+no internal map escapes. Every 204/205/206 uses the recipient
+session's current NetEntityID; `uint32(netID)` conversion happens
+ONLY at the protocol encoder boundary, never derived from
+sim.EntityID, characterID, or array/cell indexes.
+
+#### 7.4.2 Entity presentation and wire positions
+
+Kind/Proto/current presentation come from a narrow injected HOT
+IN-MEMORY seam (`EntityPresentation` + `EntityPresentationSource`
+with `Entity(entity)` and `EntitiesInCell(cell)`; race-safe,
+non-blocking, non-PG). `EntitiesInCell` returns unique EntityIDs
+sorted ascending whose positions actually map to that cell, as
+copies. There is NO production fallback kind/proto (no `0`, no
+`player`, no characterID mapping): missing presentation is an
+internal world/presentation invariant, and T5b2 never queries Store
+or PG for fanout. M9/M10 later supply real content. The single
+frozen gateway conversion is `world.Vec3` float64 meters to
+`proto.Position` int32 millimeters via `wireMM =
+math.Round(meters * 1000)` per axis — no truncation, saturation, or
+wrap; coordinates that do not fit int32 (including NaN/±Inf) are a
+stable internal error (e.g. `ErrWirePositionRange`) that fails the
+affected session closed/resync, never clamping authoritative state.
+
+#### 7.4.3 Fanout runtime and event queue
+
+One gateway `FanoutRuntime` implements `sim.MovementSink` and owns
+visibility transport composition (no gameplay or movement rules).
+Exactly one bounded event queue with `FanoutEventCapacity = 1024`,
+one fanout pump goroutine, no per-event goroutine, no worker pool,
+no arbitrary `func(*FanoutRuntime)` callback events: the private
+typed union carries movement updates, bootstrap-session controls,
+and remove-presence controls. `OnMovement` admits non-blockingly
+from the sim owner goroutine (free slot admits, full drops the
+NEWEST update immediately, closed drops) and never waits, sleeps,
+spins, writes sockets, or takes Presence locks/calls
+PresentationSource. A dropped movement event alters no sim,
+disconnects nobody, allocates no seq/handle; a later authoritative
+update or reconnect/baseline corrects state. Drops keep a bounded
+atomic diagnostic count (e.g. `DroppedMovementUpdates() uint64`)
+with low-rate sampled logging (`queue_full`/`closed`), but T5b2
+adds NO Prometheus series and never logs every flooded packet.
+Bootstrap/Remove controls are reliable: callers may wait a bounded
+`FanoutControlTimeout = 1s` admission budget (internal constant, no
+config); before admission cancellation may abort, after admission
+the event is authoritative with a cap-1 completion signal and no
+waiter goroutine. One queue is the visibility barrier: controls
+order after earlier movements and before later ones, so no 205
+precedes its bootstrap 204 and no stale 205 follows a 206. Shutdown
+is idempotent: movements discarded, queued control waiters receive
+`ErrFanoutClosed`, future movement dropped, future control
+rejected, no send-on-closed panic, no restart required.
+
+#### 7.4.4 Readiness and bootstrap
+
+Presence activation is NOT visibility readiness: the pump owns an
+ephemeral ready-session set, and a committed Presence starts NOT
+ready (its AOI subscriptions exist, but the M10 baseline may carry
+zero live entities, so the client may not even know its own handle
+1). Until BootstrapSession completes, movement fanout ignores that
+session — otherwise 205 could precede 204. Successful enter order
+is 217, baseline, physical 219, CompleteEnterWorld, Presence
+Activate, `Fanout.BootstrapSession`, ready=true, handler return;
+bootstrap 204s are ordinary post-IN_WORLD traffic under outbound
+budgets, ACK flow, and slow-client handling (not baseline
+exemptions). The staged interface may therefore take bootstrap
+context (`CommitEnter(ctx, sid)`); WorldSessionRuntime owns the
+composition with no second public bootstrap step. Bootstrap reads
+the PresenceSnapshot, unions PresentationSource over the 49 cells
+in canonical order plus the mandatory own entity (missing own
+presentation is internal), and emits `204 entity_create` (never
+203/218/220; M10-T4 still owns the real baseline) in EntityID
+ascending order — own first only if naturally first; own keeps
+pinned handle 1 and still gets its 204 because the client has not
+seen the mapping. Non-owned entities use EnsureVisible handles
+(new allocations use that exact handle). 204 is reliable
+`TryCritical` traffic, never TryState/SendCritical/raw writes, and
+the pump never waits for physical completion. Joining-session
+bootstrap failure (missing presentation, wire range, handle
+exhaustion, critical saturation, closed outbound, other invariant)
+fails that session closed with ready=false and a BootstrapSession
+error; WorldSessionRuntime rolls back Presence + staged entity
+through the post-219 path with no contradictory 202, and no
+compensating 206s are sent to the dying socket. Only AFTER the
+joining bootstrap succeeds is the new controlled entity exposed to
+other ready AOI subscribers (EnsureVisible + 204 each); one
+existing viewer's failure closes/resyncs only that viewer, never
+the joined source. Non-ready subscribers receive nothing.
+
+#### 7.4.5 Movement fanout
+
+Each MovementUpdate derives its authoritative cell from
+`world.CellForPosition(update.Position)` (invalid = internal
+invariant; no client data). The controlled-entity reverse index
+(`EntityID -> owner sid`, no scans, no casts) routes ownership: a
+cell change runs `UpdateCenter(owner, newCell)` BEFORE new viewer
+computation so owner AOI follows authoritative position, while a
+same-cell move causes no subscription churn. The owner's full
+visible set then reconciles against the NEW 49-cell desired set
+(desired-but-invisible → 204, visible-but-undesired → 206 with the
+OLD handle captured before `HideVisible`, intersection retained,
+own always retained; cell crossings are 32 m-apart, so full-set
+rebuild stays deterministic and PG-free). Movement-driven viewer
+reconciliation uses ready Subscribers(newCell) vs ready
+Viewers(entity) with the same 204/206/retain rules (owner included
+via its center update). The update that creates visibility sends NO
+redundant 205 — the 204 already carries authoritative
+position/yaw/speed. New 204s use PresentationSource Kind/Proto
+with MovementUpdate.Position/Yaw/Speed (never older snapshots);
+missing presentation for a required create is an internal
+invariant — fail the recipient closed, never 205 without 204. All
+set operations are deterministic (session IDs / EntityIDs
+ascending, cells canonical); every frame is encoded per-recipient
+with that session's handle (same entity may be 4 to A and 17 to B);
+Presence locks are never held across TryCritical/TryState/source
+calls; one pump serializes ready/throttle/ordering state.
+
+204 uses TryCritical (visibility transitions are reliable); 206
+uses TryCritical with the old handle, then retires (critical
+failure still retires — the recipient is already failed closed and
+reconnects/resyncs; never preserve a stale handle for a dying
+socket). New-handle 204 admission failure retires the handle via
+HideVisible (never reused) and fails the recipient; own-handle
+failure closes/resyncs the owner without HideVisible(own). 205 is
+coalescible state via `TryState(sid, StateKey{Kind:
+OpcodeEntityMove, ID: uint64(recipientNetID)}, ...)` — never
+sim.EntityID/characterID keys. `StateDropped` changes nothing
+(session alive, mapping kept, later movement corrects; metrics
+record it); `StateClosed` stops targeting that recipient (transport
+cleanup owns Presence removal). 205 carries the converted
+authoritative position, update yaw/speed, and
+`LastProcessedInputSeq` equal to the update anchor for the
+CONTROLLING session but 0 for every other viewer. MovementUpdate
+Position/Yaw/Speed/Tick always come from the sim event, not the
+presentation snapshot. 205 emission is capped at
+`MovementFanoutMaxHz = 10` per recipient/entity visibility epoch
+via tick stride `max(1, (tickHz+9)/10)` (20→2, 60→6, 120→12,
+7→1; no wall clock): first-205-allowed state per epoch, then
+`currentTick - lastSentTick >= stride` in wrap-safe modulo-u32
+arithmetic. A 204 does not count as a 205 (first later update may
+still 205); epochs reset on handle retirement; the owner obeys the
+same 10 Hz cap with cumulative anchors across skipped ticks.
+
+#### 7.4.6 Lifecycle with fanout
+
+`WorldSessionRuntime` requires the same `FanoutLifecycle`
+(BootstrapSession/RemovePresence; no second instance; recording
+fakes where fanout is not under test). `CommitEnter(ctx, sid)`
+activates Presence (still after 219 + CompleteEnterWorld) then
+bootstraps; bootstrap failure deactivates Presence, clears
+source-session fanout bookkeeping with ready=false, retains staged
+entity metadata, and returns — the existing post-219 path then
+aborts the entity and rolls back the binding with the connection
+failed closed. Existing viewers learn a new entity only after its
+source bootstrap succeeds, so failed joins pollute nobody. Normal
+exit is verify-Presence → downstream flush → sim remove →
+`Fanout.RemovePresence` → Presence deactivate → caller
+CompleteLeaveWorld, with the durable barrier still first:
+downstream failure changes nothing (no 206, retry); pre-mutation
+sim-remove failure skips fanout entirely (retry-safe). RemovePresence
+is ordered after earlier movements: the source goes not-ready,
+other ready viewers get 206 with mapping retirement, the source
+gets no own-206 and its throttle clears. No future MovementUpdate
+can exist after sim removal, so no stale 205 follows. If reliable
+removal cannot complete after real sim removal, every currently
+indexed viewer is closed/resynced with mappings retired, the source
+marked not-ready, and local teardown continues — never resurrecting
+the entity or leaving stale addressable handles. Takeover order is
+old flush → old sim remove → old fanout remove → old deactivate →
+old CompleteLeaveWorld → old kick → new stage/219/Presence/fresh
+bootstrap epoch; old handles never transfer, and flush/remove
+failure leaves old fanout/presence/binding unkicked with the new
+bootstrap never begun.
+
+#### 7.4.7 Raw disconnect and heartbeat
+
+ServeHTTP teardown replaces unconditional `Registry.Remove` with
+reaper-aware cleanup. One narrow `SessionReaper{Registry, Presence,
+WorldExit}` (same WorldSessionRuntime composition as
+leave/takeover; never normal-126 handling) owns unexpected
+disconnect, stale cleanup, and detached-session retry: stop
+outbound, guard on `LockAccount` for authenticated sessions with
+re-read serialization (safe against concurrent leave/takeover/
+delete/enter/read-error/sweep/kick causes; no double destructive
+WorldExit, no panic), then for no-Presence sessions (CONNECTED,
+AUTHENTICATED, rolled-back SELECTED) plain `Registry.Remove`; for
+still-owned IN_WORLD + character + active Presence, `WorldExit`
+over a fresh `context.WithTimeout(Background,
+DisconnectCleanupTimeout = 5s)` (never the dead request context).
+Successful raw cleanup order is stop outbound, cancel auth timer,
+guard, WorldExit, CompleteLeaveWorld, Remove, release. WorldExit
+failure before destructive cleanup retains session binding,
+Presence, entity, and fanout with the dead transport for the next
+sweep or legitimate takeover — never orphaning world state. If
+CompleteLeaveWorld then fails with world already gone, force
+Remove and log the invariant. Heartbeat preserves Ping/Pong 15 s,
+`PresenceHeartbeatTimeout` 30 s, 30 s sweep cadence, plus bounded
+`HeartbeatPingTimeout = 15s` (no config fields). A gateway-local
+`Pinger{ Ping(ctx) error }` seam (NOT on session.Connection)
+backs `wsConnection.Ping` via coder/websocket v1.8.15, whose
+control frames bypass opcode/seq/tick/ACK/queue/writer-gate. One
+ping loop per accepted WebSocket, ending with the connection: each
+15 s pulse pings only WITH active Presence (pre-world baseline
+never pings); Pong success touches heartbeat at injected Now
+(application frames do not count; auth TokenExp/deadline untouched;
+rate buckets untouched); ping failure CloseNows without touching,
+leaving authoritative cleanup to the reaper; post-deactivation
+TouchHeartbeat-not-found is normal convergence. The 30 s sweep uses
+sorted `StaleSessions(Now())`: CloseNow live conns, reap each,
+retain-then-retry on WorldExit failure. Presence without a session
+entry is a loud internal invariant. One `TransportLiveness`
+(Presence + Reaper + NowFunc + ticker factory) owns the sweep and
+ping loops with manually-pulsable timers (no scattered
+time.NewTicker); Server takes it as optional/explicit composition
+(nil keeps frame/auth/ACK tests world-free), gains idempotent
+`Close()` for the sweep goroutine, stops the per-conn ping loop in
+teardown, and takeover CloseNow ends the old ping loop (heartbeat
+keyed by old sid cannot touch the replacement).
+
+#### 7.4.8 T5b2 non-scope (binding)
+
+No `internal/proto` or `testdata/protocol` changes (existing
+204/205/206 layouts exactly); no store/persist/migrations/queries
+changes (in-memory injected presentation); no config changes
+(constants are `FanoutEventCapacity` 1024, `FanoutControlTimeout`
+1 s, `MovementFanoutMaxHz` 10, `HeartbeatPingTimeout` 15 s,
+`DisconnectCleanupTimeout` 5 s); no `cmd/serve.go` bootstrap
+(Keycloak/PG/WorldSource/SIGTERM stay M10–M12); no new
+dependencies; no new Prometheus family (existing metrics only);
+no M5 gameplay; no M10 real-baseline replacement (204 bootstrap
+bridges to M10-T4); `outbound.go` needs no semantic change — if
+one appears necessary, freeze the spec first.
+
 T5a exposes only a narrow no-op-by-default observer seam — sufficient
 to observe queue depth messages/bytes per lane, state dropped, state
 coalesced, session slow-drop reason, and (T5b) current ACK lag — so T5b
@@ -4309,6 +4566,19 @@ pgx/generated sqlc; tests may use pgx/raw SQL for fixtures only.
    survives it.
 
 ## 14. Version history
+
+- v0.3.23: freeze M4-T5b2 AOI fanout and transport liveness —
+  gateway Presence gains an entity->viewer reverse index; one bounded
+  1024-event fanout pump consumes sim MovementUpdate without blocking the
+  sim owner; post-world-ready bootstrap emits deterministic 204 creates
+  before a session becomes fanout-ready; live cell churn reconciles
+  visibility with 204/206 and recipient-local non-reused NetEntityIDs;
+  205 is recipient-local state-lane traffic capped at <=10 Hz with the
+  processed-input anchor exposed only to the owning session. Raw WS and
+  heartbeat teardown now use the same flush-first WorldExit composition;
+  failed disconnect cleanup retains the stale session for retry rather
+  than orphaning world state. Ping/Pong runs at 15 s and stale Presence
+  sweeps at 30 s.
 
 - v0.3.22: freeze real gateway-to-sim ingress and staged world-presence
   lifecycle — one bounded 256-command Engine owner mailbox serializes
