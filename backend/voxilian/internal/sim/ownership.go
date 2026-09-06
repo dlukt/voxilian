@@ -172,7 +172,9 @@ func (r *registry) beginHandoff(id EntityID, from OwnerRef, dest world.CellCoord
 // Generation G+1, all gameplay/history/control state preserved,
 // FIFO queue drained through resident sequencing (establishing the
 // next pending control WITHOUT same-tick movement), emptied source
-// cell removed. EntityCount is unchanged.
+// cell removed. EntityCount is unchanged. The entity's recent-op
+// dedupe cache travels with the same object automatically —
+// nothing is reset, copied, or replayed here.
 func (r *registry) commitHandoff(tok handoffToken) (HandoffDisposition, error) {
 	rec, ok := r.migrations[tok.id]
 	if !ok {

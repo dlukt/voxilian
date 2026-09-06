@@ -67,6 +67,17 @@ type entity struct {
 
 	hasProcessed     bool
 	lastProcessedSeq uint32
+
+	// recentOps is the bounded cross-cell dedupe cache
+	// (spec §5.5.15): the most recent RecentOpIDCapacity
+	// SUCCESSFULLY APPLIED OpIDs for this entity. Nil until the
+	// first successful cross-cell apply (lazy: entities that
+	// never receive cross-cell operations allocate nothing).
+	// The cache travels with this same entity object across
+	// handoff — it is never reset or copied — and is discarded
+	// with the entity on removal. No snapshot, wire, or DB
+	// representation: ephemeral bounded dedupe only.
+	recentOps *recentOpIDs
 }
 
 // snapshot copies the entity's observable state.
