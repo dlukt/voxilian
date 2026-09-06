@@ -519,10 +519,10 @@ func runHandoffScript(e *Engine, sink *recordSink, ticks int) string {
 			if err != nil {
 				panic(fmt.Sprintf("handoff script q lookup: %v", err))
 			}
-			ent.position = world.Vec3{X: 64.075, Z: 352}
 			tok, err := e.registry.beginHandoff(q,
 				OwnerRef{Cell: ent.cell, Generation: ent.generation},
-				world.CellCoord{X: 2, Z: 11})
+				world.CellCoord{X: 2, Z: 11},
+				world.Vec3{X: 64.075, Z: 352})
 			if err != nil {
 				panic(fmt.Sprintf("handoff script q begin: %v", err))
 			}

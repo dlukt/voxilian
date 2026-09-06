@@ -70,8 +70,10 @@ func requireRegistryInvariants(t *testing.T, r *registry) {
 	}
 }
 
-// holdMigration moves the entity's position dest-side and opens a
-// held migration via package-private begin (B37 mechanism).
+// holdMigration opens a held migration via package-private begin.
+// The caller passes the dest-side final position; begin captures
+// the exact pre-transfer source position for lossless abort and
+// moves the quiesced entity to final.
 func holdMigration(t *testing.T, r *registry, id EntityID, dest world.CellCoord, pos world.Vec3) handoffToken {
 	t.Helper()
 	ent, err := r.lookup(id)
@@ -79,8 +81,7 @@ func holdMigration(t *testing.T, r *registry, id EntityID, dest world.CellCoord,
 		t.Fatalf("lookup: %v", err)
 	}
 	from := OwnerRef{Cell: ent.cell, Generation: ent.generation}
-	ent.position = pos
-	tok, err := r.beginHandoff(id, from, dest)
+	tok, err := r.beginHandoff(id, from, dest, pos)
 	if err != nil {
 		t.Fatalf("beginHandoff: %v", err)
 	}
@@ -118,9 +119,8 @@ func TestOwnershipBeginCommit(t *testing.T) {
 	src := OwnerRef{Cell: snap.Cell, Generation: 1}
 	dest := world.CellCoord{X: 1, Z: 0}
 	ent, _ := r.lookup(snap.ID)
-	ent.position = world.Vec3{X: 32.075}
 	ent.yaw = 1024
-	tok, err := r.beginHandoff(snap.ID, src, dest)
+	tok, err := r.beginHandoff(snap.ID, src, dest, world.Vec3{X: 32.075})
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
@@ -157,8 +157,7 @@ func TestOwnershipBeginValidation(t *testing.T) {
 	snap, _ := r.AddEntity(world.Vec3{X: 31.9})
 	src := OwnerRef{Cell: snap.Cell, Generation: 1}
 	dest := world.CellCoord{X: 1, Z: 0}
-	ent, _ := r.lookup(snap.ID)
-	ent.position = world.Vec3{X: 32.075}
+	final := world.Vec3{X: 32.075}
 	bads := []struct {
 		name string
 		id   EntityID
@@ -172,12 +171,12 @@ func TestOwnershipBeginValidation(t *testing.T) {
 		{"unknown id", 9999, src, dest},
 	}
 	for _, tc := range bads {
-		if _, err := r.beginHandoff(tc.id, tc.from, tc.dest); !errors.Is(err, ErrOwnershipMismatch) && !errors.Is(err, ErrEntityNotFound) {
+		if _, err := r.beginHandoff(tc.id, tc.from, tc.dest, final); !errors.Is(err, ErrOwnershipMismatch) && !errors.Is(err, ErrEntityNotFound) {
 			t.Fatalf("%s: begin = %v, want mismatch/not-found", tc.name, err)
 		}
 	}
 	// Destination must match the entity's actual final position.
-	if _, err := r.beginHandoff(snap.ID, src, world.CellCoord{X: 5, Z: 5}); !errors.Is(err, ErrOwnershipMismatch) {
+	if _, err := r.beginHandoff(snap.ID, src, world.CellCoord{X: 5, Z: 5}, final); !errors.Is(err, ErrOwnershipMismatch) {
 		t.Fatalf("wrong dest = %v, want mismatch", err)
 	}
 	requireRegistryInvariants(t, r)
@@ -186,7 +185,7 @@ func TestOwnershipBeginValidation(t *testing.T) {
 	}
 	// Already migrating: second begin is a mismatch, not a second record.
 	tok := holdMigration(t, r, snap.ID, dest, world.Vec3{X: 32.075})
-	if _, err := r.beginHandoff(snap.ID, src, dest); !errors.Is(err, ErrOwnershipMismatch) {
+	if _, err := r.beginHandoff(snap.ID, src, dest, final); !errors.Is(err, ErrOwnershipMismatch) {
 		t.Fatalf("double begin = %v, want mismatch", err)
 	}
 	if _, err := r.commitHandoff(tok); err != nil {
@@ -535,8 +534,6 @@ func TestHandoffGenerationGap(t *testing.T) {
 func TestHandoffWrongSource(t *testing.T) {
 	r := newRegistry(40)
 	snap, _ := r.AddEntity(world.Vec3{X: 16})
-	ent, _ := r.lookup(snap.ID)
-	ent.position = world.Vec3{X: 32.075}
 	// Forged token with the wrong source cell while a real migration
 	// with different endpoints is open.
 	real := holdMigration(t, r, snap.ID, world.CellCoord{X: 1, Z: 0}, world.Vec3{X: 32.075})
@@ -618,6 +615,243 @@ func TestHandoffPendingPreservation(t *testing.T) {
 	}
 	if after.Position.X <= 32.075 {
 		t.Fatalf("preserved control did not move: %v", after.Position)
+	}
+	requireRegistryInvariants(t, e.registry)
+}
+
+// TestAbortHandoffLossless proves abort is a complete rollback
+// primitive: after begin + accepted queue + abort, the entity is
+// once again a valid source RESIDENT with its exact pre-transfer
+// position, original generation, single cell membership, and no
+// migration record — while queued controls replay through the
+// shared resident sequencing as pending-only work for the next
+// tick. EntityID, history, active controls, and the processed
+// anchor are preserved; the next Step processes the replayed
+// control with exactly one normal movement integration.
+func TestAbortHandoffLossless(t *testing.T) {
+	sink := &recordSink{}
+	e := mustEngine(t, 20, EngineDeps{Clock: newManualClock(), RNG: newTestRNG(1), Movement: sink})
+	snap, err := e.AddEntity(world.Vec3{X: 16, Z: 16})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	submitMove(t, e, snap.ID, 10, MoveDirForward, 0, 0)
+	e.Step() // anchor 10, one walk step -Z to {16, 15.825}
+	src, err := e.Entity(snap.ID)
+	if err != nil {
+		t.Fatalf("entity: %v", err)
+	}
+	if src.LastProcessedInputSeq != 10 {
+		t.Fatalf("anchor = %d, want 10", src.LastProcessedInputSeq)
+	}
+	srcEnt, err := e.registry.lookup(snap.ID)
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	srcPos, srcDirs, srcRun := src.Position, srcEnt.activeHeldDirs, srcEnt.activeRun
+	histBefore, err := e.History(snap.ID)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+
+	tok := holdMigration(t, e.registry, snap.ID, world.CellCoord{X: 1, Z: 0}, world.Vec3{X: 32.075, Z: 16})
+	_ = tok
+	for _, seq := range []uint32{11, 12, 13} {
+		if _, err := e.SubmitMove(snap.ID, MoveIntent{
+			InputSeq: seq, HeldDirs: MoveDirBackward, Yaw: 2048, SampleTick: e.CurrentTick(),
+		}); err != nil {
+			t.Fatalf("queue %d: %v", seq, err)
+		}
+	}
+	if !e.registry.abortHandoff(snap.ID) {
+		t.Fatal("abort returned false, want true")
+	}
+	// RESIDENT source again: generation, cell, exact position, ID.
+	got, err := e.Entity(snap.ID)
+	if err != nil {
+		t.Fatalf("entity after abort: %v", err)
+	}
+	if got.ID != snap.ID {
+		t.Fatalf("id = %d, want %d (unchanged)", uint64(got.ID), uint64(snap.ID))
+	}
+	if got.Cell != src.Cell {
+		t.Fatalf("cell = %v, want source %v", got.Cell, src.Cell)
+	}
+	if got.OwnershipGeneration != 1 {
+		t.Fatalf("generation = %d, want original 1", got.OwnershipGeneration)
+	}
+	if got.Position != srcPos {
+		t.Fatalf("position = %v, want exact source %v", got.Position, srcPos)
+	}
+	// No migration record, exactly one cell membership, locator intact.
+	if _, ok := e.registry.migrations[snap.ID]; ok {
+		t.Fatal("migration record survives abort")
+	}
+	members := 0
+	for _, c := range e.registry.cells {
+		if _, ok := c.entities[snap.ID]; ok {
+			members++
+		}
+	}
+	if members != 1 {
+		t.Fatalf("cell memberships = %d, want exactly one", members)
+	}
+	if loc, ok := e.registry.entityCell[snap.ID]; !ok || loc != src.Cell {
+		t.Fatalf("locator = %v,%v, want source %v", loc, ok, src.Cell)
+	}
+	// Queue replay: last accepted 13, pending 13, anchor still 10.
+	ent, err := e.registry.lookup(snap.ID)
+	if err != nil {
+		t.Fatalf("lookup after abort: %v", err)
+	}
+	if !ent.hasAccepted || ent.lastAcceptedSeq != 13 {
+		t.Fatalf("accepted = %v/%d, want true/13", ent.hasAccepted, ent.lastAcceptedSeq)
+	}
+	if !ent.hasPending || ent.pending.InputSeq != 13 {
+		t.Fatalf("pending = %+v/%v, want seq 13", ent.pending, ent.hasPending)
+	}
+	if ent.pending.HeldDirs != MoveDirBackward || ent.pending.Yaw != 2048 {
+		t.Fatalf("pending payload = %+v, want queued seq-13 control", ent.pending)
+	}
+	if !ent.hasProcessed || ent.lastProcessedSeq != 10 {
+		t.Fatalf("processed = %v/%d, want true/10 (anchor preserved)", ent.hasProcessed, ent.lastProcessedSeq)
+	}
+	// Active controls unchanged by queueing/abort.
+	if ent.activeHeldDirs != srcDirs || ent.activeRun != srcRun || got.Yaw != src.Yaw {
+		t.Fatalf("active control changed: dirs=%02x run=%v yaw=%d, want %02x %v %d",
+			ent.activeHeldDirs, ent.activeRun, got.Yaw, srcDirs, srcRun, src.Yaw)
+	}
+	// History neutrality: begin/queue/abort append nothing.
+	histAfter, err := e.History(snap.ID)
+	if err != nil {
+		t.Fatalf("history after abort: %v", err)
+	}
+	if len(histAfter) != len(histBefore) {
+		t.Fatalf("history len = %d, want %d (untouched)", len(histAfter), len(histBefore))
+	}
+	for i := range histBefore {
+		if histAfter[i] != histBefore[i] {
+			t.Fatalf("history[%d] changed: %+v vs %+v", i, histAfter[i], histBefore[i])
+		}
+	}
+	// Begin/queue/abort emit no movement updates of their own.
+	if n := len(sink.all()); n != 1 {
+		t.Fatalf("sink updates = %d, want only the pre-hold step", n)
+	}
+	// A second abort is a no-op.
+	if e.registry.abortHandoff(snap.ID) {
+		t.Fatal("second abort returned true, want false (no record)")
+	}
+	requireRegistryInvariants(t, e.registry)
+	// Next Step processes the replayed control: exactly one normal
+	// walk integration from the restored source position.
+	e.Step()
+	after, err := e.Entity(snap.ID)
+	if err != nil {
+		t.Fatalf("entity after step: %v", err)
+	}
+	if after.LastProcessedInputSeq != 13 {
+		t.Fatalf("anchor = %d, want 13 after next tick", after.LastProcessedInputSeq)
+	}
+	if after.Yaw != 2048 {
+		t.Fatalf("yaw = %d, want replayed 2048", after.Yaw)
+	}
+	if math.Abs(after.Position.X-srcPos.X) > 1e-9 ||
+		math.Abs((srcPos.Z-after.Position.Z)-0.175) > 1e-9 {
+		t.Fatalf("pos = %v, want one 0.175 walk step -Z from %v", after.Position, srcPos)
+	}
+	h, err := e.History(snap.ID)
+	if err != nil {
+		t.Fatalf("history after step: %v", err)
+	}
+	if len(h) != len(histBefore)+1 || h[len(h)-1].Tick != 2 {
+		t.Fatalf("history = %+v, want one appended tick-2 sample", h)
+	}
+	if n := len(sink.all()); n != 2 {
+		t.Fatalf("sink updates = %d, want pre-hold + replayed steps", n)
+	}
+	requireRegistryInvariants(t, e.registry)
+}
+
+// TestAbortHandoffIgnoresRejectedInputs proves abort never
+// resurrects duplicate/stale migration inputs: only actually
+// accepted queued controls replay.
+func TestAbortHandoffIgnoresRejectedInputs(t *testing.T) {
+	e := mustEngine(t, 20, EngineDeps{Clock: newManualClock(), RNG: newTestRNG(1)})
+	snap, err := e.AddEntity(world.Vec3{X: 16, Z: 16})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	submitMove(t, e, snap.ID, 10, MoveDirForward, 0, 0)
+	e.Step() // anchor 10
+	holdMigration(t, e.registry, snap.ID, world.CellCoord{X: 1, Z: 0}, world.Vec3{X: 32.075, Z: 16})
+	if _, err := e.SubmitMove(snap.ID, MoveIntent{InputSeq: 11, HeldDirs: MoveDirForward, Yaw: 0, SampleTick: e.CurrentTick()}); err != nil {
+		t.Fatalf("queue 11: %v", err)
+	}
+	// Duplicate with a hostile payload: rejected, queued state kept.
+	if d, err := e.SubmitMove(snap.ID, MoveIntent{InputSeq: 11, HeldDirs: MoveDirBackward, Yaw: 2048, SampleTick: e.CurrentTick()}); err != nil || d != MoveDuplicate {
+		t.Fatalf("dup 11 = %v,%v, want duplicate/nil", d, err)
+	}
+	// Stale input: rejected as well.
+	if d, err := e.SubmitMove(snap.ID, MoveIntent{InputSeq: 10, HeldDirs: MoveDirBackward, Yaw: 2048, SampleTick: e.CurrentTick()}); err != nil || d != MoveStale {
+		t.Fatalf("stale 10 = %v,%v, want stale/nil", d, err)
+	}
+	rec := e.registry.migrations[snap.ID]
+	if len(rec.queued) != 1 || rec.queued[0].HeldDirs != MoveDirForward || rec.queued[0].Yaw != 0 {
+		t.Fatalf("queued state rewritten: %+v", rec.queued)
+	}
+	if !e.registry.abortHandoff(snap.ID) {
+		t.Fatal("abort returned false, want true")
+	}
+	ent, _ := e.registry.lookup(snap.ID)
+	if ent.lastAcceptedSeq != 11 || !ent.hasPending || ent.pending.InputSeq != 11 {
+		t.Fatalf("replay = accepted %d pending %+v, want 11/11", ent.lastAcceptedSeq, ent.pending)
+	}
+	if ent.pending.HeldDirs != MoveDirForward || ent.pending.Yaw != 0 {
+		t.Fatalf("resurrected rejected payload: %+v", ent.pending)
+	}
+	if ent.lastProcessedSeq != 10 {
+		t.Fatalf("anchor = %d, want 10", ent.lastProcessedSeq)
+	}
+	e.Step()
+	after, _ := e.Entity(snap.ID)
+	if after.LastProcessedInputSeq != 11 || after.Yaw != 0 {
+		t.Fatalf("replayed = anchor %d yaw %d, want 11/0", after.LastProcessedInputSeq, after.Yaw)
+	}
+	requireRegistryInvariants(t, e.registry)
+}
+
+// TestAbortHandoffQueueFullRetry proves a queue-saturation
+// rejection is not treated as accepted by abort: after abort the
+// rejected sequence stays retryable under normal sequencing.
+func TestAbortHandoffQueueFullRetry(t *testing.T) {
+	e := mustEngine(t, 20, EngineDeps{Clock: newManualClock(), RNG: newTestRNG(1)})
+	snap, err := e.AddEntity(world.Vec3{X: 16})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	submitMove(t, e, snap.ID, 10, MoveDirForward, 0, 0)
+	holdMigration(t, e.registry, snap.ID, world.CellCoord{X: 1, Z: 0}, world.Vec3{X: 32.075})
+	for i := uint32(11); i < 11+MigrationMoveQueueCapacity; i++ {
+		if _, err := e.SubmitMove(snap.ID, MoveIntent{InputSeq: i, SampleTick: e.CurrentTick()}); err != nil {
+			t.Fatalf("queue %d: %v", i, err)
+		}
+	}
+	if _, err := e.SubmitMove(snap.ID, MoveIntent{InputSeq: 11 + MigrationMoveQueueCapacity, SampleTick: e.CurrentTick()}); !errors.Is(err, ErrMigrationQueueFull) {
+		t.Fatalf("saturation = %v, want ErrMigrationQueueFull", err)
+	}
+	if !e.registry.abortHandoff(snap.ID) {
+		t.Fatal("abort returned false, want true")
+	}
+	ent, _ := e.registry.lookup(snap.ID)
+	if ent.lastAcceptedSeq != 10+MigrationMoveQueueCapacity || !ent.hasPending || ent.pending.InputSeq != 10+MigrationMoveQueueCapacity {
+		t.Fatalf("replay = accepted %d pending %+v, want 74/74",
+			ent.lastAcceptedSeq, ent.pending)
+	}
+	// The saturation-rejected sequence was never accepted: it stays
+	// eligible under normal resident sequencing.
+	if d, err := e.SubmitMove(snap.ID, MoveIntent{InputSeq: 11 + MigrationMoveQueueCapacity, SampleTick: e.CurrentTick()}); err != nil || d != MoveAccepted {
+		t.Fatalf("retry 75 = %v,%v, want accepted", d, err)
 	}
 	requireRegistryInvariants(t, e.registry)
 }

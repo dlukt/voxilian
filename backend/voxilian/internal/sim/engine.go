@@ -298,16 +298,14 @@ func (e *Engine) stepEntity(ent *entity, tick uint32) (MovementUpdate, bool) {
 	}
 	// Cross-cell final: real ownership handoff (spec §5.4.4/§5.4.5).
 	// All source gameplay calculation is complete; begin quiesces the
-	// source and commit installs the destination in the same Step.
-	start := ent.position
-	ent.position = final
+	// source (capturing the exact pre-transfer position for lossless
+	// rollback) and commit installs the destination in the same Step.
 	from := OwnerRef{Cell: ent.cell, Generation: ent.generation}
-	tok, err := e.registry.beginHandoff(ent.id, from, dest)
+	tok, err := e.registry.beginHandoff(ent.id, from, dest, final)
 	if err != nil {
 		// Generation exhaustion (or unexpected mismatch): hold the
 		// source position with zero transfer. Yaw/anchor were
 		// already consumed above and still advance.
-		ent.position = start
 		return e.finalize(ent, tick, 0, false, true), true
 	}
 	speed := wireSpeed
@@ -317,9 +315,11 @@ func (e *Engine) stepEntity(ent *entity, tick uint32) (MovementUpdate, bool) {
 	if _, err := e.registry.commitHandoff(tok); err != nil {
 		// Practically unreachable locally (the token was just
 		// issued): roll back rather than strand the entity
-		// mid-migration, then hold as above.
+		// mid-migration, then hold as above. Abort itself is the
+		// complete rollback primitive — source ownership, exact
+		// source position, and queued controls are restored with
+		// no caller-side position repair.
 		e.registry.abortHandoff(ent.id)
-		ent.position = start
 		return e.finalize(ent, tick, 0, false, true), true
 	}
 	return e.finalize(ent, tick, speed, blocked, false), true

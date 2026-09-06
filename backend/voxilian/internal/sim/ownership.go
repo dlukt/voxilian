@@ -79,28 +79,39 @@ type handoffToken struct {
 }
 
 // migrationRecord is the explicit MIGRATING route state (spec
-// §5.4.2): the quiesced entity plus its From/To refs, bounded FIFO
+// §5.4.2): the quiesced entity plus its From/To refs, the exact
+// pre-transfer source position for lossless abort, its bounded FIFO
 // movement queue, and private sequence frontier. There is exactly
 // one mutable entity object — the record OWNS it while migrating,
 // never a second copy.
 type migrationRecord struct {
-	id          EntityID
-	from        OwnerRef
-	to          OwnerRef
-	entity      *entity
-	queued      []MoveIntent
-	hasFrontier bool
-	frontier    uint32
+	id     EntityID
+	from   OwnerRef
+	to     OwnerRef
+	entity *entity
+	// sourcePosition is the exact authoritative pre-transfer
+	// position, captured at begin before the entity takes its
+	// final dest-side position. Abort restores it verbatim —
+	// never inferred from the source cell, never snapped to a
+	// center/boundary.
+	sourcePosition world.Vec3
+	queued         []MoveIntent
+	hasFrontier    bool
+	frontier       uint32
 }
 
 // beginHandoff validates preconditions and quiesces the source
-// (spec §5.4.4): the entity leaves resident membership for the
-// migration record, which owns it until commit or abort. Failure
-// mutates nothing. The entity's final gameplay state (position,
-// yaw, speed, anchor, controls) must already be computed by the
-// caller — after success the source performs no more gameplay
-// mutation.
-func (r *registry) beginHandoff(id EntityID, from OwnerRef, dest world.CellCoord) (handoffToken, error) {
+// (spec §5.4.4): the caller computes the final authoritative
+// position and passes it explicitly. On success the record captures
+// the exact pre-transfer source position (for lossless abort), the
+// entity takes the final dest-side position, and resident
+// membership moves into the migration record, which owns the
+// entity until commit or abort. Failure mutates nothing: no
+// membership change, no position change, no record. The entity's
+// final gameplay state (yaw, speed, anchor, controls) must already
+// be computed by the caller — after success the source performs no
+// more gameplay mutation.
+func (r *registry) beginHandoff(id EntityID, from OwnerRef, dest world.CellCoord, final world.Vec3) (handoffToken, error) {
 	var zero handoffToken
 	if from.Generation == 0 {
 		return zero, fmt.Errorf("%w: reserved zero source generation", ErrOwnershipMismatch)
@@ -135,22 +146,24 @@ func (r *registry) beginHandoff(id EntityID, from OwnerRef, dest world.CellCoord
 	if next == 0 {
 		return zero, fmt.Errorf("%w: id %d at MaxUint64", ErrOwnershipGenerationExhausted, uint64(id))
 	}
-	if got, err := world.CellForPosition(ent.position); err != nil || got != dest {
+	if got, err := world.CellForPosition(final); err != nil || got != dest {
 		return zero, fmt.Errorf("%w: id %d final %v vs destination %v",
-			ErrOwnershipMismatch, uint64(id), ent.position, dest)
+			ErrOwnershipMismatch, uint64(id), final, dest)
 	}
 	tok := handoffToken{id: id, from: from, to: OwnerRef{Cell: dest, Generation: next}}
+	r.migrations[id] = &migrationRecord{
+		id:             id,
+		from:           from,
+		to:             tok.to,
+		entity:         ent,
+		sourcePosition: ent.position,
+		queued:         make([]MoveIntent, 0, MigrationMoveQueueCapacity),
+		hasFrontier:    ent.hasAccepted,
+		frontier:       ent.lastAcceptedSeq,
+	}
+	ent.position = final
 	delete(c.entities, id)
 	delete(r.entityCell, id)
-	r.migrations[id] = &migrationRecord{
-		id:          id,
-		from:        from,
-		to:          tok.to,
-		entity:      ent,
-		queued:      make([]MoveIntent, 0, MigrationMoveQueueCapacity),
-		hasFrontier: ent.hasAccepted,
-		frontier:    ent.lastAcceptedSeq,
-	}
 	return tok, nil
 }
 
@@ -185,7 +198,26 @@ func (r *registry) commitHandoff(tok handoffToken) (HandoffDisposition, error) {
 	destCell.entities[tok.id] = ent
 	r.entityCell[tok.id] = rec.to.Cell
 	delete(r.migrations, tok.id)
-	for _, qi := range rec.queued {
+	replayMigrationMoves(ent, rec.queued)
+	if src, ok := r.cells[rec.from.Cell]; ok && len(src.entities) == 0 {
+		delete(r.cells, rec.from.Cell)
+	}
+	return HandoffInstalled, nil
+}
+
+// replayMigrationMoves drains a migration's queued intents through
+// the SAME resident sequencing/coalescing semantics as SubmitMove
+// (spec §5.4.7): each queued intent classifies against the live
+// accepted frontier, and only newer accepted intents advance it and
+// replace pending control. It establishes pending control ONLY —
+// no position integration, no anchor advance, no history touch.
+// Commit and abort share this one helper; no second replay
+// implementation may diverge from it. Only actually queued
+// (accepted) intents replay: duplicates, stale inputs, ambiguous
+// gaps, and queue-full rejections were never queued and can never
+// be resurrected here.
+func replayMigrationMoves(ent *entity, queued []MoveIntent) {
+	for _, qi := range queued {
 		d, err := classifyMoveIntent(ent.hasAccepted, ent.lastAcceptedSeq, qi.InputSeq)
 		if err != nil || d != MoveAccepted {
 			continue
@@ -195,10 +227,6 @@ func (r *registry) commitHandoff(tok handoffToken) (HandoffDisposition, error) {
 		ent.pending = qi
 		ent.hasPending = true
 	}
-	if src, ok := r.cells[rec.from.Cell]; ok && len(src.entities) == 0 {
-		delete(r.cells, rec.from.Cell)
-	}
-	return HandoffInstalled, nil
 }
 
 // handoffRef renders migration endpoints for mismatch diagnostics.
@@ -233,9 +261,17 @@ func (r *registry) resolvePostHandoff(tok handoffToken) (HandoffDisposition, err
 		ErrOwnershipMismatch, uint64(tok.id), ent.cell, ent.generation, tok.to.Cell, tok.to.Generation)
 }
 
-// abortHandoff defensively restores a quiesced migration to resident
-// source ownership. Normal flows never strand entities
-// mid-migration; this runs only if a local commit fails
+// abortHandoff is the complete rollback primitive for a quiesced
+// migration: the same single entity object returns to RESIDENT
+// source ownership with its source Cell, source Generation, exact
+// pre-transfer source position, and source cell membership
+// restored; accepted queued intents replay through the shared
+// sequencing helper (becoming normal pending source-owner work for
+// the next tick, never same-tick movement); EntityID, history,
+// active controls, and the processed anchor are preserved; the
+// migration record is removed. No caller-side follow-up repair is
+// required for registry consistency. Normal flows never strand
+// entities mid-migration; this runs only if a local commit fails
 // unexpectedly so no tick boundary ever observes a lost entity.
 func (r *registry) abortHandoff(id EntityID) bool {
 	rec, ok := r.migrations[id]
@@ -243,13 +279,15 @@ func (r *registry) abortHandoff(id EntityID) bool {
 		return false
 	}
 	ent := rec.entity
+	ent.cell = rec.from.Cell
+	ent.generation = rec.from.Generation
+	ent.position = rec.sourcePosition
+	replayMigrationMoves(ent, rec.queued)
 	srcCell, ok := r.cells[rec.from.Cell]
 	if !ok {
 		srcCell = &cell{coord: rec.from.Cell, entities: make(map[EntityID]*entity)}
 		r.cells[rec.from.Cell] = srcCell
 	}
-	ent.cell = rec.from.Cell
-	ent.generation = rec.from.Generation
 	srcCell.entities[id] = ent
 	r.entityCell[id] = rec.from.Cell
 	delete(r.migrations, id)
