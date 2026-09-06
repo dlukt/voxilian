@@ -1137,6 +1137,7 @@ func TestOutboundKickedBypassesSaturatedQueue(t *testing.T) {
 		Registry:   reg,
 		Baseline:   BaselineProviderFunc(provider.StreamBaseline),
 		WorldExit:  WorldExitFunc(exit.ExitWorld),
+		WorldEnter: &fakeWorldEnter{},
 		Tick:       func() uint32 { return enterTestTick },
 	})
 	if err != nil {

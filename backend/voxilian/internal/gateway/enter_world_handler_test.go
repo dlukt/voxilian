@@ -269,14 +269,15 @@ func (l *eventLog) slice() []string {
 }
 
 type enterFixture struct {
-	reg      *session.Registry
-	lookup   *fakeLookup
-	provider *fakeProvider
-	sends    *sendRecorder
-	next     *recordingNext
-	exit     *recordingExit
-	conns    map[session.ID]*takeoverConn
-	h        *EnterWorldHandler
+	reg        *session.Registry
+	lookup     *fakeLookup
+	provider   *fakeProvider
+	sends      *sendRecorder
+	next       *recordingNext
+	exit       *recordingExit
+	worldEnter *fakeWorldEnter
+	conns      map[session.ID]*takeoverConn
+	h          *EnterWorldHandler
 }
 
 func newEnterFixture(t *testing.T, reg *session.Registry) *enterFixture {
@@ -289,11 +290,13 @@ func newEnterFixture(t *testing.T, reg *session.Registry) *enterFixture {
 	sends := &sendRecorder{}
 	next := &recordingNext{}
 	exit := &recordingExit{registry: reg}
+	worldEnter := &fakeWorldEnter{}
 	h, err := NewEnterWorldHandler(EnterWorldHandlerDeps{
 		Characters: lookup,
 		Registry:   reg,
 		Baseline:   BaselineProviderFunc(provider.StreamBaseline),
 		WorldExit:  WorldExitFunc(exit.ExitWorld),
+		WorldEnter: worldEnter,
 		Tick:       func() uint32 { return enterTestTick },
 		Next:       next,
 	})
@@ -301,14 +304,15 @@ func newEnterFixture(t *testing.T, reg *session.Registry) *enterFixture {
 		t.Fatalf("NewEnterWorldHandler: %v", err)
 	}
 	return &enterFixture{
-		reg:      reg,
-		lookup:   lookup,
-		provider: provider,
-		sends:    sends,
-		next:     next,
-		exit:     exit,
-		conns:    map[session.ID]*takeoverConn{},
-		h:        h,
+		reg:        reg,
+		lookup:     lookup,
+		provider:   provider,
+		sends:      sends,
+		next:       next,
+		exit:       exit,
+		worldEnter: worldEnter,
+		conns:      map[session.ID]*takeoverConn{},
+		h:          h,
 	}
 }
 
@@ -432,6 +436,7 @@ func TestNewEnterWorldHandlerRequiresDeps(t *testing.T) {
 			Registry:   session.NewRegistry(),
 			Baseline:   provider,
 			WorldExit:  exit,
+			WorldEnter: &fakeWorldEnter{},
 			Tick:       tick,
 		}
 		if mut != nil {
@@ -450,6 +455,9 @@ func TestNewEnterWorldHandlerRequiresDeps(t *testing.T) {
 	}
 	if _, err := NewEnterWorldHandler(deps(func(d *EnterWorldHandlerDeps) { d.WorldExit = nil })); err == nil {
 		t.Error("nil world exit accepted")
+	}
+	if _, err := NewEnterWorldHandler(deps(func(d *EnterWorldHandlerDeps) { d.WorldEnter = nil })); err == nil {
+		t.Error("nil world enter accepted")
 	}
 	if _, err := NewEnterWorldHandler(deps(func(d *EnterWorldHandlerDeps) { d.Tick = nil })); err == nil {
 		t.Error("nil tick accepted")
@@ -776,6 +784,7 @@ func TestTakeoverEventOrder(t *testing.T) {
 		Registry:   reg,
 		Baseline:   provider,
 		WorldExit:  exit,
+		WorldEnter: &fakeWorldEnter{log: log},
 		Tick:       func() uint32 { return enterTestTick },
 	})
 	if err != nil {
@@ -806,7 +815,7 @@ func TestTakeoverEventOrder(t *testing.T) {
 	if herr != nil {
 		t.Fatalf("takeover err = %v", herr)
 	}
-	want := []string{"flush-old", "kick-old", "closeNow-old", "baseline-new"}
+	want := []string{"flush-old", "kick-old", "closeNow-old", "prepare", "baseline-new", "commit"}
 	if got := log.slice(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("event order = %v, want %v", got, want)
 	}

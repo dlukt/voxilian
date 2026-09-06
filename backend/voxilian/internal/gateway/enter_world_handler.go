@@ -140,6 +140,7 @@ type EnterWorldHandler struct {
 	Registry   *session.Registry
 	Baseline   BaselineProvider
 	WorldExit  WorldExit
+	WorldEnter WorldEnter
 	Tick       TickFunc
 	Next       MessageHandler
 	observer   OutboundObserver
@@ -147,18 +148,23 @@ type EnterWorldHandler struct {
 
 // EnterWorldHandlerDeps wires an EnterWorldHandler without a growing
 // positional constructor. Characters, Registry, Baseline, WorldExit,
-// and Tick are required (no silent no-op defaults); Next may be nil,
-// in which case unowned allowed opcodes are consumed without a reply.
+// WorldEnter, and Tick are required (no silent no-op defaults); Next
+// may be nil, in which case unowned allowed opcodes are consumed
+// without a reply.
 // Observer may be nil (no-op default): when supplied it receives the
 // flow-epoch initialization observation (lag 0) after each successful
 // CompleteEnterWorld (spec §7.1.12). WorldExit must be the SAME
 // instance the CharacterHandler chain uses: normal leave_world and
-// forced takeover share one world-side quiesce/flush contract.
+// forced takeover share one world-side quiesce/flush contract. In
+// production that instance is the WorldSessionRuntime that also
+// implements WorldEnter, so enter/leave/takeover share one staged
+// world-presence composition (spec §7.3.4).
 type EnterWorldHandlerDeps struct {
 	Characters CharacterLookup
 	Registry   *session.Registry
 	Baseline   BaselineProvider
 	WorldExit  WorldExit
+	WorldEnter WorldEnter
 	Tick       TickFunc
 	Next       MessageHandler
 	Observer   OutboundObserver
@@ -178,6 +184,9 @@ func NewEnterWorldHandler(deps EnterWorldHandlerDeps) (*EnterWorldHandler, error
 	if deps.WorldExit == nil {
 		return nil, errors.New("gateway: world exit seam is required")
 	}
+	if deps.WorldEnter == nil {
+		return nil, errors.New("gateway: world entry seam is required")
+	}
 	if deps.Tick == nil {
 		return nil, errors.New("gateway: tick source is required")
 	}
@@ -190,6 +199,7 @@ func NewEnterWorldHandler(deps EnterWorldHandlerDeps) (*EnterWorldHandler, error
 		Registry:   deps.Registry,
 		Baseline:   deps.Baseline,
 		WorldExit:  deps.WorldExit,
+		WorldEnter: deps.WorldEnter,
 		Tick:       deps.Tick,
 		Next:       deps.Next,
 		observer:   observer,
@@ -216,10 +226,12 @@ func (h *EnterWorldHandler) Handle(
 // enter serves 124. The account lifecycle guard spans the ENTIRE
 // logical operation (spec §6.1.2): re-read, requested-character
 // lookup, old-session discovery, old WorldExit flush, old unbind,
-// old retirement/kick, new BeginEnterWorld, 217, baseline, 219, and
-// new CompleteEnterWorld — so no deletion, leave, or other enter can
+// old retirement/kick, new BeginEnterWorld, staged sim PrepareEnter,
+// 217, baseline, 219, new CompleteEnterWorld, and Presence
+// CommitEnter — so no deletion, leave, or other enter can
 // interleave. The guard is released before any simple-failure
-// response (invalid/empty slot, lookup retry, takeover flush retry);
+// response (invalid/empty slot, lookup retry, takeover flush retry,
+// world-stage retry);
 // once the handler commits to BeginEnterWorld the guard intentionally
 // stays held through baseline emission and the world_ready barrier —
 // the whole baseline is the lifecycle transaction being serialized,
@@ -278,7 +290,8 @@ func (h *EnterWorldHandler) enter(
 			return terr
 		}
 	}
-	// Commit point: the guard now spans 217, baseline, 219, complete.
+	// Commit point: the guard now spans staging, 217, baseline,
+	// 219, complete, and presence commit.
 	if err := h.Registry.BeginEnterWorld(sid, desc.ID); err != nil {
 		// Includes ErrCharacterInUse after takeover: a foreign owner
 		// (never same-account, just flushed) is an ownership invariant
@@ -286,14 +299,25 @@ func (h *EnterWorldHandler) enter(
 		unlock()
 		return fmt.Errorf("gateway: begin enter: %w", err)
 	}
-	if err := sendCharacterOp(send, proto.CharacterOpEnterWorld, proto.CharacterOpOK); err != nil {
+	// Stage the sim entity BEFORE 217: the client never hears enter
+	// OK without a staged runtime entity (spec §7.3.5). Operational
+	// staging failures roll back the binding with 202 retry.
+	if err := h.WorldEnter.PrepareEnter(ctx, sid, cur.AccountID, desc.ID); err != nil {
 		_ = h.Registry.AbortEnterWorld(sid, desc.ID)
+		unlock()
+		if errors.Is(err, ErrWorldEntryRetry) {
+			return &ClientError{Code: proto.ErrorCodeRetry, Message: "enter_world unavailable"}
+		}
+		return fmt.Errorf("gateway: prepare enter: %w", err)
+	}
+	if err := sendCharacterOp(send, proto.CharacterOpEnterWorld, proto.CharacterOpOK); err != nil {
+		h.rollbackStagedEnter(ctx, sid, desc.ID)
 		unlock()
 		return err
 	}
 	sink := gatewayBaselineSink{send: send}
 	if err := h.Baseline.StreamBaseline(ctx, sid, cur.AccountID, desc.ID, sink); err != nil {
-		_ = h.Registry.AbortEnterWorld(sid, desc.ID)
+		h.rollbackStagedEnter(ctx, sid, desc.ID)
 		unlock()
 		var werr *baselineWriteError
 		if errors.As(err, &werr) {
@@ -306,7 +330,7 @@ func (h *EnterWorldHandler) enter(
 			proto.WorldReady{}.Encode(e)
 			return nil
 		}); err != nil {
-		_ = h.Registry.AbortEnterWorld(sid, desc.ID)
+		h.rollbackStagedEnter(ctx, sid, desc.ID)
 		unlock()
 		return err
 	}
@@ -315,14 +339,42 @@ func (h *EnterWorldHandler) enter(
 	// AND the registry is IN_WORLD. A failure here is an internal
 	// invariant failure: terminate, never claim success. The completion
 	// also initializes the ACK-flow epoch at the written 219 sequence
-	// (spec §7.1.11) — observed as lag 0 (spec §7.1.12).
+	// (spec §7.1.11) — observed as lag 0 (spec §7.1.12). The staged
+	// entry is aborted and the binding rolled back where still
+	// applicable; the client may have seen 219, so no contradictory
+	// retry sequence is emitted.
 	if err := h.Registry.CompleteEnterWorld(sid, desc.ID); err != nil {
+		_ = h.WorldEnter.AbortEnter(ctx, sid)
+		_ = h.Registry.AbortEnterWorld(sid, desc.ID)
 		unlock()
 		return fmt.Errorf("gateway: complete enter after world_ready: %w", err)
+	}
+	// Presence activates only after the physical 219 barrier AND
+	// session completion (spec §7.3.4): buckets start at commit time,
+	// and a baseline failure can never leave an active Presence. A
+	// commit failure after completion is an internal world/session
+	// invariant: abort the staged entity, roll back the just-completed
+	// binding where still owned, and fail closed with no enter
+	// success.
+	if err := h.WorldEnter.CommitEnter(sid); err != nil {
+		_ = h.WorldEnter.AbortEnter(ctx, sid)
+		_ = h.Registry.CompleteLeaveWorld(sid, desc.ID)
+		unlock()
+		return fmt.Errorf("gateway: commit enter: %w", err)
 	}
 	h.observer.AckLag(0)
 	unlock()
 	return nil
+}
+
+// rollbackStagedEnter cleans BOTH lifecycle layers after
+// BeginEnterWorld: the staged sim world entry and the session
+// CHARACTER_SELECTED binding/state. It runs on every pre-commit
+// failure path so no branch repeats subtly different ordering. Best
+// effort: the caller's primary failure is returned.
+func (h *EnterWorldHandler) rollbackStagedEnter(ctx context.Context, sid session.ID, characterID int64) {
+	_ = h.WorldEnter.AbortEnter(ctx, sid)
+	_ = h.Registry.AbortEnterWorld(sid, characterID)
 }
 
 // kickWriteBudget bounds the best-effort kicked control write so a

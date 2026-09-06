@@ -39,10 +39,12 @@ type CharacterService interface {
 }
 
 // WorldExit flushes world-side character state on leave_world: quiesce
-// the character, clear AOI, drop presence, flush dirty durable state.
-// T3b defines only this seam (plus test fakes); the real world
-// implementation lands later. It must never import internal/world or
-// internal/sim.
+// the character, remove the sim entity, drop presence, flush dirty
+// durable state. T3b defines only this seam; the T5b1
+// WorldSessionRuntime is the real world implementation (staged sim
+// entity removal + Presence deactivation composed around the
+// downstream quiesce/flush seam). This seam definition itself stays
+// free of world/sim imports.
 type WorldExit interface {
 	ExitWorld(
 		ctx context.Context,
@@ -129,9 +131,11 @@ func (h *CharacterHandler) Handle(
 	case proto.OpcodeLeaveWorld:
 		return h.leave(ctx, sid, payload, send)
 	default:
-		// 124 enter_world is owned wholly by M3-T4; 102–120 belong to
-		// later tasks. Opcode 125 ack is owned by the Server itself and
-		// never reaches this chain. Delegate unchanged.
+		// 124 enter_world is owned wholly by M3-T4; 102 movement
+		// routing and the 103..120 rate gate belong to the downstream
+		// GameplayIngressHandler (M4-T5b1); 103..120 gameplay semantics
+		// belong to later tasks. Opcode 125 ack is owned by the Server
+		// itself and never reaches this chain. Delegate unchanged.
 		if h.Next == nil {
 			return nil
 		}

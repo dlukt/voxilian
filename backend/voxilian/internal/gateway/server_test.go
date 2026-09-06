@@ -31,8 +31,10 @@ import (
 	"github.com/dlukt/voxilian/internal/gateway"
 	"github.com/dlukt/voxilian/internal/proto"
 	"github.com/dlukt/voxilian/internal/session"
+	"github.com/dlukt/voxilian/internal/sim"
 	"github.com/dlukt/voxilian/internal/simtest"
 	"github.com/dlukt/voxilian/internal/store"
+	"github.com/dlukt/voxilian/internal/world"
 )
 
 const testTick = 555
@@ -1357,6 +1359,7 @@ func newCharFixture(t *testing.T, nextMarker bool, baseline gateway.BaselineProv
 			Registry:   f.reg,
 			Baseline:   baseline,
 			WorldExit:  exit,
+			WorldEnter: stubWorldEnter{},
 			Tick:       func() uint32 { return testTick },
 			Next:       f.next,
 		})
@@ -2590,4 +2593,204 @@ func TestEnterWorldSlotMappingWS(t *testing.T) {
 	}
 	ids := f.reg.SessionsBySub("test-sub")
 	waitForSessionState(t, f.reg, ids[0], session.StateInWorld)
+}
+
+// ---------------------------------------------------------------------------
+// M4-T5b1 real-WS movement ingress proof (B67)
+// ---------------------------------------------------------------------------
+
+// wsCharsFake serves one slot-0 character (durable ID 500).
+type wsCharsFake struct{}
+
+func (wsCharsFake) List(context.Context, int64) ([]character.ListEntry, error) {
+	return []character.ListEntry{{Slot: 0, Name: "Aria", Level: 20}}, nil
+}
+
+func (wsCharsFake) Create(context.Context, int64, character.CreateRequest) (int64, error) {
+	return 0, errors.New("not used")
+}
+
+func (wsCharsFake) FindBySlot(_ context.Context, _ int64, slot uint8) (character.Descriptor, error) {
+	if slot != 0 {
+		return character.Descriptor{}, character.ErrNotFound
+	}
+	return character.Descriptor{ID: 500, Slot: 0, Name: "Aria", Revision: 3}, nil
+}
+
+func (wsCharsFake) Delete(context.Context, int64, int64) (int64, error) {
+	return 0, errors.New("not used")
+}
+
+// wsEmptyBaseline streams no entity state: T5b1 combines entry with
+// an EMPTY entity baseline, never duplicated fake IDs.
+type wsEmptyBaseline struct{}
+
+func (wsEmptyBaseline) StreamBaseline(context.Context, session.ID, int64, int64, gateway.BaselineSink) error {
+	return nil
+}
+
+// wsSimMove records one routed movement.
+type wsSimMove struct {
+	id     sim.EntityID
+	intent sim.MoveIntent
+}
+
+// wsSimFake is the recording SimIngress for the WS proof.
+type wsSimFake struct {
+	mu      sync.Mutex
+	adds    int
+	nextID  sim.EntityID
+	removes []sim.EntityID
+	moves   []wsSimMove
+}
+
+func (f *wsSimFake) EnqueueAddEntity(_ context.Context, pos world.Vec3) (sim.EntitySnapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.adds++
+	f.nextID++
+	cell, err := world.CellForPosition(pos)
+	if err != nil {
+		return sim.EntitySnapshot{}, err
+	}
+	return sim.EntitySnapshot{ID: f.nextID, Position: pos, Cell: cell}, nil
+}
+
+func (f *wsSimFake) EnqueueRemoveEntity(_ context.Context, id sim.EntityID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removes = append(f.removes, id)
+	return nil
+}
+
+func (f *wsSimFake) EnqueueMove(_ context.Context, id sim.EntityID, intent sim.MoveIntent) (sim.MoveDisposition, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.moves = append(f.moves, wsSimMove{id: id, intent: intent})
+	return sim.MoveAccepted, nil
+}
+
+func (f *wsSimFake) CurrentTick() uint32 { return 777 }
+
+func sendMoveWS(t *testing.T, c *websocket.Conn, seq uint32, tick uint32, inputSeq uint32) {
+	t.Helper()
+	sendFrame(t, c,
+		proto.Header{Opcode: proto.OpcodeMove, MsgVersion: 1, Seq: seq, Tick: tick},
+		func(e *proto.Encoder) error {
+			proto.Move{InputSeq: inputSeq, HeldDirs: 1, Yaw: 512}.Encode(e)
+			return nil
+		})
+}
+
+// TestMovementIngressWS drives a real WebSocket through the actual
+// Server chain (CharacterHandler → EnterWorldHandler →
+// GameplayIngressHandler) with a real PresenceRegistry and staged
+// world runtime: IN_WORLD 102s are decoded and routed, successes are
+// silent, the movement bucket eventually yields 202 rate_limited,
+// and the connection stays usable afterwards.
+func TestMovementIngressWS(t *testing.T) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	nowFunc := func() time.Time { return now }
+	reg := session.NewRegistry()
+	presence, err := gateway.NewPresenceRegistry(gateway.RateLimitPolicy{MovePerSec: 3, IntentPerSec: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeSim := &wsSimFake{}
+	spawn := gateway.SpawnResolverFunc(func(context.Context, int64, int64) (world.Vec3, error) {
+		return world.Vec3{X: 4}, nil
+	})
+	downstream := gateway.WorldExitFunc(func(context.Context, session.ID, int64, int64) error { return nil })
+	runtime, err := gateway.NewWorldSessionRuntime(fakeSim, presence, spawn, nowFunc, downstream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gameplay, err := gateway.NewGameplayIngressHandler(presence, fakeSim, nowFunc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enter, err := gateway.NewEnterWorldHandler(gateway.EnterWorldHandlerDeps{
+		Characters: wsCharsFake{},
+		Registry:   reg,
+		Baseline:   wsEmptyBaseline{},
+		WorldExit:  runtime,
+		WorldEnter: runtime,
+		Tick:       func() uint32 { return testTick },
+		Next:       gameplay,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chars, err := gateway.NewCharacterHandler(wsCharsFake{}, reg, runtime, enter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validator := &fakeValidator{
+		ids: map[string]auth.Identity{
+			"tok": {Sub: "ws-sub", ExpiresAt: now.Add(time.Hour)},
+		},
+		now: nowFunc,
+	}
+	accounts := &fakeAccounts{ids: map[string]int64{"ws-sub": 11}}
+	srv := gateway.NewServer(gateway.ServerDeps{
+		Registry:  reg,
+		Validator: validator,
+		Accounts:  accounts,
+		Welcome:   func(context.Context) proto.Welcome { return fixedWelcome },
+		Tick:      func() uint32 { return testTick },
+		Now:       nowFunc,
+		Schedule:  func(time.Time, func()) gateway.CancelFunc { return func() {} },
+		Handler:   chars,
+	})
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close(websocket.StatusNormalClosure, "") })
+
+	sendHello(t, c, "tok", 1, 1)
+	if h, _ := readFrame(t, c); h.Opcode != proto.OpcodeWelcome {
+		t.Fatalf("opcode = %d, want 200", h.Opcode)
+	}
+	sendEnterWorld(t, c, 2, 0)
+	if _, op := readCharOp(t, c); op.OK != proto.CharacterOpOK {
+		t.Fatalf("217 = %+v, want OK", op)
+	}
+	// Empty entity baseline: next frame must be 219 directly.
+	if h, _ := readFrame(t, c); h.Opcode != proto.OpcodeWorldReady {
+		t.Fatalf("opcode = %d, want 219", h.Opcode)
+	}
+
+	// Three IN_WORLD 102s: routed and silent. The fourth exhausts the
+	// frozen 3/s movement bucket into 202 rate_limited — the first
+	// frame read after all four, so any success reply would desync
+	// this stream and fail the assertion.
+	sendMoveWS(t, c, 3, 10, 1)
+	sendMoveWS(t, c, 4, 10, 2)
+	sendMoveWS(t, c, 5, 10, 3)
+	sendMoveWS(t, c, 6, 10, 4)
+	if _, msg := readError(t, c); msg.Code != proto.ErrorCodeRateLimited {
+		t.Fatalf("4th move code = %d, want 11 rate_limited", msg.Code)
+	}
+	if len(fakeSim.moves) != 3 {
+		t.Fatalf("sim moves = %d, want 3 (denied move never submitted)", len(fakeSim.moves))
+	}
+	for i, m := range fakeSim.moves {
+		if uint64(m.id) != 1 {
+			t.Fatalf("move %d entity = %d, want staged presence entity 1", i, uint64(m.id))
+		}
+		want := sim.MoveIntent{InputSeq: uint32(i + 1), HeldDirs: 1, Yaw: 512, SampleTick: 10}
+		if m.intent != want {
+			t.Fatalf("move %d intent = %+v, want %+v", i, m.intent, want)
+		}
+	}
+	// Connection remains usable: character_list answers 216.
+	sendCharList(t, c, 7)
+	if h, _ := readFrame(t, c); h.Opcode != proto.OpcodeCharacterListResult {
+		t.Fatalf("opcode = %d, want 216", h.Opcode)
+	}
 }

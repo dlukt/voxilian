@@ -530,6 +530,7 @@ func newM3Engine(t *testing.T, label string) *m3Engine {
 		Registry:   reg,
 		Baseline:   baseline,
 		WorldExit:  exit, // same instance the CharacterHandler uses
+		WorldEnter: &fakeWorldEnter{},
 		Tick:       func() uint32 { return 777 },
 		Next:       next,
 	})

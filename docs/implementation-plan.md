@@ -129,7 +129,7 @@ Exit: 20 Hz tick loop, cells, server-authoritative movement with reconciliation 
   stale-handle, rate, property, and concurrency tests. No WebSocket,
   sim-ingress, protocol fanout, or runtime lifecycle wiring.
   Spec: §4, §7, §7.2.
-- [ ] **M4-T5b1** Sim-owner ingress + movement/rate/lifecycle:
+- [x] **M4-T5b1** Sim-owner ingress + movement/rate/lifecycle:
   bounded single-writer Engine command mailbox; concurrency-safe queued
   AddEntity / RemoveEntity / SubmitMove; real opcode 102 decode and sim
   routing; existing per-presence move/intent rate enforcement with exact

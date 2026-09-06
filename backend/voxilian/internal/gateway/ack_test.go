@@ -126,6 +126,18 @@ func (a *ackExit) ExitWorld(context.Context, session.ID, int64, int64) error {
 	return nil
 }
 
+// stubWorldEnter is a no-op WorldEnter for chains that do not exercise
+// staged world entry (also used by server_test.go).
+type stubWorldEnter struct{}
+
+func (stubWorldEnter) PrepareEnter(context.Context, session.ID, int64, int64) error {
+	return nil
+}
+
+func (stubWorldEnter) CommitEnter(session.ID) error { return nil }
+
+func (stubWorldEnter) AbortEnter(context.Context, session.ID) error { return nil }
+
 func (a *ackExit) callCount() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -164,6 +176,7 @@ func newAckFixture(t *testing.T, policy gateway.OutboundPolicy, observer gateway
 		Registry:   reg,
 		Baseline:   baseline,
 		WorldExit:  gateway.WorldExitFunc(exit.ExitWorld),
+		WorldEnter: stubWorldEnter{},
 		Tick:       func() uint32 { return testTick },
 		Next:       next,
 		Observer:   observer,

@@ -57,9 +57,15 @@ type EngineDeps struct {
 // has exactly one writer. There are no per-cell goroutines, no
 // cell/entity locks, and no worker pools.
 //
-// Ownership: Step and Run own mutable sim execution. Do NOT call Step
-// concurrently with Run; later intent queues will submit work to the
-// sim owner instead of adding synchronization here.
+// Ownership: Step and Run own mutable sim execution. AddEntity,
+// RemoveEntity, and SubmitMove are owner-local synchronous
+// primitives: safe only when the caller owns simulation execution
+// (inside Run/Step on the owner goroutine, or in tests driving Step
+// directly) and MUST NOT run concurrently with Engine.Run.
+// Concurrent gateway callers use EnqueueAddEntity,
+// EnqueueRemoveEntity, and EnqueueMove (spec §5.2.10), which route
+// through the bounded owner mailbox instead of adding
+// synchronization here.
 //
 // Construction via NewEngine is pure: it starts no goroutine and no
 // background ticker. The owner explicitly drives simulation with Run
@@ -76,6 +82,13 @@ type Engine struct {
 	anomaly   MovementObserver
 	tick      atomic.Uint32
 	registry  *registry
+	// ingress is the bounded owner-command mailbox (spec §5.2.10):
+	// exactly SimIngressCapacity slots, built once in NewEngine
+	// (never nil, never rebuilt). runState tracks Run ownership;
+	// it coordinates admission vs shutdown only and never guards
+	// entity state.
+	ingress  chan ingressCommand
+	runState ingressState
 }
 
 // NewEngine validates config/deps and builds a tick-0 engine with an
@@ -108,6 +121,7 @@ func NewEngine(cfg EngineConfig, deps EngineDeps) (*Engine, error) {
 		movement:  deps.Movement,
 		anomaly:   deps.Anomaly,
 		registry:  newRegistry(HistoryHorizonSeconds * cfg.TickHz),
+		ingress:   make(chan ingressCommand, SimIngressCapacity),
 	}, nil
 }
 
@@ -373,6 +387,9 @@ func (e *Engine) observe(a MovementAnomaly) {
 // sequence, position, yaw, queue content, or routing frontier change.
 // In particular a rejected future-tick intent does NOT consume its
 // InputSeq.
+//
+// Owner-local: call only from the sim owner goroutine (Run/Step) or
+// in Step-driven tests. Concurrent gateway callers use EnqueueMove.
 func (e *Engine) SubmitMove(id EntityID, intent MoveIntent) (MoveDisposition, error) {
 	if rec, ok := e.registry.migrations[id]; ok {
 		return e.submitMigrating(rec, intent)
@@ -434,18 +451,28 @@ func (e *Engine) submitMigrating(rec *migrationRecord, intent MoveIntent) (MoveD
 // catch-up ticks are ever executed from elapsed wall time, so an
 // overloaded process falls behind wall time instead of spiraling.
 //
+// Run makes the calling goroutine the single sim owner (spec
+// §5.2.10): a second concurrent Run reports ErrEngineAlreadyRunning.
+// While owned, the loop also executes admitted ingress commands one
+// at a time on this same goroutine, but a ready tick always wins
+// before another queued command (no command backlog starves ticks).
+// On exit Run marks the engine non-running and fails every
+// queued-but-not-executed command with ErrEngineStopped; a later
+// sequential Run may become owner of the emptied mailbox.
+//
 // Run creates exactly one ticker, stops it on exit, and returns when
 // ctx is cancelled (returning nil). Cancellation executes no extra
 // final tick and performs no persistence/shutdown work.
 func (e *Engine) Run(ctx context.Context) error {
+	if err := e.runState.claimRun(); err != nil {
+		return err
+	}
+	defer e.releaseRun()
 	ticker := e.clock.NewTicker(e.tickDur)
 	defer ticker.Stop()
 	for {
-		select {
-		case <-ctx.Done():
+		if e.runIngressStep(ctx, ticker) {
 			return nil
-		case <-ticker.C():
-			e.Step()
 		}
 	}
 }
@@ -453,6 +480,10 @@ func (e *Engine) Run(ctx context.Context) error {
 // AddEntity inserts a skeleton entity (see registry.AddEntity) and
 // samples VolumeFlagsAt at the initial position (spec §5.3.6). History
 // remains initially empty.
+//
+// Owner-local: call only from the sim owner goroutine (Run/Step) or
+// in Step-driven tests. Concurrent gateway callers use
+// EnqueueAddEntity.
 func (e *Engine) AddEntity(pos world.Vec3) (EntitySnapshot, error) {
 	snap, err := e.registry.AddEntity(pos)
 	if err != nil {
@@ -467,6 +498,10 @@ func (e *Engine) AddEntity(pos world.Vec3) (EntitySnapshot, error) {
 }
 
 // RemoveEntity deletes an entity and discards its history.
+//
+// Owner-local: call only from the sim owner goroutine (Run/Step) or
+// in Step-driven tests. Concurrent gateway callers use
+// EnqueueRemoveEntity.
 func (e *Engine) RemoveEntity(id EntityID) error {
 	return e.registry.RemoveEntity(id)
 }
