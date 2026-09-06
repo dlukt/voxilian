@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.20 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.21 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -2692,6 +2692,304 @@ closed by disconnecting/resyncing the affected sessions rather than
 dropping the event or stalling the simulation. Unbounded queues are a
 spec violation.
 
+### 7.2 Presence, AOI subscriptions, handles, and inbound limits
+(frozen, v0.3.21)
+
+This section freezes the gateway-owned ephemeral world-session core
+(M4-T5a). It is transport-independent infrastructure: registry/index
+primitives only. Real gateway↔sim runtime integration (movement
+ingress, Ping/Pong scheduling, 204/205/206 fanout, lifecycle hooks)
+belongs to M4-T5b, which composes these primitives without
+reimplementing them.
+
+#### 7.2.1 Gateway ownership boundary
+
+Sessions, presence, visibility handles, AOI subscriptions, heartbeat
+state, and inbound rate limits are gateway-owned ephemeral state. The
+sim owns `EntityID`, authoritative positions/cells, and
+movement/gameplay rules. The gateway owns `SessionID`,
+`CharacterID ↔ active world session` binding, session-local
+`NetEntityID`, which cells each session subscribes to, which entities
+each client currently knows, rate-limit state, heartbeat state, and
+wire fanout. The gateway MUST NOT implement movement/gameplay rules.
+
+#### 7.2.2 Presence vs session registry
+
+The existing `session.Registry` remains authoritative for session
+lifecycle, connection, sub/account/character binding, and `IN_WORLD`
+state. Presence does NOT duplicate `session.Connection`, `TokenExp`,
+auth state, or account state. Although older §7 prose describes
+presence as `charID → {conn, currentCells, heartbeatAt}`, the
+implementation-normalized shape is frozen as
+`charID → {sessionID, entityID, AOI cells, heartbeatAt, visibility,
+rate state}`. Connection lookup remains through `session.Registry`;
+there is no torn duplicate connection ownership.
+
+#### 7.2.3 Presence epoch
+
+A presence record exists only for one active world-presence epoch.
+Conceptually:
+
+```go
+type PresenceSnapshot struct {
+    SessionID   session.ID
+    CharacterID int64
+    EntityID    sim.EntityID
+    CenterCell  world.CellCoord
+    Cells       []world.CellCoord
+    HeartbeatAt time.Time
+    OwnNetID    NetEntityID
+}
+```
+
+Exact Go names may differ. Snapshots are immutable copies: mutating a
+returned slice MUST NOT mutate registry state, and no API returns a
+mutable internal map, slice backing array, handle-table pointer, or
+token-bucket pointer.
+
+#### 7.2.4 Activation identity and atomicity
+
+Activation requires `SessionID != 0`, `CharacterID > 0`,
+`EntityID != 0`, and a valid center `CellCoord`. Malformed identity is
+rejected before mutation with stable `errors.Is`-compatible errors.
+While active, at most one presence exists per `SessionID`, per
+`CharacterID`, and per controlled `sim.EntityID`; the three indexes
+are maintained atomically under one registry lock. A conflict is an
+error with zero partial mutation — the registry MUST NOT silently
+replace another presence. M4-T5b owns lifecycle/takeover ordering
+before activation. `Activate` is only the ephemeral registry
+primitive: it does NOT change `session.Registry` state, add a sim
+entity, load PG, send a baseline, send `world_ready`, or write a
+WebSocket.
+
+#### 7.2.5 Deactivation
+
+`Deactivate(sessionID)` atomically removes the session, character,
+and controlled-`EntityID` index entries, all AOI subscriptions, all
+session-local visibility mappings, heartbeat state, and rate-limit
+state. It returns/copies enough prior state for tests or later
+cleanup if useful. Unknown sessions report a stable
+`ErrPresenceNotFound` (frozen choice: explicit not-found, never a
+silent divergent no-op in one path and an error in another). No
+partially retained subscriber entries may survive.
+
+A new world-presence epoch gets a fresh `NetEntityID` namespace and
+fresh rate-limit buckets: handles from an old/disconnected/replaced
+session NEVER carry into the new session, and rate state is never
+persisted across reconnect/restart (accepted MVP ephemeral-state
+tradeoff).
+
+#### 7.2.6 Base AOI rule
+
+The §4 MVP AOI is frozen as `CellSizeMeters = 32`,
+`DefaultAOIRadiusMeters = 96`, cell radius 3. The T5a base AOI is the
+Chebyshev 3-cell neighborhood around the center cell
+(`dx = -3..+3`, `dz = -3..+3`): exactly 7×7 = 49 cells. This matches
+the existing "3-cell radius" language. `INTERIOR` volumes, portal AOI
+remaps, classic/procedural world sources, and terrain visibility are
+NOT implemented here (M10 owns those); T5b/M10 may later provide an
+AOI policy override while preserving the same subscription-registry
+API, for which the exact-49 base policy keeps portal/remap
+composition possible.
+
+All returned AOI cell slices use canonical ordering (`CellCoord.X`
+ascending, then `CellCoord.Z` ascending — never Go map order). For
+center `{0,0}`: first `{-3,-3}`, last `{3,3}`, length 49. Negative
+coordinates behave identically. A center within 3 cells of
+`math.MaxInt32`/`math.MinInt32` cannot represent the full AOI: the
+registry MUST NOT wrap coordinates and MUST return a stable
+`ErrAOICellRange` (or equivalent) from activation/update with zero
+registry mutation, even though real world coordinates should never
+approach it.
+
+#### 7.2.7 Subscriptions and deltas
+
+The registry maintains both directions atomically:
+`session → subscribed cells` and `cell → subscribed session IDs`,
+with no duplicate membership. Conceptually:
+
+```go
+UpdateCenter(sid session.ID, center world.CellCoord) (SubscriptionDelta, error)
+
+type SubscriptionDelta struct {
+    Entered []world.CellCoord
+    Exited  []world.CellCoord
+}
+```
+
+The session's full new cell set is the 49-cell base AOI around
+`center`. When the center does not change, both lists are empty and
+the reverse index is untouched (no churn). Churn reference points
+(mandatory tests): `{0,0} → {1,0}` yields exactly 7 entered / 7
+exited (42 overlap); `{0,0} → {1,1}` yields exactly 13 entered / 13
+exited (36 overlap); a sufficiently distant jump yields 49 entered /
+49 exited. `Entered` and `Exited` are individually canonical
+(X ascending, Z ascending).
+
+`Subscribers(cell)` (or equivalent) returns unique live presence
+session IDs sorted numerically ascending, as a copy: no mutable
+subscriber map escapes, and mutation of the result cannot affect the
+registry.
+
+#### 7.2.8 Session-local NetEntityID handles
+
+The gateway owns:
+
+```go
+type NetEntityID uint32
+```
+
+with `0` invalid/reserved. Handles are session-local only, never
+persisted, never equal-by-definition to `sim.EntityID`, and never
+obtained by `uint32(simEntityID)` truncation. Protocol codecs continue
+to use raw `uint32`; T5b converts `NetEntityID` to `uint32` only at
+the wire boundary. At presence activation the controlled
+`sim.EntityID` is bound immediately to `NetEntityID(1)`, pinned for
+the lifetime of that presence epoch (AOI churn never removes it).
+Subsequent visible entities receive 2, 3, 4, … per session,
+monotonically, with no reuse during one presence/session lifetime:
+when a non-owned entity leaves visibility its forward and reverse
+mappings are removed but its numeric handle is retired forever, so a
+later re-entry allocates a NEW larger handle. This prevents a delayed
+old packet from aliasing a new visibility epoch.
+
+`MaxUint32` MAY be allocated once; the next required allocation
+returns a stable `ErrNetEntityIDExhausted` (or equivalent) — never
+wrap to 0, never reuse. T5b fails/resyncs the affected session rather
+than inventing an alias.
+
+Conceptually:
+
+```go
+EnsureVisible(sid session.ID, entity sim.EntityID) (net NetEntityID, created bool, err error)
+HideVisible(sid session.ID, entity sim.EntityID) (NetEntityID, bool, error)
+ResolveHandle(sid session.ID, net NetEntityID) (sim.EntityID, bool/error)
+```
+
+Rules: already-visible → same handle, `created=false`; new →
+fresh handle, `created=true`; unknown presence or invalid `EntityID`
+→ error. Hiding a visible non-owned entity removes the mapping and
+returns the retired handle; an absent entity is a no-op/not-visible
+disposition (frozen clear semantics, no partial mutation). Hiding the
+session's own controlled `EntityID` while presence is active is a
+stable `ErrOwnEntityVisibility` (or equivalent); the own mapping
+disappears only on full `Deactivate`. `ResolveHandle` maps `0` to
+invalid, currently-visible handles to their entity, and
+retired/stale handles or other sessions' handles to not-found — the
+future target-handle gate for opcodes such as attack/use/trade (T5b
+maps stale client handles to `202 invalid_handle`; T5a has no wire
+use). The SAME sim `EntityID` visible to two sessions normally maps
+to different handles per session (mandatory test): there is no global
+wire entity ID. The handle table is the authoritative list of
+entities the client may currently address; T5b MUST NOT resolve
+target handles through a global cast/index bypassing it.
+
+Incremental visibility ordering for T5b: on becoming visible,
+allocate the handle, then `204 create` comes before any later `205`
+for that visibility epoch; on visibility end, `206 remove` uses the
+still-known old handle, then the mapping is retired. T5a sends none
+of 203/204/205/206 and owns the API shape that makes this ordering
+possible: `203 cell_snapshot` remains the M3/M10 baseline/full-cell
+snapshot, `204 entity_create` is incremental entry into a live
+session's visibility, `205 entity_move` is authoritative movement for
+an already-visible entity, `206 entity_remove` ends visibility and
+invalidates the handle. T5a does NOT invent entity-presentation
+metadata (`204 EntityEntry` kind/proto/position/angle/speed
+registries remain with the real entity-presentation/world layer).
+
+#### 7.2.9 Per-character inbound rate limits
+
+The frozen Store/config-independent gateway policy is:
+
+```go
+type RateLimitPolicy struct {
+    MovePerSec   int
+    IntentPerSec int
+}
+```
+
+Production T5b derives it from the existing
+`config.RateLimits.MovePerSec`/`IntentPerSec` (defaults 10/10, env
+`VOX_RATE_MOVE_PER_SEC`/`VOX_RATE_INTENT_PER_SEC`); T5a adds no new
+config field and imports no config package. Policy validation:
+`MovePerSec > 0` and `IntentPerSec > 0` (no new upper bound — config
+defines none). Each active presence owns exactly two independent
+token buckets (movement; general gameplay-intent): a movement flood
+never consumes intent budget and vice versa. For rate R, capacity is
+R tokens and buckets start full, so the maximum immediate burst is
+one second of configured traffic. Refill is continuous at R
+tokens/second up to capacity, computed lazily from an explicitly
+supplied `time.Time now` (no goroutine/ticker; fractional refill held
+internally; tests stay deterministic). One accepted request consumes
+exactly 1 token; below 1 token the request is denied without going
+negative and without disconnect (T5b maps denial to
+`202 error{rate_limited}`).
+
+Reference behavior at `MovePerSec = 10`: at T0 ten immediate moves
+are allowed and the 11th denied; at T0+100 ms exactly one token has
+refilled so one request is allowed and the immediate next denied
+(mandatory test). If `now` precedes the bucket's previous timestamp,
+elapsed is 0: no tokens are minted and the internal timestamp never
+moves backwards. Frozen opcode ownership for T5b wiring: `102 move`
+charges the movement bucket; `103..120` gameplay intents charge the
+general intent bucket; `100/101` auth, `121..124`
+character/lifecycle, `125` ACK, and `126` leave_world are NOT charged,
+so rate limiting can never block reauthentication, leaving the world,
+or ACK flow. Rate denial precedes downstream gameplay: denied → `202
+rate_limited` with no sim/gameplay handler invocation (T5a supplies
+only the decision primitive). Migration-queue saturation stays
+separate: bucket deny → later `202 rate_limited`, while
+`sim.ErrMigrationQueueFull` → later `202 retry`; ordinary `MIGRATING`
+state is never `retry`.
+
+#### 7.2.10 Heartbeat core
+
+Presence stores `HeartbeatAt time.Time`, with the initial value
+supplied at activation; T5a runs no heartbeat goroutine. Frozen
+runtime constants (§7 preserved): WebSocket Ping/Pong cadence 15 s,
+dead-presence sweep 30 s; the core timeout constant is
+`PresenceHeartbeatTimeout = 30 * time.Second` (T5b wires scheduling).
+`TouchHeartbeat(sid, now)` advances only when `now` is strictly after
+the current value — equal/older timestamps are no-ops, so a regressed
+clock never moves heartbeat backwards. `StaleSessions(now)` reports
+presences with `now >= HeartbeatAt + 30s` (boundary inclusive; `now <
+HeartbeatAt` is never stale), returning session IDs sorted ascending
+as a copy. The query performs no teardown and deletes nothing — T5b
+owns close/delete. Heartbeat is transport liveness only: it advances
+no sim tick, extends no auth token (the M3 90 s authorization
+deadline stays independent), and touches no rate, AOI, or gameplay
+state.
+
+#### 7.2.11 Concurrency and determinism
+
+Unlike sim entity mutation, the registry MAY be touched concurrently
+by WebSocket read handlers, the future heartbeat runtime, the future
+AOI fanout, and disconnect cleanup, so it MUST be race-safe (a single
+short mutex/RWMutex over metadata is appropriate). The lock MUST NOT
+be held over socket writes, sim calls, PG calls, sleeps, or external
+callbacks (T5a performs none of those anyway). Every public
+collection derived from maps MUST be sorted (AOI cells, entered,
+exited, subscriber IDs, stale IDs, visible-handle snapshots if
+exposed) — no map-order flakes.
+
+#### 7.2.12 T5a non-scope (binding)
+
+T5a adds no Redis/NATS/Kafka/gRPC/protobuf; the single-process
+in-memory design stands. T5a builds registry/index primitives only:
+no sim→gateway fanout channel, no `Engine.Run`/`SubmitMove`
+ownership change (no broad Engine mutex shortcut), no
+`sim.MovementSink`/`gateway.OutboundProducer`/`TryState` wiring, no
+WebSocket changes (`server.go`, `outbound.go` unchanged; no Ping/Pong
+runtime, no handler-chain change), no protocol changes
+(`internal/proto` and `testdata/protocol` unchanged; no new
+fields/opcodes/`msg_version`), no `session.Registry`/`session.entry`/
+`session.Snapshot` mutation (linked by `session.ID` only), no
+`store`/`persist`/migration/query changes, no sim production changes
+(may import `sim.EntityID`, `world.CellCoord`, `session.ID` only),
+no config changes, no new Prometheus series, and no new third-party
+dependencies (`go.mod`/`go.sum` unchanged). T5a sends no 204/205/206
+and implements no 102 handler, no 202 mapping, and no gameplay.
+
 ## 8. PostgreSQL schema (authoritative; migrations via goose, queries via sqlc)
 
 Tables (D4; M59 property names in parens where ported):
@@ -3681,6 +3979,13 @@ pgx/generated sqlc; tests may use pgx/raw SQL for fixtures only.
    survives it.
 
 ## 14. Version history
+
+- v0.3.21: freeze M4 ephemeral presence/AOI core — gateway-owned
+  active-presence epochs, exact 3-cell/49-cell base subscriptions,
+  reverse subscriber index, session-local monotonic non-reused
+  NetEntityIDs, visibility lifecycle/stale-handle protection,
+  per-character active-presence token buckets, and monotonic heartbeat
+  state; split M4-T5 into core T5a and runtime integration T5b.
 
 - v0.3.20: freeze saver persistence composition — Store-independent
   T4a jobs bind through internal/persist to existing character/item/bank CAS

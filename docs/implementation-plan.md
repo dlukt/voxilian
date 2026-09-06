@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.4)
+# Voxilian Backend — Implementation Plan (v1.5)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.20).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.21).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -120,7 +120,24 @@ Exit: 20 Hz tick loop, cells, server-authoritative movement with reconciliation 
   ambiguous-commit convergence, and context-bounded shutdown-flush tests.
   No gameplay/AOI/runtime wiring.
   Spec: §5.6, §8.1, §8.3, §10.
-- [ ] **M4-T5** AOI + presence + inbound limits: cell enter/exit subscriptions, `204/205/206` fanout to subscribers, presence registry updates, per-character inbound token buckets (movement/intent caps). Subscription-churn tests. Spec: §4, §7.
+- [ ] **M4-T5a** AOI/presence/handle/rate-limit core:
+  gateway-owned active presence registry; exact 96 m / 3-cell
+  Chebyshev subscriptions with reverse cell index; session-local
+  monotonic non-reused NetEntityIDs and visibility resolution;
+  per-character active-presence movement/general token buckets; and
+  heartbeat timestamp/stale-sweep primitives. Deterministic churn,
+  stale-handle, rate, property, and concurrency tests. No WebSocket,
+  sim-ingress, protocol fanout, or runtime lifecycle wiring.
+  Spec: §4, §7, §7.2.
+- [ ] **M4-T5b** Gateway↔sim runtime integration:
+  serialize real 102 movement ingress through the sim owner; config
+  token-bucket enforcement and 202 mappings; enter/leave/takeover
+  presence lifecycle; WS Ping/Pong + stale sweep; sim MovementSink
+  into AOI-filtered 204/205/206 fanout using session-local NetEntityIDs,
+  TryCritical/TryState backpressure, own-character reconciliation
+  anchors, and real WebSocket subscription-churn tests.
+  No M5 gameplay.
+  Spec: §4, §5.3–§5.4, §6.3, §7, §7.1, §7.2.
 - [ ] **M4 exit criteria met** (movement + handoff race tests green; saver property tests green).
 
 ## M5 — Combat + vitals + death
@@ -231,7 +248,9 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M3-T4b | M3-T4a | `backend/voxilian/internal/{gateway,session}` |
 | M3-T5a | M3-T4b | `backend/voxilian/internal/{gateway,config}` |
 | M3-T5b | M3-T5a | `backend/voxilian/internal/{gateway,session,observe}` |
-| M4-T1, T2, T5 | M2-T3a/b, M3-T1 | `backend/voxilian/internal/sim` |
+| M4-T1, T2 | M2-T3a/b, M3-T1 | `backend/voxilian/internal/sim` |
+| M4-T5a | M2-T3a/b, M3-T1 | `backend/voxilian/internal/gateway` |
+| M4-T5b | M4-T5a | `backend/voxilian/internal/gateway` + `backend/voxilian/internal/sim` |
 | M4-T3a…c, T4a, T4b | M1-T7a…c (CAS), M3-T1 | `backend/voxilian/internal/sim`, `internal/store` |
 | M5-T1…T6 | M4-T1, M4-T2 | `backend/voxilian/internal/sim` (combat/vitals/intents) |
 | M6-T1…T3 | M5-T1…T5 | `backend/voxilian/internal/sim` (progression) |
@@ -251,7 +270,7 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | Opcode(s) | Owner task | Notes |
 |---|---|---|
 | 100/101 hello/reauth | M3-T2 (+M11-T2 hardening) | auth plane |
-| 102 move | M4-T2 | M4-T2 owns authoritative move semantics; M4-T5 wires decoded gateway intents into sim and fans 205 updates to session-local NetEntityIDs/AOI |
+| 102 move | M4-T2 | M4-T2 owns authoritative move semantics; M4-T5b owns decoded transport ingress/serialization and AOI fanout; it does NOT reimplement movement rules. |
 | 103/104 attack/cast | M5-T1…T3 | combat plane |
 | 105 use, 115 rest, 116 eat, 119 safety, 117/118 chat | M5-T6 | personal intents |
 | 106/107/108/109 get/drop/put/give | M7-T4 | world items |
@@ -264,6 +283,11 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 
 ## Plan history
 
+- v1.5: split oversized M4-T5 into AOI/presence core T5a
+  (gateway-owned registry, 49-cell subscriptions, session-local
+  NetEntityIDs, token buckets, heartbeat primitives; no runtime
+  wiring) plus gateway↔sim integration T5b (ingress, fanout,
+  lifecycle, Ping/Pong); freeze semantics in spec §7.2 (+spec v0.3.21).
 - v1.4: freeze T4b persistence semantics in spec §8.3.11–16 (+§5.6.9
   RequireReload): internal/persist composition boundary, deep-copy job
   adapters, dual-sentinel stale mapping, T3c forced-reload bridge,
