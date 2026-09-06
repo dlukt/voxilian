@@ -631,7 +631,6 @@ func (m *fpModel) pickActive(r *rand.Rand) *fpSession {
 	return pool[r.Intn(len(pool))]
 }
 
-
 func itoa(v int) string {
 	if v == 0 {
 		return "0"
