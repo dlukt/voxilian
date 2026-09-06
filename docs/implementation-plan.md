@@ -120,7 +120,7 @@ Exit: 20 Hz tick loop, cells, server-authoritative movement with reconciliation 
   ambiguous-commit convergence, and context-bounded shutdown-flush tests.
   No gameplay/AOI/runtime wiring.
   Spec: §5.6, §8.1, §8.3, §10.
-- [ ] **M4-T5a** AOI/presence/handle/rate-limit core:
+- [x] **M4-T5a** AOI/presence/handle/rate-limit core:
   gateway-owned active presence registry; exact 96 m / 3-cell
   Chebyshev subscriptions with reverse cell index; session-local
   monotonic non-reused NetEntityIDs and visibility resolution;
