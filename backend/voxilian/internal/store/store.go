@@ -23,6 +23,7 @@ type Store interface {
 	SoftDeleteCharacter(ctx context.Context, id, expectedRevision int64) (int64, error)
 	SaveItemSnapshot(ctx context.Context, snap ItemSnapshot) (int64, error)
 	SaveBankBalance(ctx context.Context, snap BankSnapshot) (int64, error)
+	LoadBankBalance(ctx context.Context, characterID int64, system string) (BankSnapshot, error)
 	UpsertCatalogBatch(ctx context.Context, batch CatalogBatch, allowDowngrade bool) error
 	LoadCatalogRegistry(ctx context.Context) (*CatalogRegistry, error)
 	EnsureAccount(ctx context.Context, keycloakSub string, email *string) (int64, error)
@@ -254,6 +255,27 @@ func (s *PGStore) SaveBankBalance(ctx context.Context, snap BankSnapshot) (int64
 		return 0, fmt.Errorf("store: save bank balance: %w", err)
 	}
 	return newRev, nil
+}
+
+// LoadBankBalance reads one bank root's materialized balance and
+// persisted revision for post-commit reconciliation reloads
+// (spec §5.6.8). The returned ExpectedRevision IS the persisted
+// banks.revision, making the snapshot immediately CAS-ready. No
+// write, no auto-create: a missing row is an error wrapping the
+// existing pgx.ErrNoRows missing-row convention (never a
+// zero-valued fake snapshot, never a stale-revision count).
+func (s *PGStore) LoadBankBalance(ctx context.Context, characterID int64, system string) (BankSnapshot, error) {
+	row, err := gen.New(s.pool).GetBank(ctx, gen.GetBankParams{CharacterID: characterID, System: system})
+	if err != nil {
+		return BankSnapshot{}, fmt.Errorf("store: load bank balance character=%d system=%q: %w",
+			characterID, system, err)
+	}
+	return BankSnapshot{
+		CharacterID:      row.CharacterID,
+		System:           row.System,
+		ExpectedRevision: row.Revision,
+		Balance:          row.Balance,
+	}, nil
 }
 
 // UpsertCatalogBatch applies a version-ruled batch atomically (see
