@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.17 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.18 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -1356,6 +1356,331 @@ engine RNG), no sleeps, no busy waits, no goroutines. Two
 generators with the same worker and the same explicit time
 script produce byte-for-byte identical ID sequences; a different
 worker produces different IDs.
+
+### 5.6 Post-commit durable reconciliation (frozen, v0.3.18)
+
+This section freezes M4-T3c post-commit reconciliation: the
+fencing that marks in-memory aggregates stale after their PG
+transaction commits but before their in-memory commit
+notifications are confirmed, the persisted-revision tracking
+that detects dropped notifications, and the mandatory staged
+PG reload before the aggregate's next mutation.
+
+M4-T3c owns ONLY: post-PG-commit reconciliation fencing,
+per-in-memory-aggregate persisted revision tracking,
+commit-notification application ordering, dropped-notification
+detection state, mandatory PG reload before the next mutation,
+reload failure behavior, revision-gap handling, integration with
+T3b same-OpID delivery semantics, the synthetic unit proof, and
+the real PG18 reconciliation proof.
+
+M4-T3c does NOT own: real trade, give, bank gameplay,
+inventory transfer gameplay, combat, death, new persistence
+schema, the snapshot saver, dirty queues, periodic saves,
+gateway, AOI, presence, rate limits, wire messages, background
+retry, or an external bus. Ownership remains: M4-T4 → snapshot
+saver / periodic persistence; M4-T5 → gateway/AOI/runtime
+ingress; M8 → real trade/bank/vault gameplay transactions.
+
+#### 5.6.1 PG remains authoritative
+
+D7 / §8.1 stand sharpened: PG materialized state is the
+recovery source of truth; the ledger is audit only.
+Post-commit reconciliation MUST reload materialized aggregate
+rows from PG, and MUST NOT replay ledger rows, replay old
+operation notifications as an event log, guess the missing
+mutation, or reverse the PG commit.
+
+A critical operation executes validate, then a PG transaction
+commit, then in-memory commit notification delivery — and step
+2 and step 3 cannot be one atomic distributed operation. A PG
+commit success combined with a missing/dropped/failed
+notification must therefore leave an explicit in-memory
+condition saying the aggregate may be stale relative to PG, and
+the owning sim state MUST NOT accept another mutation for that
+aggregate until it has reconciled. There is no
+PG-transaction-plus-in-memory-notification pseudo-transaction:
+the PG transaction is never held open while waiting for a cell
+callback, channel delivery, or future acknowledgement. Correct
+recovery is commit PG, mark the reconciliation requirement,
+attempt notifications, and reload PG when required.
+
+#### 5.6.2 Reconciliation state
+
+The sim-domain reconciliation state is small and reusable,
+conceptually:
+
+```go
+type ReconcileState struct {
+    knownRevision    int64
+    pending          bool
+    requiredRevision int64
+}
+```
+
+Exact field visibility/names may differ. It is single-writer,
+in-memory, and ephemeral: not persisted, not a ledger, and not
+an OpID cache. No mutex is required; it is not arbitrarily
+concurrent-safe.
+
+`knownRevision` means the persisted aggregate revision that the
+current in-memory aggregate contents are known to represent. It
+is NOT the ownership generation, `EntityID`, `OpID`, tick, or
+`inputSeq` — those domains remain completely separate and are
+never compared against persisted revisions. Persisted root
+revisions are `int64 >= 0` (newly persisted rows normally start
+at `0`); a negative reconciliation revision is invalid and
+returns a stable internal error, with no unsigned cast.
+
+When a durable aggregate is initially loaded from PG, the
+in-memory contents equal the loaded materialized snapshot with
+`knownRevision` set to the persisted revision and `pending`
+false. A known persisted aggregate revision is never
+initialized to zero unless PG actually says zero, preserving
+§8.1 restart semantics.
+
+#### 5.6.3 Commit identity and fencing order
+
+A successful critical PG transaction returns or otherwise makes
+known the NEW persisted revision for every mutated aggregate
+root — conceptually participant A → revision RA, participant B
+→ revision RB, and so on. Different roots may carry different
+revision numbers; no transaction-wide revision is assumed. The
+durable multi-owner operation reuses the SAME T3b `OpID` for
+its in-memory commit notifications: T3c invents no `CommitID`,
+`TransactionID`, or `NotificationID` competing idempotence
+domain. T3b `OpID` remains the operation identity; the
+persisted root revision remains the recovery/version domain.
+
+After the PG transaction successfully COMMITs, the fencing
+order is binding: FIRST mark every affected live in-memory
+aggregate as requiring at least its newly committed revision,
+and ONLY AFTER ALL participant fences are installed attempt
+any in-memory commit notifications. Notifying A before fencing
+B is forbidden, because an intervening B mutation could observe
+stale state. Under the current single sim writer, fencing all
+participants is one deterministic synchronous phase. If the PG
+transaction fails validation, fails CAS, fails SQL, rolls
+back, or fails COMMIT, then there is NO reconciliation fence,
+NO commit notification, and NO in-memory committed-state
+update — the old in-memory state remains authoritative because
+PG did not advance. If the entire process crashes after PG
+commit but before the fence installs, restart recovery loads
+PG materialized state and the stale-memory problem disappears
+with the process; a surviving coordinator MUST fence
+synchronously before returning control to gameplay. No outbox
+is introduced for this MVP case.
+
+The mark primitive, conceptually `MarkCommitted(revision
+int64) error`, obeys: revision < 0 is an invalid-revision
+error with zero mutation; revision <= knownRevision needs no
+reconciliation (stale/already-observed mark); revision >
+knownRevision sets `pending = true` with `requiredRevision =
+max(requiredRevision, revision)`, so several committed
+revisions marked before reload never lower the requirement
+(known 5, then marks 6 and 7, leaves pending with required 7).
+Marking changes reconciliation metadata only: no gameplay
+fields, no in-memory persisted revision, no OpID dedupe, no
+delta, no history touch.
+
+#### 5.6.4 Commit notifications
+
+A commit notification carries generic revision metadata,
+conceptually:
+
+```go
+type DurableCommitNotice struct {
+    ID       OpID
+    Revision int64
+}
+```
+
+The actual gameplay payload is owned by the future real
+operation; T3c adds no production trade, inventory,
+bank-transfer, or damage payload. The notification ID is
+exactly the T3b operation's OpID: no replacement ID on
+redelivery, after route refresh, or after reload.
+
+Reconciliation does NOT replace T3b dedupe — the layers answer
+different questions. T3b: did this in-memory operation OpID
+already apply? T3c: does this in-memory durable aggregate
+reflect at least the persisted PG revision required after
+committed transactions? A bounded T3b recent-OpID hit does not
+prove an unrelated newer durable revision was loaded, and a
+durable revision does not replace OpID idempotence.
+
+A commit notification may be applied as an incremental
+in-memory update ONLY when `notice.Revision == knownRevision +
+1` — this ordering is binding. For known 5 with required >= 6
+and notice 6, the apply callback may execute, and only after
+successful apply does `knownRevision` become 6; the fence
+clears when `knownRevision >= requiredRevision`, otherwise it
+remains pending for the later required revision. When
+`notice.Revision <= knownRevision` the notice is a
+stale/already-applied no-op: the payload is not applied again
+(disposition at least `CommitNoticeApplied` /
+`CommitNoticeStale`; a revision gap remains an error requiring
+reload), with no state rollback — this covers especially a
+notification arriving late AFTER a PG reload already brought
+memory to that revision or beyond. When `notice.Revision >
+knownRevision + 1`, the missed intermediate state cannot be
+reconstructed incrementally: the apply callback is NOT
+invoked, `requiredRevision >= notice.Revision` is
+marked/retained, and a stable `ErrReconcileRequired` /
+revision-gap error returns; recovery is a complete
+materialized-PG reload, never replaying missing notifications.
+If the apply callback returns an error, `knownRevision` is
+unchanged, pending remains true, and `requiredRevision` stays
+at least `notice.Revision`; the notification OpID is not
+treated as successfully applied by any T3b apply-once wrapper,
+and the same notification may be retried. Like T3b's apply
+callback, a notification callback must leave the in-memory
+aggregate unmodified on error (validate first, then make an
+in-memory replacement/mutation that cannot subsequently fail);
+T3c rolls back no partially-mutating callback.
+
+#### 5.6.5 Mandatory reload before the next mutation
+
+While `pending == true` the owning aggregate MUST NOT accept a
+new mutating intent before successful PG reconciliation: the
+reload happens BEFORE validation whose correctness depends on
+aggregate state, BEFORE mutation, and BEFORE generating a new
+durable write based on that state. Mutating first and hoping
+CAS catches it later is forbidden; read-only inspection may
+still be served with the understanding it may be stale, but
+further authoritative mutation is prohibited. The mutation
+guard is a small operation, conceptually `EnsureReconciled(ctx,
+reload)`, called as reconcile-first-then-validate-then-mutate,
+with no hidden goroutine and no background polling (an optional
+`WithMutation` convenience wrapper may exist if it enforces
+the same order). While `pending == false` the guard performs
+ZERO PG reads — reconciliation reload is exceptional recovery
+only, never a per-mutation database read.
+
+Reloads use full materialized state: the root persisted
+revision, root gameplay state, and root-owned child state
+where applicable (for a future character aggregate that means
+character plus guarded children; the T3c PG proof
+intentionally uses the simpler existing bank root, which has
+no child rows). The reload callback MUST NOT reconstruct from
+the ledger; the ledger may be inspected for audit/debug but is
+never recovery input.
+
+A PG reload stages its candidate before touching memory,
+conceptually:
+
+```go
+type ReloadCandidate struct {
+    Revision int64
+    Apply    func() error
+}
+
+type ReloadFunc func(context.Context) (ReloadCandidate, error)
+```
+
+Exact names may differ. The loader reads PG into temporary
+values and returns the loaded revision plus an apply closure;
+reconciliation validates the revision BEFORE invoking
+`Apply`, so a stale load can never overwrite newer memory.
+Required before replacement: `candidate.Revision >=
+knownRevision`, `candidate.Revision >= requiredRevision`, and
+`candidate.Apply != nil`; otherwise `Apply` is not invoked. A
+loader revision below `requiredRevision` yields a stable
+`ErrReconcileRevisionBehind` with pending true and memory
+unchanged (guarding read-replica lag, buggy fake loaders, and
+stale reads). A loader revision below `knownRevision` yields a
+stable invariant/revision-regression error with no apply —
+in-memory persisted revision never moves backward. A PG load
+failure returns/wraps the reload error with pending true and
+no mutation invoked; the next mutation attempt may retry, with
+no local fallback mutation. A valid candidate whose `Apply`
+succeeds sets `knownRevision = candidate.Revision`, clears
+pending, and resets the required revision; a valid candidate
+whose `Apply` fails leaves everything unchanged and keeps the
+mutation blocked. PG is authoritative, so reload may leap
+forward: a fence requiring revision 6 with PG at revision 8
+correctly applies the complete revision-8 snapshot and clears
+the fence, never demanding an exact revision match.
+
+#### 5.6.6 Required ordering scenarios
+
+Sequential pending notifications need no reload: with known 5
+and fences 6 then 7, notice 6 applies (known 6, still pending
+required 7) and notice 7 applies (known 7, pending clears).
+A missing middle notice always gaps: with known 5 and
+required 7, notice 7 alone is a gap — payload not applied,
+reload required (mandatory test coverage). A late notice after
+reload is a no-op: commit revision 6, notice dropped, reload
+brings memory to revision 6, and the late revision-6 notice
+applies no second gameplay mutation (routed through T3b, the
+successful no-op may then become a seen OpID without changing
+durable contents). A notice older than a newer reload is
+likewise stale: required 6, reload obtains 8, late notice 6 is
+a no-op that never rolls revision 8 back to 6.
+
+#### 5.6.7 Cross-layer invariants
+
+Reconciliation metadata never enters the 256-entry T3b OpID
+ring: revisions and requirements live in `ReconcileState`,
+operations live in `recentOpIDs`. Within one live sim owner the
+T3b dedupe cache remains ephemeral and independent — reloading
+durable fields must not accidentally reset it. After a dropped
+notification T3c MAY remain pending until the next mutation;
+the guarantee is reload-before-next-mutation, never an
+immediate background reload: no reload goroutine, no polling.
+When sequential notifications all arrive and apply, memory
+advances and pending clears with no PG reload (the healthy
+fast path). If reconciliation needs PG and PG is unavailable,
+mutation stays blocked with pending intact — consistent with
+§10's no-local-critical-state-exception rule. Reconciliation
+state never appears in protocol/entity snapshot messages, and
+cell-handoff ownership generations never compare against
+persisted revisions: either domain may advance while the other
+does not. T3c attaches no fake durable aggregate to every sim
+entity, but any real durable aggregate owned by an
+entity/cell's reconciliation state MUST conceptually travel
+with its owner exactly like the aggregate state: a handoff
+clears neither pending reconciliation nor known/required
+persisted revisions.
+
+M4-T4 later owns periodic snapshot CAS; T3c establishes that
+after successful reconciliation `knownRevision` equals the
+actual PG revision, giving future saver/critical write code
+the correct CAS generation — without implementing dirty
+queues, snapshot intervals, write-through schedulers, or
+shutdown flushes. M8 real trade will later validate
+participants, ensure each is reconciled, commit ONE PG
+transaction, fence affected owners, and deliver same-OpID
+commit notifications; T3c provides that recovery mechanism
+without implementing trade validations now.
+
+#### 5.6.8 PG proof fixture
+
+The PostgreSQL integration proof uses the existing
+`banks(character_id, system, balance, revision)` root ONLY as
+a convenient already-existing revisioned aggregate — not new
+bank gameplay, trade semantics, or a money-transfer API, and
+no production synthetic bank transfer method is introduced.
+The bank root already carries balance, revision, CAS save
+semantics, and the existing `GetBank` sqlc query with no child
+rows, making it the smallest real §8.1 aggregate with which
+to prove that the PG committed revision is authoritative, a
+dropped memory notification is detected, and a reload precedes
+the next mutation. The store gains one explicit operation,
+conceptually `LoadBankBalance(ctx, characterID, system) →
+(BankSnapshot, error)`, implemented on `PGStore` with the
+existing `gen.GetBank` (no new SQL, no regenerated sqlc, no
+migration); the returned `ExpectedRevision` is the persisted
+`banks.revision`, making the snapshot immediately CAS-ready,
+with no write and no auto-create. A missing row is an error
+(wrapping the existing `pgx.ErrNoRows` missing-row
+convention): no fallback balance zero, no zero-valued fake
+snapshot treated as success. To prove multi-party ordering
+without implementing M8 trade, a STORE TEST ONLY may compose
+the existing private `saveBankBalance(...)` twice under one
+test-owned PG transaction (bank A CAS, bank B CAS, COMMIT);
+no production `TransferBanks` / `SyntheticTrade` /
+`CommitTwoBanks` API is exposed.
 
 ## 6. WebSocket protocol (binary, versioned — DECISION §13.8)
 
@@ -2838,6 +3163,12 @@ ledger is never replayed.
    survives it.
 
 ## 14. Version history
+
+- v0.3.18: freeze post-commit reconciliation — successful durable
+  transactions fence every affected in-memory aggregate before notification
+  delivery; sequential commit notices advance persisted revisions, while
+  dropped/failed/gapped notices require a staged full materialized-PG reload
+  before the next mutation. Ledger replay remains forbidden.
 
 - v0.3.17: freeze cross-cell operation infrastructure — opaque
   Snowflake-style OpIDs, explicit owner routing, same-ID retry semantics,
