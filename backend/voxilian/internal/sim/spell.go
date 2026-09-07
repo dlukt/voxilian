@@ -410,7 +410,8 @@ func PlanReagentPreflight(hasInventory, hasSubstitute bool) ReagentPlan {
 }
 
 // PostcastReady is the post-cast cooldown primitive in simulation
-// time (spec §9.3a.10, source IsOkayAttackTime): the first attempt
+// time (spec §9.3a.10, source IsOkayAttackTime): invalid timing input
+// is rejected regardless of attempt state; then the first attempt
 // (hasPriorAttempt == false) is always allowed; otherwise allowed iff
 // unsigned mod-2^32 (nowTick-lastAttemptTick) >=
 // postCastSeconds*tickHz. On an allowed attempt the caller arms
@@ -418,8 +419,11 @@ func PlanReagentPreflight(hasInventory, hasSubstitute bool) ReagentPlan {
 // stage (§9.3a.9: armed even if a later gate fails); rejected
 // too-early attempts MUST NOT re-arm. postCastSeconds 0 (valid) is
 // always allowed. tickHz MUST be 1..120; negative seconds or
-// interval overflow are ErrInvalidCastTiming. No goroutine/timer;
-// wrap-safe by unsigned arithmetic.
+// interval overflow are ErrInvalidCastTiming. A valid int64 interval
+// larger than MaxUint32 is NOT an error: the first attempt is still
+// allowed, while a prior attempt simply never reaches it (u32 elapsed
+// distance is always < 2^32). No goroutine/timer; wrap-safe by
+// unsigned arithmetic.
 func PostcastReady(hasPriorAttempt bool, lastAttemptTick, nowTick uint32, tickHz, postCastSeconds int) (bool, error) {
 	if tickHz < minTickHz || tickHz > maxTickHz {
 		return false, ErrInvalidTickHz
@@ -427,11 +431,11 @@ func PostcastReady(hasPriorAttempt bool, lastAttemptTick, nowTick uint32, tickHz
 	if postCastSeconds < 0 {
 		return false, ErrInvalidCastTiming
 	}
-	if !hasPriorAttempt {
-		return true, nil
-	}
 	if int64(postCastSeconds) > math.MaxInt64/int64(tickHz) {
 		return false, ErrInvalidCastTiming
+	}
+	if !hasPriorAttempt {
+		return true, nil
 	}
 	interval := int64(postCastSeconds) * int64(tickHz)
 	if interval > math.MaxUint32 {

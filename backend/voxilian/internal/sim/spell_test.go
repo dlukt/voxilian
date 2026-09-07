@@ -589,6 +589,31 @@ func TestPostcastReadyGolden(t *testing.T) {
 	}
 }
 
+func TestPostcastReadyValidationOrdering(t *testing.T) {
+	// Spec §9.3a.10: invalid timing input is rejected regardless of
+	// attempt state, so int64-overflow validation MUST precede the
+	// first-attempt fast path. A valid int64 interval larger than
+	// MaxUint32 is NOT an error: first attempt still allows, a prior
+	// attempt simply never reaches it.
+	// 1. First attempt + int64 overflow -> error (the missing regression).
+	if ready, err := PostcastReady(false, 0, 0, 20, math.MaxInt); !errors.Is(err, ErrInvalidCastTiming) || ready {
+		t.Fatalf("first+overflow = %v,%v, want false,ErrInvalidCastTiming", ready, err)
+	}
+	// 2. Prior attempt + int64 overflow -> error.
+	if ready, err := PostcastReady(true, 0, 0, 20, math.MaxInt); !errors.Is(err, ErrInvalidCastTiming) || ready {
+		t.Fatalf("prior+overflow = %v,%v, want false,ErrInvalidCastTiming", ready, err)
+	}
+	// math.MaxInt32*20 = 42949672940: valid in int64 but > MaxUint32.
+	// 3. First attempt + valid >u32 interval -> allowed.
+	if ready, err := PostcastReady(false, 7, 7, 20, math.MaxInt32); err != nil || !ready {
+		t.Fatalf("first+huge-valid = %v,%v, want true,nil", ready, err)
+	}
+	// 4. Prior attempt + same interval -> false, nil (u32 can never reach it).
+	if ready, err := PostcastReady(true, 7, math.MaxUint32, 20, math.MaxInt32); err != nil || ready {
+		t.Fatalf("prior+huge-valid = %v,%v, want false,nil", ready, err)
+	}
+}
+
 func TestTranceDurationGolden(t *testing.T) {
 	// (base*(150-power))/100, one truncation. Source GetTranceTime.
 	cases := []struct {
