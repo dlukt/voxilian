@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.26 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.27 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -5569,6 +5569,643 @@ input → same output; no helper mutates input slices; T2 production
 never calls `ApplyPlayerDamageCaps` (a test asserts the zero case
 stays zero through T2 alone).
 
+### 9.3 M5 spell combat: T3a generic core, T3b special archetypes, T7 runtime (frozen, v0.3.27)
+
+M5 spell work is split into three tasks with a hard pure/runtime
+boundary. Normative source for T3a: §9.3a. Research reference:
+`docs/meridian59.md` §3 (success formula), §4.3 (vigor gates), §5
+(spell bases), §7.5 (spell damage) — as corrected by the v0.3.27
+source audit; corrections are noted inline below. Vendored sources
+audited: `kod/object/passive/spell.kod` (`SuccessChance`,
+`SpellFailed`, `CanPayCosts`, `CanPayManaVigor`, `CanPayReagents`,
+`KarmaCheck`/`GetRequiredKarma`, `PayCosts`, `GetManaCost`,
+`GetTranceTime`, `BeginCastingTrance`, `DoubleCheckAfterTrance`,
+`TranceBroken`), `kod/object/passive/trance.kod`
+(`BeginCastingTrance`, `EndEnchantment`, `BreakTrance`),
+`kod/object/passive/spell/atakspel.kod` (generic `CastSpell`
+damage/scaling/ManaFocus),
+`kod/object/active/holder/nomoveon/battler/player/user.kod`
+(`UserCast` payment-before-trance order),
+`kod/object/active/holder/nomoveon/battler/player.kod`
+(`GetLevel` = `GetBaseMaxHealth`, `IsOkayAttackTime`,
+`HasVigor`, `AssessDamage` absolute path),
+`kod/object/item/passitem/spelitem.kod` and
+`kod/object/item/passitem/specwand/spelwand.kod` (item-cast paths),
+`kod/object/passive/spell/persench/touchatk.kod`,
+`kod/object/passive/spell/atakspel/illwound.kod`,
+`kod/object/passive/spell/atakspel/vampdrn.kod`,
+`kod/object/passive/spell/earthqua.kod`,
+`kod/object/passive/spell/walspell.kod`,
+`kod/object/active/wallelem.kod` (+ `wallfire.kod`,
+`wallltng.kod`) — the last paragraph is T3b-boundary reference
+only (§9.3b). `kod/include/blakston.khd`
+(`SPELLPOWER_MINIMUM = 1`, `SPELLPOWER_MAXIMUM = 99`). No GPL
+KOD/C text is copied: mechanics only are reimplemented. All spell
+integer division truncates toward zero (C semantics); every T3a
+operand at a truncation point is non-negative except the
+already-resolved signed Hinder delta, whose addition precedes the
+5..95 clamp so the clamped result is non-negative. Intermediate
+products use 64-bit widths.
+
+#### 9.3.0 Why T7 exists (architectural rationale, frozen)
+
+The live `sim.entity` deliberately does NOT yet contain HP,
+MaxHP, Mana, Vigor, spell/cast state, death state, or
+inventory/reagent state. M5-T4 owns the authoritative vitals
+model. Therefore M5-T3a/T3b MUST NOT create a temporary second
+vitals model, mutate HP/Mana/Vigor, implement gateway 103/104,
+or invent a parallel combat entity. T3a/T3b are pure/value
+mechanics; M5-T7 performs the runtime composition only after
+the required state exists (see §9.3c).
+
+#### 9.3a M5-T3a generic spell core (normative)
+
+T3a OWNS: spell-power domain validation; generic SuccessChance
+math; the d100 spell-success roll; the ReagentRing
+success-override contract (as an already-resolved boolean);
+generic AttackSpell damage scaling; the generic Mana Focus
+damage bonus; mana-cost arithmetic; spell exertion/vigor gate
+arithmetic; the resource-payment result plan (full vs failed);
+the reagent gate/substitute plan; karma required-value
+arithmetic and eligibility; the BaseMaxHP minimum gate; the
+post-cast cooldown primitive; cast/trance duration arithmetic;
+the cost-before-trance ordering contract; the
+trance-break/no-refund contract; item-cast generic behavior;
+the absolute/resistance policy value; deterministic RNG use;
+golden/property tests.
+
+T3a does NOT own (and MUST NOT implement): live HP/Mana/Vigor
+(M5-T4); HP damage application (M5-T7); death (M5-T5); actual
+reagent inventory (M7/M9, with a T7 seam); the actual
+ReagentRing item (later content/inventory); room rules
+(T7/world); target acquisition (T7); line-of-sight queries
+(T7/world); PK/safety legality (M5-T6/T7); Spellbane/Silence
+enchantments (later spell/content runtime); Jala Hinder
+implementation (phase 2 — T3a accepts only an
+already-resolved delta); Deflect runtime (later/T7
+composition); advancement (M6 — T3a exposes only a pure
+successful-cast hook flag); named spell catalog (M9);
+gateway opcode 104 (M5-T7); protocol changes (NONE);
+Store/PG (NONE).
+
+The live sim entity gains NO new fields in T3a (`entity.go`,
+`engine.go`, `ingress.go` untouched): no HP/BaseMaxHP/MaxHP/
+Mana/MaxMana/Vigor/Exertion/Stomach/TranceState/CastState.
+Every formula input that needs such numbers receives
+already-resolved immutable values, never live state.
+
+##### 9.3a.1 Spell-power domain
+
+Source `blakston.khd`: `SPELLPOWER_MINIMUM = 1`,
+`SPELLPOWER_MAXIMUM = 99`. The normal production path
+(`UserCast` → `GetSpellPower`) always returns clamped
+`bound(power, 1, 99)`; source handlers merely warn on 0 and
+proceed arithmetically, but that leniency is NOT reachable
+through normal casting and T3a MUST NOT reproduce it: T3a
+functions take spell power as an already-resolved immutable
+input valid in `1..99` only. Power `0`, negative power, and
+power `> 99` are deterministic domain errors
+(`ErrInvalidSpellPower`), never silent clamps. `SPELLPOWER_
+MAXIMUM` is frozen as the named divisor 99 in the damage
+pipeline (§9.3a.11 of this spec — the AttackSpell scaling
+section) — never 100.
+
+##### 9.3a.2 Generic spell SuccessChance
+
+Source `spell.kod SuccessChance` frozen exactly. Inputs are
+already-resolved values; T3a performs NO world queries:
+
+```text
+base = ((100 - requisiteStat) * spellPower) / 100 + requisiteStat
+chance = base + ResolvedHinderDelta
+chance = bound(chance, 5, 95)
+```
+
+- ONE truncation: `(100-stat)*power` first (64-bit
+  intermediate), `/100`, then `+ stat`, then `+
+  ResolvedHinderDelta`. `requisiteStat` is the already-resolved
+  division requisite (Mysticism/Stamina/Intellect by school);
+  negative requisite stats are domain errors
+  (`ErrInvalidCombatStat` reuse); spell power is §9.3a.1.
+- `ResolvedHinderDelta` is the already-resolved signed Jala/
+  Hinder alteration (source: same-school hinder subtracts
+  `random(sp/2, sp*2/3)` of the *hinder song's* power; the
+  Hinder implementation itself is phase 2). It applies BEFORE
+  the 5..95 bound (source order: Hinder, then clamp). Zero in
+  the MVP. No clamping of the delta itself.
+- Bound placement: exactly once, after Hinder, before the
+  no-LOS adjustment. Source `bound(num, 5, 95)`.
+- No-LOS single-Battler adjustment (§9.3a.3) applies AFTER the
+  bound. There is NO second clamp after it.
+- Success is source-exact: `d100 <= chance` over the existing
+  sim `RNG`/`RollD100` (no second RNG implementation). The
+  `ReagentRing` in-use override arrives as the already-resolved
+  boolean `ForceSuccess`: an ordinary failed roll with
+  `ForceSuccess == true` succeeds; with false it fails. No
+  ring lookup, no charges, no inventory in T3a. A
+  ForceSuccess-rescued cast resolves the FULL-success payment
+  path (§9.3a.7 of this spec — the payment section), not the
+  failed path.
+
+##### 9.3a.3 Exact no-LOS adjustment
+
+Source frozen exactly — NOT conventional distance falloff.
+Applies only when the already-resolved inputs state
+`SingleBattlerTarget == true AND HasLineOfSight == false`
+(source additionally requires `GetNumSpellTargets = 1`, first
+target is `Battler`, caster not immortal DM — all folded into
+these two booleans by the future runtime). `SquaredDistance`
+is the already-resolved integer squared distance (`>= 0`;
+negative is `ErrInvalidSquaredDistance`):
+
+```text
+distance = SquaredDistance / 4          (integer division)
+if distance > chance/2:    chance = chance/2
+else if distance < chance/2: chance = chance - distance
+(else equal: chance unchanged)
+```
+
+- Both comparisons are STRICT `>` / `<` against `chance/2`
+  (itself integer division). Equality leaves chance unchanged.
+- Effects only decrease-or-keep: halve (`chance/2`, integer
+  division) when far, subtract `distance` when near. The
+  result may fall below 5 (even to 0/negative) — source has
+  NO post-distance clamp and T3a MUST NOT add one.
+- `SquaredDistance` needs no validation beyond
+  non-negativity; division uses 64-bit intermediates.
+
+##### 9.3a.4 Mana cost
+
+Source `spell.kod GetManaCost` frozen exactly. `baseMana` is
+the already-resolved `viMana` (`>= 0`; negative is
+`ErrInvalidManaCost`):
+
+```text
+if baseMana == 0: return 0
+cost = baseMana
+if spellPower > 40: cost -= 1        (strict >, 40 gets nothing)
+if spellPower > 80: cost -= 1        (strict >, 80 gets nothing)
+cost -= ceil(cost * ManaReductionPercent / 100)
+return bound(cost, 1, $)
+```
+
+- `ManaReductionPercent` is the already-resolved scalar
+  equipment reduction (source: Princess Shield faction-rank
+  5–25%; T3a MUST NOT hard-code Princess Shield). Valid
+  `0..100`; outside is `ErrInvalidManaReduction`.
+- Exact rounding: `(cost*percent + 99)/100` integer division
+  = `ceil(cost*percent/100)` — any fractional reduction
+  rounds UP (costs the player). 64-bit intermediate.
+- Final nonzero cost is bounded to at least 1
+  (`bound(cost,1,$)`); the `baseMana == 0` path bypasses it
+  and returns 0 (source `DMSpell`-style zero-mana spells).
+- Mana availability (source `CanPayManaVigor` mana leg):
+  `currentMana >= cost` passes (equality passes; strict `<`
+  fails). Pure helper, immutable inputs.
+
+##### 9.3a.5 Karma requirement
+
+```text
+Qor:       required = -10 * spellLevel
+Shalille:  required = +10 * spellLevel
+other ordinary schools: required = 0
+```
+
+- `spellLevel` valid `1..6` (M59 spell levels); outside is
+  `ErrInvalidSpellLevel`. `school` is the typed T3a domain
+  `{SchoolQor, SchoolShalille, SchoolOther}` (callers map
+  Kraanan/Faren/Riija/Jala/DM to `SchoolOther`; DM immortal
+  bypass is runtime, not T3a); unknown values are
+  `ErrInvalidSpellSchool`. No spell IDs, no faction/quest
+  system.
+- Eligibility (source `KarmaCheck`, equality passes both
+  ways):
+
+```text
+required > 0:  casterKarma >= required  (fails only on strict <)
+required < 0:  casterKarma <= required  (fails only on strict >)
+required == 0: allowed
+```
+
+##### 9.3a.6 BaseMaxHP / piMinHitPoints gate
+
+CORRECTED from the research summary (verified in source):
+`CanPayCosts` gates `caster.GetLevel() < piMinHitPoints`, and
+Player `GetLevel()` returns `GetBaseMaxHealth` — i.e. the
+authoritative UNBUFFED BaseMaxHP, NOT current HP and NOT
+buffed MaxHP. T3a freezes the generic gate over immutable
+inputs:
+
+```text
+allow iff BaseMaxHP >= minimum     (equality passes; strict < denies)
+```
+
+`BaseMaxHP < 1` or `minimum < 0` is `ErrInvalidHitPointGate`.
+`minimum == 0` (source default `piMinHitPoints = 0`) always
+allows. Current HP MUST NOT appear in this function.
+
+##### 9.3a.7 Spell vigor/exertion gate and charges
+
+Source generic spell defaults: `vbCheck_Exertion = TRUE`,
+`viSpellExertion` in `0..100` (default 2); outside `0..100`
+is `ErrInvalidExertion`. All amounts are integer exertion;
+10000 exertion = 1 vigor (shared T1 domain, no float vigor,
+no live mutation):
+
+- Availability mirrors source `HasVigor` with the STRICT
+  threshold: `currentVigor > required` passes (equality
+  DENIES). When the already-resolved `checkEnabled == false`
+  (source `vbCheck_exertion = FALSE`), the gate is skipped
+  (proceeds, full charge on success). Negative vigor input
+  is `ErrInvalidExertion`.
+- Full successful-cast charge: `10000 * viSpellExertion`
+  (64-bit; default 20000 = 2 vigor).
+- Failed-cast charge (source `SpellFailed` "half exertion"):
+  `(10000 * viSpellExertion) / 2` with integer truncation.
+
+##### 9.3a.8 Preflight reagent contract
+
+T3a MUST NOT invent reagent item IDs. It represents an
+already-resolved preflight state:
+
+```text
+ReagentAvailable    (inventory has required reagents)
+ReagentSubstituted  (substitute/ReagentRing satisfies requirement)
+ReagentMissing      (neither)
+```
+
+Source timing frozen: a missing-inventory requirement
+satisfied by ReagentRing charges during the reagent preflight
+check consumes/reserves that substitute charge BEFORE the
+later SuccessChance roll. A later spell-roll failure does
+NOT retroactively restore it. T3a exposes this as
+DATA/transaction-plan output only (`SubstituteConsumed bool`
+on the preflight plan); no inventory mutation, no charge
+counters.
+
+##### 9.3a.9 CanPayCosts ordering relevant to T3a
+
+Source `CanPayCosts` order relevant to this milestone
+(runtime/legal gates interleaved by T7 later):
+
+```text
+enabled/accessibility
+BaseMaxHP minimum
+rest/forget
+post-cast cooldown check+arm
+other runtime/legal gates (token, mana/vigor availability,
+  reagent availability/substitute, karma, range/safety/target,
+  target spell-resist check)
+```
+
+Critical timing invariant (source `IsOkayAttackTime` both
+checks AND arms, called before the later gates, with no
+disarm path): post-cast cooldown does NOT arm when an
+earlier BaseMaxHP/rest/forget gate fails. Once the post-cast
+cooldown check succeeds, it IS armed even if a later mana,
+vigor, reagent, karma, range/safety/target gate fails. T3a
+owns the timing primitive (§9.3a.10); T7 owns the complete
+runtime ordering.
+
+##### 9.3a.10 Post-cast cooldown primitive
+
+Simulation ticks, not wall clock. Inputs
+`(hasPriorAttempt, lastAttemptTick, nowTick, tickHz,
+postCastSeconds)`:
+
+```text
+allowed iff NOT hasPriorAttempt
+  OR unsigned mod-2^32 (nowTick - lastAttemptTick) >= postCastSeconds * tickHz
+```
+
+- On an allowed attempt the caller arms
+  `lastAttemptTick = nowTick` immediately at the
+  source-equivalent stage (§9.3a.9). Rejected too-early
+  attempts do NOT re-arm. First attempt always allowed.
+- `postCastSeconds == 0` (valid) is always allowed.
+  Negative seconds, `tickHz` outside `1..120`, or
+  `postCastSeconds * tickHz` overflowing int64 are
+  `ErrInvalidCastTiming` / `ErrInvalidTickHz`. No
+  goroutine/timer. Wrap-safe by unsigned arithmetic.
+
+##### 9.3a.11 Payment occurs BEFORE trance; full vs failed payment
+
+Source `UserCast` sequence frozen as binding:
+`CanPayCosts`/preflight → `PayCosts` → if the payment roll
+succeeds → `BeginCastingTrance`. Payment resolves BEFORE the
+cast/trance timer begins. T3a returns a value/result plan; it
+does NOT mutate resources.
+
+- Successful spell roll (or ForceSuccess rescue):
+
+```text
+mana charge = full resolved mana cost (§9.3a.4)
+exertion charge = 10000 * viSpellExertion
+normal reagents consumed = YES (plan flag ConsumeReagents)
+substitute charge = as already resolved in preflight (§9.3a.8)
+trance may begin
+```
+
+- Failed spell roll without override (source `SpellFailed`
+  "half mana, half exertion, no reagents"):
+
+```text
+mana charge = resolved mana cost / 2      (integer truncation)
+exertion charge = (10000 * viSpellExertion) / 2
+normal reagents consumed = NO
+substitute charge already consumed in preflight REMAINS consumed
+no trance begins
+```
+
+##### 9.3a.12 Target spell-resist cost behavior
+
+Generic `SpellResist` of an enchantment target happens during
+the source preflight. When it resists, source deliberately
+invokes the ordinary `PayCosts` path to simulate a cast with
+no effect, then aborts before trance. Frozen composable T3a
+contract: `TargetResisted == true` → still resolve the
+ordinary spell-payment roll → full or half cost per that
+roll → no effect → no trance. Do NOT confuse this
+enchantment-resist gate with T2 `ResistanceCheck` for numeric
+damage. No SpellResist algorithm in T3a; T7/later spell
+runtime supplies the resolved `TargetResisted` decision.
+
+##### 9.3a.13 Trance duration and sim ticks
+
+Source `GetTranceTime` frozen exactly:
+
+```text
+if baseCastMs == 0: tranceMs = 0
+else: tranceMs = (baseCastMs * (150 - spellPower)) / 100
+```
+
+- ONE truncation (`*` first, 64-bit intermediate, then
+  `/100`). Normal power 1..99 yields 149%..51%. Negative
+  base is `ErrInvalidCastTiming`; spell power is §9.3a.1.
+  (Source immortal-DM zero-trance is runtime, not T3a.) No
+  Warp Time implementation; a future resolved modifier may
+  wrap this stage.
+- Milliseconds → sim ticks (no wall-clock timer goroutines
+  in sim): `ticks = ceil(durationMs * tickHz / 1000)` so a
+  cast never completes earlier than the source duration.
+  64-bit intermediate; negative ms, `tickHz` outside
+  `1..120`, or product overflow are domain errors. No hidden
+  floating point. Boundary vectors (§9.3a.20) pin 0/1/600/
+  1000/1500/5000/30000 ms at 20/60/120 Hz.
+
+##### 9.3a.14 Trance interruption and completion
+
+Resources were already spent before trance (§9.3a.11), so:
+trance interrupted → no spell effect, NO refund (source
+`TranceBroken` is message+sound only). The runtime event
+that breaks trance is NOT T3a; T3a exposes the value
+`TranceRequired bool` (derived from `tranceMs > 0`) and owns
+no enchantment/timer state. At natural trance completion
+source revalidates targets/legality (may Deflect, then
+`CastSpell`) and does NOT pay costs again — frozen
+no-second-payment contract; revalidation, Deflect, and live
+effects belong to T7/later systems.
+
+##### 9.3a.15 Generic AttackSpell base damage and Mana Focus
+
+Source `atakspel.kod CastSpell` frozen exactly:
+
+```text
+damage = inclusive Random(min, max)     (both endpoints reachable)
+```
+
+For a normal PLAYER cast, not an item cast:
+
+```text
+damage = (damage * (50 + spellPower/2)) / SPELLPOWER_MAXIMUM
+```
+
+- Truncation order: `spellPower/2` truncates FIRST, then
+  multiply, then `/99` truncates (64-bit intermediate).
+  Divisor is `SPELLPOWER_MAXIMUM = 99`, never 100. Power
+  is §9.3a.1 (`min > max` is `ErrInvalidRange`; negative
+  bounds are `ErrInvalidDamageValue`).
+- Mana Focus (ordinary player non-item AttackSpell with the
+  focus flag set; inputs are resolved scalars
+  `ManaFocusActive bool`, `ManaFocusPower`,
+  `ManaFocusBonus` — no enchantment implementation):
+
+```text
+if ManaFocusActive:
+    damage += ((ManaFocusPower * ManaFocusBonus) / SPELLPOWER_MAXIMUM) + 1
+```
+
+  Multiply-then-divide (single truncation), then
+  unconditional `+1` (source: the `+1` applies even when
+  the bonus scalar is 0). Negative focus inputs are
+  `ErrInvalidCombatStat`.
+
+##### 9.3a.16 Player / monster / item-cast damage and resource differences
+
+Source-audited, frozen via the explicit origin domain
+`CastOrigin {OriginPlayer, OriginItem, OriginMonster}`:
+
+```text
+OriginPlayer  (normal player cast):
+    spell-power scaling (§9.3a.15) + Mana Focus allowed;
+    full mana/vigor/reagent payment (§9.3a.11);
+    karma gate applies.
+OriginItem    (player item/scroll/wand cast, bItemCast=TRUE):
+    NO spell-power scaling, NO Mana Focus (raw roll to AssessDamage);
+    NO mana/vigor/inventory-reagent payment;
+    karma gate STILL applies unless the resolved ItemSkipsKarma
+    policy input is true (source bCheckKarma, default enforced).
+    Item charge consumption itself is later inventory, not T3a.
+OriginMonster (non-player cast):
+    NO scaling, NO Mana Focus; NO costs of any kind
+    (source CanPayCosts/PayCosts no-op for non-players).
+```
+
+Unknown origin is `ErrInvalidCastOrigin`. T3a implements no
+item consumption and no monster AI.
+
+##### 9.3a.17 Generic attack-spell result and absolute policy
+
+T3a produces only PRE-APPLICATION spell damage and
+metadata: `{Damage, Origin, Policy}`. It does NOT call
+`ApplyDefenseModifiers`, `ApplyResistance`,
+`ApplyPlayerDamageCaps`, HP mutation, or death. Runtime
+composition is later (§9.3a.18, §9.3c).
+
+T3a defines the narrow policy value
+`DamagePolicy {PolicyOrdinary, PolicyAbsolute}`
+representing source `absolute`: ordinary spells take the
+normal resistance pipeline (pure-spell armor bypass per
+§9.2.18 still applies inside T2); absolute spells bypass
+numeric resistance and bypass ordinary player damage caps
+where source requires (source player `AssessDamage` skips
+defense+resistance+bonus+floor-1+both-caps when absolute;
+monster `AssessDamage` skips resistance only). T3a
+implements NO absolute damage formula itself (Illusionary
+Wounds is T3b); the representation exists so T3b/T7 compose
+without ad-hoc booleans. Unknown policy is
+`ErrInvalidDamagePolicy`.
+
+##### 9.3a.18 T1/T2/T3 pipeline boundary
+
+Full eventual damage order frozen (no premature universal
+`ResolveDamage()` that erases these differences):
+
+```text
+Weapon attack:
+  T1 raw weapon damage -> T2 defense modifiers -> T2 resistance
+  -> resolved bonuses -> T1 player caps -> T4 HP mutation -> T5 death
+Ordinary AttackSpell (armor DamageReduce bypassed by T2's pure-spell rule):
+  T3 raw spell damage -> T2 damage-class defense stage -> T2 resistance
+  -> resolved bonuses -> applicable T1 player caps
+  -> T4 HP mutation -> T5 death
+Absolute special spell:
+  T3b special raw/absolute calculation
+  -> bypass source-defined resistance/caps -> T4/T7 exact special HP rule
+```
+
+A T3a test composes generic AttackSpell raw damage through
+the REAL T2 pure-spell defense stage + resistance to prove
+no armor DamageReduce but full resistance; T3a production
+never calls T1 caps.
+
+##### 9.3a.19 Stable domain errors
+
+`errors.Is`-compatible sentinels for public-domain errors
+(no string parsing; no dozens of hyper-specific errors):
+
+```text
+ErrInvalidSpellPower       (power outside 1..99)
+ErrInvalidSpellSchool      (unknown CastSchool value)
+ErrInvalidSpellLevel       (spell level outside 1..6)
+ErrInvalidManaCost         (negative base mana)
+ErrInvalidManaReduction    (percent outside 0..100)
+ErrInvalidExertion         (exertion outside 0..100, or negative vigor)
+ErrInvalidHitPointGate     (BaseMaxHP < 1, or minimum < 0)
+ErrInvalidCastTiming       (negative durations, overflow)
+ErrInvalidSquaredDistance  (negative squared distance)
+ErrInvalidCastOrigin       (unknown CastOrigin value)
+ErrInvalidDamagePolicy     (unknown DamagePolicy value)
+```
+
+plus reuse of existing T1/T2 errors: `ErrNilRNG`,
+`ErrInvalidRange`, `ErrInvalidHitRoll`,
+`ErrInvalidCombatStat`, `ErrInvalidDamageValue`,
+`ErrInvalidTickHz`, `ErrInvalidVictimSnapshot` where the
+same domain condition applies. Deterministic under
+scripted RNG; identical RNG + identical inputs yield
+identical results.
+
+##### 9.3a.20 Golden vectors and property invariants (normative minimum)
+
+Success base `((100-req)*power/100)+req`: (req 10, power 1)
+→ `(90*1)/100+10 = 0+10` = 10; (req 25, power 50) →
+`(75*50)/100+25 = 37+25` = 62; (req 50, power 99) →
+`(50*99)/100+50 = 49+50` = 99 → bound 95; (req 10, power
+99) → `(90*99)/100+10 = 89+10` = 99 → 95; low clamp: (req
+1, power 1) → 1 → 5. No-LOS: chance 60, squaredDistance 0
+→ distance 0 `< 30` → 60; squaredDistance 120 → distance
+30 `== 30` → unchanged 60; squaredDistance 200 → distance
+50 `> 30` → 30; odd chance 61, squaredDistance 120 →
+distance 30, `61/2 = 30`, equal → unchanged 61. d100:
+`1`, `chance`, `chance+1`, `100` boundaries with
+`d100 <= chance` success. ForceSuccess flips a scripted
+failed roll to success with full-payment plan.
+
+Mana: base 0 → 0 at any power; base 8 power 40 → 8, power
+41 → 7, power 80 → 7, power 81 → 6; base 8 power 81 pct
+0 → 6; pct 25 → `6-(150+99)/100 = 6-2` = 4; pct 100 →
+`6-6` = 0 → bound 1; base 1 power 99 pct 100 → 1 (floor).
+Karma: Qor L1 → −10, Qor L6 → −60, Shalille L1 → +10,
+Shalille L6 → +60, other → 0; caster exactly threshold
+allows, one point wrong-side denies. BaseMaxHP gate:
+`Base < min` denies, `==`/`>` allows. Exertion: disabled
+check proceeds; `vigor == required` denies (strict),
+`required+1` allows; full `10000*e`, failed half with odd
+truncation (`e = 3` → 30000/15000). Cooldown: first
+attempt allows; one tick early rejects; exact boundary
+allows; u32 wrap correct; 0 postcast seconds allows.
+Trance: base 600 ms power 1 → `(600*149)/100` = 894 ms;
+base 1000 power 50 → 1000 ms; base 5000 power 99 →
+`(5000*51)/100` = 2550 ms; base 30000 power 99 → 15300 ms;
+base 0 → 0 at any power. Ticks `ceil(ms*Hz/1000)`: 1 ms @
+20 Hz → 1; 600 ms @ 20 Hz → 12; 1000 ms @ 60 Hz → 60;
+1500 ms @ 20 Hz → 30; 5000 ms @ 120 Hz → 600.
+AttackSpell (Fireball-like 8..12 scripted min/max): power
+1 → `(8*(50+0))/99 = 400/99` = 4 .. `(12*50)/99 =
+600/99` = 6; power 50 → `(8*75)/99 = 600/99` = 6 ..
+`(12*75)/99 = 900/99` = 9; power 99 → `(8*99)/99` = 8 ..
+12 (a `/100` implementation fails the power-50 vectors).
+ManaFocus (bonus 5): inactive → unchanged; active focus
+power 1 → `+((1*5)/99)+1 = +1`; focus 99 → `+(495/99)+1
+= +6`; bonus 0 active → `+1`; monster/item origins ignore
+focus. Origin matrix: identical raw roll + power proves
+player-scaled vs item-raw vs monster-raw.
+
+Property invariants: success base before the no-LOS stage
+respects the frozen 5..95 bound only at that stage (the
+post-distance value is intentionally unclamped);
+nonzero-base mana cost stays `>= 1`; full payment `>=`
+failed payment componentwise; failed normal casts consume
+no normal reagents; trance duration deterministic in
+(power, base); postcast timing wrap-safe; identical
+RNG/input → identical result. Monotonicity is asserted
+only where source guarantees it (no invented monotonicity
+across the strict `>`/`>=` tier edges).
+
+#### 9.3b M5-T3b special spell-damage archetypes (deferred, boundary only)
+
+T3b owns pure/value deterministic mechanics for touch
+attacks, wall periodic damage/timing, Earthquake/AoE
+falloff, Illusionary Wounds, Vampiric Drain /
+damage-derived side-effect hooks, and other special
+spell-damage formulas needed by the MVP. Still: no
+authoritative HP mutation, no room/world-object scheduler,
+no gateway, no real inventory/reagent mutation. Source
+families verified for the boundary (exact T3b normative
+formulas may be finalized in the T3b task if more audit is
+needed):
+
+```text
+Touch: weapon-hit pipeline (not AttackSpell); spell ability as
+  Stroke; max(Punch, 1.5*Mysticism) proficiency;
+  damage/2 + ((damage/2)*power)/99 + 1 scaling.
+Illusionary Wounds: absolute; resistance bypass; player/intellect
+  and monster/difficulty formulas with /100 (not /99) divisor;
+  floor MaxHP/3 cap; leave-1-HP rule; duration/refund value contract.
+Earthquake: 5..9 base; severity 1 + power/25; squared-distance
+  falloff, full <= 8, zero > 20; environmental flat mode.
+Walls: periodic ~1.5 s with 90..110% jitter; per-cycle affected
+  suppression; family-specific 0..MaxDamage rolls.
+Vampiric Drain: generic AttackSpell pipeline + half-damage heal
+  side-effect hook (kill uses half of max instead).
+```
+
+T3a/T3b math MUST NOT introduce room goroutines, wall
+timers, world-object goroutines per effect, `time.Sleep`,
+or per-spell `time.Ticker`. Later runtime/world integration
+uses deterministic sim ownership. T3b production contains
+no `TouchAttackDamage`, `EarthquakeDamage`,
+`WallTickDamage`, `IllusionaryWounds`, `VampiricDrain`, AoE
+target enumeration, wall objects, or wall timers — and T3a
+MUST NOT implement them either (§9.3a.16–§9.3a.17).
+
+#### 9.3c M5-T7 authoritative attack/cast runtime integration (deferred)
+
+T7 owns: real C→S 103 attack routing; real C→S 104 cast
+routing; typed sim-owner combat commands; composition of
+T1/T2/T3a/T3b mechanics; authoritative T4 HP/mana/vigor
+mutation; T5 death handoff; T6 safety/personal-state
+interaction where required; runtime cooldown ownership;
+spell/weapon/loadout resolver seams; actual mana/exertion
+charging; reagent transaction/inventory seam; damage
+application; hit/cast result events; gateway result
+transport; scripted-duel integration proof. Depends on
+M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4, M5-T5, M5-T6. Opcode
+ownership: 103/104 attack/cast → M5-T7; T1/T2/T3a/T3b own
+pure mechanics only and MUST NOT implement 103/104
+handlers. The M5 exit gate sits after T7.
+
 ## 10. Config / deployment / ops
 
 - Config: env + file (`config.yaml` default, env override `VOX_*`); MUST
@@ -5724,6 +6361,28 @@ stays zero through T2 alone).
    survives it.
 
 ## 14. Version history
+
+- v0.3.27: split M5-T3 into generic core T3a + special archetypes T3b
+  (new §9.3/§9.3a normative: spell-power 1..99 domain, generic
+  SuccessChance order Hinder → 5..95 bound → no-LOS adjustment →
+  d100<=chance → ReagentRing ForceSuccess rescue with full payment,
+  exact strict no-LOS distance rule with equality-unchanged and no
+  second clamp, mana-cost arithmetic with strict >40/>80 tiers and
+  ceil equipment reduction floored at 1, karma ±10×level with
+  equality-passing eligibility, BaseMaxHP-not-current-HP minimum
+  gate, strict HasVigor exertion gate with full/half charges,
+  reagent preflight substitute-consumed-before-roll contract,
+  postcast check+arm ordering invariant, payment-before-trance with
+  full/half plans and target-resisted cost rule, trance duration
+  (150−power)% with ceil ms→tick conversion and no-refund/no-repay
+  contracts, AttackSpell /99 scaling with truncation order and Mana
+  Focus +1, player/item/monster origin matrix, absolute policy
+  value, T1/T2/T3 pipeline boundary; §9.3b T3b boundary families;
+  §9.3c new M5-T7 authoritative 103/104 runtime after T1..T6 with
+  M5 exit after T7; T3a/T3b own pure mechanics only, no live
+  vitals/gateway) + verified `meridian59.md` correction
+  (piMinHitPoints gates BaseMaxHP via Player GetLevel, not
+  current HP).
 
 - v0.3.26: freeze M5-T2 defense mitigation semantics (new §9.2:
   T1/T2/T3/T4/T5 ownership, T1→armor→resistance→caps pipeline with no

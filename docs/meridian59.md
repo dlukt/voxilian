@@ -184,7 +184,9 @@ Lore (Jala/Riija, req Int).
 
 - Spell base: `viMana` (mana), `viSpellExertion` (vigor 0–100),
   `viCast_time` ms trance (Heal 600 … HolyWeapon 30000), `piMinHitPoints`
-  (need HP to cast, e.g. Shatter 40, Jig 30), `plReagents` (e.g. Herbs×1;
+  (need BaseMaxHP to cast — the source gate is `caster.GetLevel() <
+  piMinHitPoints` and Player `GetLevel()` returns BaseMaxHealth, NOT
+  current HP; e.g. Shatter 40, Jig 30), `plReagents` (e.g. Herbs×1;
   bypassed by Reagent Ring charges / immortals), `viOutlaw/viHarmful` flags.
 - Skill base: `viSkill_level`, `viChance_to_Increase` (default 25),
   `viskillExertion`, `vbCheck_Exertion`, `vbAutomatic` (passive parry/dodge/
@@ -214,7 +216,7 @@ of Life L6 (30 mana — corpse portal, mitigates death penalty), Bond L6
 Cloak L1 (anti-track), Darkness L1 (darken room), Detect Good, Resist Good,
 Acid Touch L2, Fade L2, Karahol’s Curse L2 (battle buff), Unholy Weapon L2,
 Defile L3 (0 mana ritual), Enfeeble L3 (drain STR, O/H), Silence L3 (room
-mute, O/H, minHP 10), Poison Fog wall L3 (20 mana), Vampiric Drain L3
+mute, O/H, minHP 10 = needs BaseMaxHP 10, §5), Poison Fog wall L3 (20 mana), Vampiric Drain L3
 (10 mana ranged, heal half), Animate L4, Curse Weapon L4, Shadow Rift L4
 (30+1/tick teleport), Hold L4 (15 mana paralyze, O/H, no-newbie-offense),
 Shalille Bane L4, Splash of Acid L4 (10 mana ranged), Blind L5, Blood
@@ -243,12 +245,12 @@ L2, Heat L3 (room, O/H), Mana Focus L3, Resist Shock L3, Shocking Fury L3
 (ranged), Brittle L4 (age weapon, O/H), Explosive Frost L4, Fire Wall L4 (H),
 Fireball L4 bolt (7 mana), Earthquake L5 (12 mana room AoE, O/H), Lightning
 L5 bolt (10 mana), Ring of Flames L5 (H), Sandstorm L5 (O/H), Shatter L5
-(O/H, minHP 40), Lightning Wall L6 (H), Spore Burst L6 (paralyze cloud, H).
+(O/H, minHP 40 = needs BaseMaxHP 40, §5), Lightning Wall L6 (H), Spore Burst L6 (paralyze cloud, H).
 
 ### 5.5 Riija (illusion/trick) — monks + assassins; Blink excluded from learn points
 
 Anonymity L1, Blink L1 (15 mana room teleport — the free starter),
-Feign Death L1 (minHP 5), Flash L1 (interrupt trance, O/H), Shadow Form L1,
+Feign Death L1 (minHP 5 = needs BaseMaxHP 5, §5), Flash L1 (interrupt trance, O/H), Shadow Form L1,
 Bait L2 (taunt mobs), Eavesdrop L2, Foresight L2 (reveal victim stats, O/H),
 Forget L2 (victim forgets ability, O/H), Illusionary Firewall L3 (fake wall,
 H), Illusionary Form L3, Illusionary Wounds L3 (absolute damage, leaves 1 HP,
@@ -260,13 +262,14 @@ Cow L6 (joke, 5+1/tick).
 
 ### 5.6 Jala (bard songs, room enchants that hinder other schools)
 
-All need HP (`piMinHitPoints` 1–30) + Ruby/Sapphire/Diamond reagents.
+All need BaseMaxHP (`piMinHitPoints` 1–30; same BaseMaxHP — not
+current-HP — gate as §5) + Ruby/Sapphire/Diamond reagents.
 Invigorate L1 (room vigor), Mirth/Melancholy L1 (buff/debuff), Truth L1
 (hinder Riija, H), Civility L2 (hinder Faren, H), Conciliation L2 (hinder
 Kraanan, H), Warp Time L2, Distill L3 (spell→potion), Profane/Sacred Resonance
 L3 (hinder Shal/Qor, H), Restorate L3 (room HP regen), Spellbane L3 (block
 casting above power, H), Disharmony L4 (hinder Jala, H), Jig L4 (force dance,
-minHP 30), Mana Convergence L5 (boost effectiveness), Rejuvenate L5 (room mana
+minHP 30 = needs BaseMaxHP 30, §5), Mana Convergence L5 (boost effectiveness), Rejuvenate L5 (room mana
 regen), Crystalize Mana L6 (catch mana to crystals).
 
 ### 5.7 Weaponcraft & utility skills

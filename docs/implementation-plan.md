@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.10)
+# Voxilian Backend — Implementation Plan (v1.11)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.26).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.27).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -168,11 +168,35 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
 
 - [x] **M5-T1** Offense/defense/hit + weapon tables: `(Off*55)/Def` 10–95%, weapon type/quality, 1 swing/s, vigor costs, 30/hit + ⅓-HP caps, severity text hooks. Golden vectors from `meridian59.md` §7. Spec: §9.1, meridian59 §7. Pure sim-domain math only: NO gateway/opcode-103 wiring (103..120 stay rate-gate-then-delegate), NO armor/resist/spell/vitals/death work, NO `entity.go` fields.
 - [x] **M5-T2** Armor/shields/resists: `ModifyDefensePower/Damage`, block/parry/dodge rolls, ±100 resist clip, spell-vs-weapon reduction rules. Golden vectors. Spec: §9.2 (frozen v0.3.26).
-- [ ] **M5-T3** Spell damage + touch/walls/AoE: `rand*(50+power/2)/99`, wall ticks, touch scaling, Illusionary-Wounds rules, quake falloff; mana/vigor/reagent/karma gates; cast/post-cast timing. Spec: §9.
+- [ ] **M5-T3a** Generic spell core (pure/value sim-domain mechanics):
+  generic spell success chance + d100 roll, generic AttackSpell damage
+  scaling, Mana Focus damage contract, mana-cost arithmetic,
+  vigor/exertion gate + cost contract, reagent-availability/substitution
+  contract, karma requirement/gate, BaseMaxHP/min-hitpoint gate, post-cast
+  cooldown timing, cast/trance duration math, full vs failed cast
+  resource-payment plan, item-cast differences, absolute/resistance policy
+  representation. No live mutation, no gateway, no world/target lookup.
+  Spec: §9.3a (frozen v0.3.27).
+- [ ] **M5-T3b** Special spell-damage archetypes (pure/value deterministic
+  mechanics): touch attacks, wall periodic damage/timing, Earthquake/AoE
+  falloff, Illusionary Wounds, Vampiric Drain / damage-derived side-effect
+  hooks, other special spell-damage formulas needed by the MVP. Still no
+  authoritative HP mutation, no room/world-object scheduler, no gateway, no
+  real inventory/reagent mutation. Spec: §9.3b (boundary frozen v0.3.27).
 - [ ] **M5-T4** Vitals/regen/hunger: HP=level caps, mana+nodes, exertion/rest/thresholds, regen tick formulas, stomach decay. Golden vectors + timer tests (fake clock). Spec: §9, meridian59 §4.
 - [ ] **M5-T5** Death pipeline: corpse + full droppable drop (PK tags), advancement wipe/halve, Underworld-region respawn, leaving penalties (Stam saves), Portal-of-Life hook; single-txn state+ledger. Crash-during-death test. Spec: §9, §8.1.
 - [ ] **M5-T6** Personal/world-light intents: `115 rest`, `116 eat` (hunger/vigor effects), `105 use` (skill/item dispatch incl. Second Wind), `119 safety_toggle`, `117/118 → 209` chat (+channel rules, length caps, rate limits). Owner of these opcodes: this task, no other. Spec: §6.3, §9.
-- [ ] **M5 exit criteria met** (scripted duel bot: two M4+M5 entities fight to death, corpse lootable).
+- [ ] **M5-T7** Authoritative attack/cast runtime integration (depends on
+  M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4, M5-T5, M5-T6). Owns real C→S 103
+  attack routing, real C→S 104 cast routing, typed sim-owner combat
+  commands, composition of T1/T2/T3a/T3b mechanics, authoritative T4
+  HP/mana/vigor mutation, T5 death handoff, T6 safety/personal-state
+  interaction where required, runtime cooldown ownership, spell/weapon/
+  loadout resolver seams, actual mana/exertion charging, reagent
+  transaction/inventory seam, damage application, hit/cast result events,
+  gateway result transport, scripted-duel integration proof.
+  Spec: §9.3c (frozen v0.3.27).
+- [ ] **M5 exit criteria met** (scripted duel bot via M5-T7: two M4+M5 entities fight to death, corpse lootable).
 
 ## M6 — Progression (use-based)
 
@@ -275,7 +299,10 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M4-T5b1 | M4-T5a | `backend/voxilian/internal/{sim,gateway}` |
 | M4-T5b2 | M4-T5b1 | `backend/voxilian/internal/gateway` (existing observe metrics only, no new family; no sim production change beyond a compile-time assertion if needed) |
 | M4-T3a…c, T4a, T4b | M1-T7a…c (CAS), M3-T1 | `backend/voxilian/internal/sim`, `internal/store` |
-| M5-T1…T6 | M4-T1, M4-T2 | `backend/voxilian/internal/sim` (combat/vitals/intents) |
+| M5-T1/T2/T3a/T3b | M4-T1, M4-T2 | `backend/voxilian/internal/sim` (pure mechanics only: no live vitals, no gateway) |
+| M5-T4/T5 | M5-T1, M5-T2, M5-T3a, M5-T3b | `backend/voxilian/internal/sim` (authoritative gameplay state) |
+| M5-T6 | M4-T1, M4-T2 | `backend/voxilian/internal/sim` + gateway only for its own listed personal intents |
+| M5-T7 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4, M5-T5, M5-T6 | `backend/voxilian/internal/{sim,gateway}` (authoritative 103/104 runtime integration) |
 | M6-T1…T3 | M5-T1…T5 | `backend/voxilian/internal/sim` (progression) |
 | M7-T1 | M9-T1 (seed pipeline) + M1-T6b | `backend/voxilian/internal/sim`, `seed/` fixtures |
 | M7-T2a…c, T3, T4 | M4-T1…T3a, M1-T7b | `backend/voxilian/internal/sim` |
@@ -294,7 +321,7 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 |---|---|---|
 | 100/101 hello/reauth | M3-T2 (+M11-T2 hardening) | auth plane |
 | 102 move | M4-T2 | M4-T2 owns authoritative move semantics; M4-T5b1 owns wire decode/rate/owner-mailbox routing; M4-T5b2 owns 205 AOI transport fanout; none reimplement movement rules. |
-| 103/104 attack/cast | M5-T1…T3 | combat plane (T1 = pure math only, no gateway wiring; transport integration when M5 runtime state exists) |
+| 103/104 attack/cast | M5-T7 | combat plane. T1/T2/T3a/T3b own pure mechanics; T7 alone owns wire/runtime integration. |
 | 105 use, 115 rest, 116 eat, 119 safety, 117/118 chat | M5-T6 | personal intents |
 | 106/107/108/109 get/drop/put/give | M7-T4 | world items |
 | 110–113 offer/counter/accept/cancel | M8-T1 | trade machine |
@@ -306,6 +333,12 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 
 ## Plan history
 
+- v1.11: split M5-T3 into generic core T3a + special archetypes T3b and
+  add M5-T7 authoritative 103/104 combat runtime after T1..T6 (spec
+  v0.3.27 §9.3/§9.3a/§9.3b/§9.3c: T3a generic success/cost/timing/damage
+  semantics, T3b boundary families, T7 runtime ownership with M5 exit
+  after T7, repaired 103/104 ownership gap, no live vitals/gateway in
+  T3a). M5-T1/T2 stay `[x]`; T3a/T3b/T4/T5/T6/T7 and M5 exit stay `[ ]`.
 - v1.10: freeze M5-T2 defense mitigation semantics (spec v0.3.26 §9.2:
   T2 ownership/pipeline boundaries, T2-resolved PlayerDefense
   components, exact capability gates, shared skill-chance formula,
