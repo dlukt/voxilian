@@ -166,7 +166,7 @@ Exit: 20 Hz tick loop, cells, server-authoritative movement with reconciliation 
 
 Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested.
 
-- [ ] **M5-T1** Offense/defense/hit + weapon tables: `(Off*55)/Def` 10–95%, weapon type/quality, 1 swing/s, vigor costs, 30/hit + ⅓-HP caps, severity text hooks. Golden vectors from `meridian59.md` §7. Spec: §9.1, meridian59 §7. Pure sim-domain math only: NO gateway/opcode-103 wiring (103..120 stay rate-gate-then-delegate), NO armor/resist/spell/vitals/death work, NO `entity.go` fields.
+- [x] **M5-T1** Offense/defense/hit + weapon tables: `(Off*55)/Def` 10–95%, weapon type/quality, 1 swing/s, vigor costs, 30/hit + ⅓-HP caps, severity text hooks. Golden vectors from `meridian59.md` §7. Spec: §9.1, meridian59 §7. Pure sim-domain math only: NO gateway/opcode-103 wiring (103..120 stay rate-gate-then-delegate), NO armor/resist/spell/vitals/death work, NO `entity.go` fields.
 - [ ] **M5-T2** Armor/shields/resists: `ModifyDefensePower/Damage`, block/parry/dodge rolls, ±100 resist clip, spell-vs-weapon reduction rules. Golden vectors. Spec: §9.
 - [ ] **M5-T3** Spell damage + touch/walls/AoE: `rand*(50+power/2)/99`, wall ticks, touch scaling, Illusionary-Wounds rules, quake falloff; mana/vigor/reagent/karma gates; cast/post-cast timing. Spec: §9.
 - [ ] **M5-T4** Vitals/regen/hunger: HP=level caps, mana+nodes, exertion/rest/thresholds, regen tick formulas, stomach decay. Golden vectors + timer tests (fake clock). Spec: §9, meridian59 §4.
