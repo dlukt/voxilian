@@ -120,11 +120,13 @@ func TestRollWeaponBaseEndpoints(t *testing.T) {
 }
 
 func TestRawWeaponDamageGolden(t *testing.T) {
-	// Representative full calculation (spec §9.1.10), hand-computed:
-	// w = 8 + 1 + 0 = 9; s = 9*80/100 = 7; profFlat = 51*5/100 = 2;
-	// attrBonus = 40-25 = 15; m = 115*7/100 = 8; raw = 10.
+	// Representative full calculation (spec §9.1.10), hand-computed.
+	// WeaponBaseDamage 9 (= slash roll 8 + high quality +1, resolved
+	// upstream by RollWeaponBase): s = 9*80/100 = 7;
+	// profFlat = 51*5/100 = 2; attrBonus = 40-25 = 15;
+	// m = 115*7/100 = 8; raw = 10.
 	got, err := RawWeaponDamage(RawDamageInput{
-		BaseRoll: 8, QualityDmgMod: 1, DamageBonus: 0,
+		WeaponBaseDamage: 9, DamageBonus: 0,
 		DamageFactor: DamageFactorSlash, Proficiency: 50,
 		MaxProfDamage: DefaultMaxProfDamage, Attr: 40,
 	})
@@ -135,7 +137,7 @@ func TestRawWeaponDamageGolden(t *testing.T) {
 	// w = 6; s = 6*100/100 = 6; prof 0 -> flat 5/100 = 0;
 	// m = 100*6/100 = 6; raw = 6.
 	got, err = RawWeaponDamage(RawDamageInput{
-		BaseRoll: 6, DamageFactor: DamageFactorDefault,
+		WeaponBaseDamage: 6, DamageFactor: DamageFactorDefault,
 		MaxProfDamage: DefaultMaxProfDamage, Attr: 10,
 	})
 	if err != nil || got != 6 {
@@ -145,7 +147,7 @@ func TestRawWeaponDamageGolden(t *testing.T) {
 	// w = 6; s = 6; flat 0; m = 140*6/100 = 8; raw = 8.
 	for _, might := range []int{65, 70, 100} {
 		got, err = RawWeaponDamage(RawDamageInput{
-			BaseRoll: 6, DamageFactor: DamageFactorDefault,
+			WeaponBaseDamage: 6, DamageFactor: DamageFactorDefault,
 			MaxProfDamage: DefaultMaxProfDamage, Attr: might,
 		})
 		if err != nil || got != 8 {
@@ -154,7 +156,7 @@ func TestRawWeaponDamageGolden(t *testing.T) {
 	}
 	// Intermediate might: 40 -> +15%: m = 115*6/100 = 6 (690/100 trunc).
 	got, err = RawWeaponDamage(RawDamageInput{
-		BaseRoll: 6, DamageFactor: DamageFactorDefault,
+		WeaponBaseDamage: 6, DamageFactor: DamageFactorDefault,
 		MaxProfDamage: DefaultMaxProfDamage, Attr: 40,
 	})
 	if err != nil || got != 6 {
@@ -164,7 +166,7 @@ func TestRawWeaponDamageGolden(t *testing.T) {
 	// the Fire factor 90. w = 6; s = 540/100 = 5; flat 0;
 	// m = 115*5/100 = 5 (575/100); raw = 5.
 	got, err = RawWeaponDamage(RawDamageInput{
-		BaseRoll: 6, DamageFactor: DamageFactorFire,
+		WeaponBaseDamage: 6, DamageFactor: DamageFactorFire,
 		MaxProfDamage: DefaultMaxProfDamage, Attr: 40,
 	})
 	if err != nil || got != 5 {
@@ -172,7 +174,7 @@ func TestRawWeaponDamageGolden(t *testing.T) {
 	}
 	// Minimum-one floor: degenerate zero pipeline still yields 1.
 	got, err = RawWeaponDamage(RawDamageInput{
-		BaseRoll: 0, QualityDmgMod: -50, DamageFactor: DamageFactorDefault,
+		WeaponBaseDamage: -50, DamageFactor: DamageFactorDefault,
 		MaxProfDamage: DefaultMaxProfDamage, Attr: 1,
 	})
 	if err != nil || got != 1 {
@@ -182,7 +184,7 @@ func TestRawWeaponDamageGolden(t *testing.T) {
 	// raw equals the scaled base exactly (base counted once).
 	// w = 7; s = 7; m = 7; raw = 7.
 	got, err = RawWeaponDamage(RawDamageInput{
-		BaseRoll: 7, DamageFactor: DamageFactorDefault,
+		WeaponBaseDamage: 7, DamageFactor: DamageFactorDefault,
 		MaxProfDamage: DefaultMaxProfDamage, Attr: 25,
 	})
 	if err != nil || got != 7 {
@@ -198,6 +200,118 @@ func TestRawWeaponDamageGolden(t *testing.T) {
 		if _, err := RawWeaponDamage(bad); !errors.Is(err, ErrInvalidCombatStat) {
 			t.Fatalf("bad %+v err = %v, want ErrInvalidCombatStat", bad, err)
 		}
+	}
+}
+
+// TestWeaponDamageComposition is the mandatory real-composition golden
+// test: the actual output of RollWeaponBase feeds RawWeaponDamage with
+// no manual restatement of the roll + quality arithmetic.
+func TestWeaponDamageComposition(t *testing.T) {
+	// Slash, High quality, scripted raw family roll 8 (span 7, index 3).
+	// RollWeaponBase -> 8 + 1 = 9; then WeaponBaseDamage 9, bonus 0,
+	// factor 80, prof 50, maxProf 5, attr 40 -> 10.
+	base, err := RollWeaponBase(&scriptRNG{vals: []uint64{3}}, WeaponSlash, WeaponQualityHigh)
+	if err != nil || base != 9 {
+		t.Fatalf("RollWeaponBase = %d,%v, want 9,nil", base, err)
+	}
+	got, err := RawWeaponDamage(RawDamageInput{
+		WeaponBaseDamage: base, DamageBonus: 0,
+		DamageFactor: DamageFactorSlash, Proficiency: 50,
+		MaxProfDamage: DefaultMaxProfDamage, Attr: 40,
+	})
+	if err != nil || got != 10 {
+		t.Fatalf("composition = %d,%v, want 10,nil", got, err)
+	}
+}
+
+// TestWeaponQualityOnceMatrix proves each quality modifier enters
+// exactly once through the real RollWeaponBase -> RawWeaponDamage
+// composition: a re-applied (twice) or dropped (zero times) modifier
+// fails the expected values. Fixed slash roll 8 (script index 3),
+// DamageBonus 0, factor 100 (identity scaling), prof 0, maxProf 5
+// (flat 0), attr 25 (baseline +0%): final equals the composed base.
+func TestWeaponQualityOnceMatrix(t *testing.T) {
+	cases := []struct {
+		quality WeaponQuality
+		// wantBase is 8 + the frozen quality DamageMod.
+		wantBase int
+	}{
+		{WeaponQualityLow, 7},
+		{WeaponQualityNormal, 8},
+		{WeaponQualityHigh, 9},
+		{WeaponQualityNerudite, 9},
+	}
+	for _, c := range cases {
+		base, err := RollWeaponBase(&scriptRNG{vals: []uint64{3}}, WeaponSlash, c.quality)
+		if err != nil || base != c.wantBase {
+			t.Fatalf("quality %d base = %d,%v, want %d,nil", int(c.quality), base, err, c.wantBase)
+		}
+		got, err := RawWeaponDamage(RawDamageInput{
+			WeaponBaseDamage: base,
+			DamageFactor:     DamageFactorDefault,
+			MaxProfDamage:    DefaultMaxProfDamage,
+			Attr:             25,
+		})
+		if err != nil || got != c.wantBase {
+			t.Fatalf("quality %d final = %d,%v, want %d,nil", int(c.quality), got, err, c.wantBase)
+		}
+	}
+}
+
+// TestWeaponDamageEndpointComposition forces the minimum and maximum
+// family rolls through the full public composition, preserving the
+// inclusive range behavior end to end (slash 5..11, span 7).
+func TestWeaponDamageEndpointComposition(t *testing.T) {
+	lo, err := RollWeaponBase(&scriptRNG{vals: []uint64{0}}, WeaponSlash, WeaponQualityNormal)
+	if err != nil || lo != 5 {
+		t.Fatalf("min composition base = %d,%v, want 5,nil", lo, err)
+	}
+	hi, err := RollWeaponBase(&scriptRNG{vals: []uint64{6}}, WeaponSlash, WeaponQualityNormal)
+	if err != nil || hi != 11 {
+		t.Fatalf("max composition base = %d,%v, want 11,nil", hi, err)
+	}
+	for _, base := range []int{lo, hi} {
+		got, err := RawWeaponDamage(RawDamageInput{
+			WeaponBaseDamage: base,
+			DamageFactor:     DamageFactorDefault,
+			MaxProfDamage:    DefaultMaxProfDamage,
+			Attr:             25,
+		})
+		if err != nil || got != base {
+			t.Fatalf("endpoint base %d final = %d,%v, want %d,nil", base, got, err, base)
+		}
+	}
+}
+
+// TestWeaponDamageBonusOnce proves DamageBonus enters exactly once
+// before DamageFactor scaling: with composed base 8 (slash/normal,
+// script index 3), factor 100, flat 0, baseline attr, bonus b yields
+// exactly 8 + b.
+func TestWeaponDamageBonusOnce(t *testing.T) {
+	base, err := RollWeaponBase(&scriptRNG{vals: []uint64{3}}, WeaponSlash, WeaponQualityNormal)
+	if err != nil || base != 8 {
+		t.Fatalf("base = %d,%v, want 8,nil", base, err)
+	}
+	for _, bonus := range []int{0, 5, -3} {
+		got, err := RawWeaponDamage(RawDamageInput{
+			WeaponBaseDamage: base, DamageBonus: bonus,
+			DamageFactor:  DamageFactorDefault,
+			MaxProfDamage: DefaultMaxProfDamage,
+			Attr:          25,
+		})
+		if err != nil || got != 8+bonus {
+			t.Fatalf("bonus %d final = %d,%v, want %d,nil", bonus, got, err, 8+bonus)
+		}
+	}
+	// Scaling proof: the same bonus enters before the factor.
+	// base 8 + bonus 5 = 13; 13*80/100 = 10 (1040/100 trunc).
+	got, err := RawWeaponDamage(RawDamageInput{
+		WeaponBaseDamage: base, DamageBonus: 5,
+		DamageFactor: DamageFactorSlash,
+		Proficiency:  0, MaxProfDamage: DefaultMaxProfDamage, Attr: 25,
+	})
+	if err != nil || got != 10 {
+		t.Fatalf("scaled bonus final = %d,%v, want 10,nil", got, err)
 	}
 }
 
@@ -239,16 +353,16 @@ func TestRawDamageMonotonic(t *testing.T) {
 	// the base roll with all else fixed (property, independent oracle:
 	// simple loop comparison, no production call for expectations).
 	prev := 0
-	for roll := 0; roll <= 12; roll++ {
+	for base := 0; base <= 12; base++ {
 		got, err := RawWeaponDamage(RawDamageInput{
-			BaseRoll: roll, DamageFactor: DamageFactorSlash,
+			WeaponBaseDamage: base, DamageFactor: DamageFactorSlash,
 			Proficiency: 30, MaxProfDamage: DefaultMaxProfDamage, Attr: 40,
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if got < prev {
-			t.Fatalf("non-monotonic at roll %d: %d < %d", roll, got, prev)
+			t.Fatalf("non-monotonic at base %d: %d < %d", base, got, prev)
 		}
 		prev = got
 	}
@@ -259,10 +373,9 @@ func TestRawDamageLargeInputs(t *testing.T) {
 	larges := []int{0, 1, 1 << 30, math.MaxInt - 1, math.MaxInt}
 	for _, v := range larges {
 		for _, in := range []RawDamageInput{
-			{BaseRoll: v, DamageFactor: 100, MaxProfDamage: 5, Attr: 40},
-			{BaseRoll: 6, QualityDmgMod: v, DamageFactor: 100, MaxProfDamage: 5, Attr: 40},
-			{BaseRoll: 6, DamageBonus: v, DamageFactor: 100, MaxProfDamage: 5, Attr: 40},
-			{BaseRoll: 6, DamageFactor: v, MaxProfDamage: 5, Attr: 40},
+			{WeaponBaseDamage: v, DamageFactor: 100, MaxProfDamage: 5, Attr: 40},
+			{WeaponBaseDamage: 6, DamageBonus: v, DamageFactor: 100, MaxProfDamage: 5, Attr: 40},
+			{WeaponBaseDamage: 6, DamageFactor: v, MaxProfDamage: 5, Attr: 40},
 		} {
 			got, err := RawWeaponDamage(in)
 			if err != nil {
@@ -273,19 +386,19 @@ func TestRawDamageLargeInputs(t *testing.T) {
 			}
 		}
 	}
-	negBonus := RawDamageInput{BaseRoll: 1, DamageBonus: -100, DamageFactor: 100, MaxProfDamage: 5, Attr: 1}
+	negBonus := RawDamageInput{WeaponBaseDamage: 1, DamageBonus: -100, DamageFactor: 100, MaxProfDamage: 5, Attr: 1}
 	if got, err := RawWeaponDamage(negBonus); err != nil || got != 1 {
 		t.Fatalf("negative bonus = %d,%v, want 1,nil", got, err)
 	}
 }
 
 func FuzzRawWeaponDamage(f *testing.F) {
-	f.Add(6, 0, 0, 100, 50, 5, 40)
-	f.Add(1, -1, 0, 80, 0, 5, 25)
-	f.Add(11, 1, 10, 90, 99, 5, 70)
-	f.Fuzz(func(t *testing.T, base, qmod, bonus, factor, prof, maxProf, attr int) {
+	f.Add(6, 0, 100, 50, 5, 40)
+	f.Add(1, 0, 80, 0, 5, 25)
+	f.Add(11, 10, 90, 99, 5, 70)
+	f.Fuzz(func(t *testing.T, base, bonus, factor, prof, maxProf, attr int) {
 		got, err := RawWeaponDamage(RawDamageInput{
-			BaseRoll: base, QualityDmgMod: qmod, DamageBonus: bonus,
+			WeaponBaseDamage: base, DamageBonus: bonus,
 			DamageFactor: factor, Proficiency: prof,
 			MaxProfDamage: maxProf, Attr: attr,
 		})

@@ -126,10 +126,11 @@ func WeaponHitModifier(family WeaponFamily, quality WeaponQuality, hitBonus int)
 }
 
 // RollWeaponBase rolls the inclusive family damage range and adds the
-// quality damage modifier (spec §9.1.8–§9.1.9): GetBaseDamage order.
-// The generic enchant/item DamageBonus is NOT added here — it joins in
-// RawWeaponDamage (§9.1.10 GetDamage order). Deterministic under the
-// injected RNG.
+// quality damage modifier (spec §9.1.8–§9.1.9): the source GetBaseDamage
+// stage. The returned value is the quality-adjusted weapon base damage:
+// family roll + quality DamageMod, exactly once. Feed it directly into
+// RawWeaponDamage as WeaponBaseDamage; never decompose or re-apply the
+// quality modifier. Deterministic under the injected RNG.
 func RollWeaponBase(rng RNG, family WeaponFamily, quality WeaponQuality) (int, error) {
 	fam, err := weaponFamilyTable(family)
 	if err != nil {
@@ -190,27 +191,28 @@ func scaleDamage(w, factor int64) int64 {
 
 // RawDamageInput carries already-resolved integer inputs for the
 // pre-mitigation physical weapon damage formula (spec §9.1.10).
-// BaseRoll is the rolled base (RollWeaponBase result WITHOUT the
-// quality modifier double-counted — pass the roll and the quality mod
-// separately); DamageBonus is the resolved numeric enchant/item bonus
-// (trusted future-content input); DamageFactor selects the stroke
+// WeaponBaseDamage is the quality-adjusted weapon base damage — the
+// result of RollWeaponBase (family roll + quality DamageMod, exactly
+// once). It MUST NOT be decomposed and the quality modifier MUST NOT
+// be applied again here. DamageBonus is the resolved numeric
+// enchant/item bonus (trusted future-content input), added exactly
+// once before DamageFactor scaling. DamageFactor selects the stroke
 // (80/90/100); Proficiency is the resolved weapon proficiency ability;
 // MaxProfDamage is viMaxProficiencyDamage (5 default); Attr is the
 // resolved Might (melee) or Aim (Fire) effective attribute.
 type RawDamageInput struct {
-	BaseRoll      int
-	QualityDmgMod int
-	DamageBonus   int
-	DamageFactor  int
-	Proficiency   int
-	MaxProfDamage int
-	Attr          int
+	WeaponBaseDamage int
+	DamageBonus      int
+	DamageFactor     int
+	Proficiency      int
+	MaxProfDamage    int
+	Attr             int
 }
 
 // RawWeaponDamage computes pre-mitigation physical weapon damage with
 // the exact source-audited operation order (spec §9.1.10):
 //
-//	w = BaseRoll + QualityDmgMod + DamageBonus
+//	w = WeaponBaseDamage + DamageBonus
 //	s = (w * DamageFactor) / 100            (truncation)
 //	profFlat = ((Proficiency+1) * MaxProfDamage) / 100   (truncation)
 //	attrBonus = bound(Attr-25, 0, 40)
@@ -228,11 +230,12 @@ func RawWeaponDamage(in RawDamageInput) (int, error) {
 	if in.Proficiency < 0 || in.Attr < 0 {
 		return 0, ErrInvalidCombatStat
 	}
-	// Trusted resolved numerics (content-owned ranges) compose
-	// additively; saturation keeps the pipeline total for absurd
-	// magnitudes (w may legitimately go negative from degenerate
-	// content and then floors to 1 at the end).
-	w := satAddSigned(satAddSigned(int64(in.BaseRoll), int64(in.QualityDmgMod)), int64(in.DamageBonus))
+	// WeaponBaseDamage already composes the family roll and the
+	// quality modifier (RollWeaponBase); only the resolved DamageBonus
+	// joins here, exactly once. Saturation keeps the pipeline total
+	// for absurd magnitudes (w may legitimately go negative from
+	// degenerate content and then floors to 1 at the end).
+	w := satAddSigned(int64(in.WeaponBaseDamage), int64(in.DamageBonus))
 	s := scaleDamage(w, int64(in.DamageFactor))
 	profFlat := satMul(int64(in.Proficiency)+1, int64(in.MaxProfDamage)) / 100
 	attrBonus := boundInt64(int64(in.Attr)-25, 0, 40)
