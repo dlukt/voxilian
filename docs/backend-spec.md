@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.25 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.26 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -4926,6 +4926,649 @@ exemption affects only the one-third cap; cooldown never allows more than
 one accepted swing per simulated second and stays correct across u32 wrap;
 identical scripted RNG + identical inputs yield identical results.
 
+### 9.2 M5-T2 defense mitigation math/domain core (frozen, v0.3.26)
+
+M5-T2 builds the deterministic defensive-math layer as pure sim-domain
+functions over immutable input structs/value objects. Normative source:
+this section. Research reference: `docs/meridian59.md` §7.1, §7.4, §7.6
+(as corrected by the v0.3.26 source audit; corrections are noted inline
+below). Vendored sources audited: `kod/object/item/passitem/defmod.kod`
+(`ModifyDefensePower`, `ModifyDefenseDamage`, `DefendingHit`),
+`kod/object/item/passitem/defmod/shield.kod` (`GetBlockAbility`,
+`ModifyDefensePower` identity, gated `ModifyDefenseDamage`),
+`kod/object/item/passitem/defmod/armor/*.kod`,
+`defmod/shield/*.kod`, `defmod/helmet/*.kod` (content numbers),
+`kod/object/passive/skill.kod` (`SuccessChance`, `CanPayCosts`),
+`kod/object/passive/skill/parry.kod`, `dodge.kod`, `block.kod` (flag
+gates), `kod/object/passive/skill/stroke.kod` (`CanParry/CanBlock/
+CanDodge` defaults), `kod/object/active/holder/nomoveon/battler.kod`
+(`TryAttack` hit/miss split, `AssessMiss` + `PFLAG_DODGED`,
+`ResistanceCheck`, `GetDamageFromResistance`, `GetDefenseDesc`
+weighting), `.../battler/player.kod` (`GetDefense`,
+`GetParry/Block/DodgeAbility`, `GetDamageType/GetSpellType`,
+`AssessDamage` order, `AdvancementCheck` defensive-improvement block),
+`.../battler/monster.kod` (`AssessDamage` without armor loop),
+`kod/include/blakston.khd` (`ATCK_*` bits, `NO/MAX/MIN_RESISTANCE`),
+`blakserv/ccode.c` (`C_Random` inclusive endpoints, `C_Bound`
+clamp order). No GPL KOD/C text is copied: mechanics only are
+reimplemented. All combat integer division truncates toward zero (C
+semantics); every T2 combat operand in the reduction/resistance path is
+non-negative at its truncation points except the documented unified
+resistance numerator, whose truncation coincides with floor because the
+result is non-negative (see §9.2.17). Intermediate products use 64-bit
+widths. T2 MUST NOT duplicate the T1 `PlayerDefense` formula (§9.2.3).
+
+#### 9.2.1 Ownership: T2 owns vs defers
+
+T2 OWNS: defensive contribution primitives consumed by `PlayerDefense`;
+Parry/Block/Dodge eligibility (capability) inputs and resolvers;
+Parry/Dodge/Block success-roll math (one shared formula, §9.2.6);
+shield block-value calculation; defensive power modifiers;
+armor/shield damage reduction; the pure-spell vs weapon+spell armor
+rule; the damage resistance tag/domain model; resistance aggregation;
+resistance clipping; the resistance damage transform; deterministic RNG
+use; golden/property tests.
+
+T2 does NOT own (and MUST NOT implement): weapon hit/damage core
+(T1, §9.1); spell damage/casting (M5-T3); real HP/mana/vigor entity
+storage (M5-T4); actual vigor mutation (M5-T4); `LoseHealth`/HP mutation
+(M5-T4/T5 composition); death/corpse/respawn (M5-T5); actual
+weapon/item inventory or equipped-item lookup (M7/M9); item durability
+mutation (M7/M9 composition — see §9.2.19 hook); named armor/shield
+catalog content (M9-T13); gateway attack wiring (later M5 integration);
+protocol changes (NONE); PG/store/persist (NONE).
+
+The live sim entity gains NO new fields in T2 (`entity.go` untouched):
+no HP/MaxHP/vigor/flags/inventory/equipment pointers. Every formula
+input that needs such numbers receives already-resolved immutable
+values, never live state.
+
+#### 9.2.2 Pipeline position and stage boundary
+
+Normative conceptual order (source `player.kod AssessDamage`):
+
+```text
+T1 RawWeaponDamage (pre-mitigation physical weapon damage, §9.1.10)
+  -> T2 armor/shield ModifyDefenseDamage (§9.2.10–§9.2.13)
+  -> T2 ResistanceCheck/GetDamageFromResistance (§9.2.14–§9.2.17)
+  -> future already-resolved post-resistance bonuses (attmods AFTER resist)
+  -> T1 ApplyPlayerDamageCaps (§9.1.12)
+  -> later vitals LoseHealth (M5-T4/T5 composition)
+```
+
+(Monster victims skip the armor stage — source `monster.kod
+AssessDamage` applies resistance only — but share the T2 resistance
+helpers. The monster-side floor-1 and bonus composition belong to
+future integration, not T2.)
+
+T2 MUST NOT apply the minimum-one rule, the one-third player cap, or
+the 30/hit cap; T2 MUST NOT mutate HP or classify death. Armor and
+resistance may legitimately produce 0 intermediate damage (notably
++100 resistance yields exactly 0); T2 production MUST NOT floor that
+to 1. The later T1 final player-cap stage owns minimum 1 (§9.1.12).
+
+#### 9.2.3 PlayerDefense composition boundary (no duplication)
+
+T1 owns the `PlayerDefense` arithmetic (§9.1.4) and T2 MUST NOT
+reimplement it. T2 resolves the defensive components that a future
+runtime feeds into `PlayerDefenseInput`:
+
+```text
+Parry     <- ResolveParryComponent (§9.2.5)
+Block     <- ResolveBlockComponent (§9.2.5)
+Dodge     <- ResolveDodgeComponent (§9.2.5)
+ExtraMods <- ResolveDefensePowerModifier (§9.2.8)
+```
+
+`Agility` (effective attribute) and `BaseMaxHP` pass through unchanged
+from their owning systems. A mandatory composition test feeds
+T2-resolved components into the REAL T1 `PlayerDefense` (§9.1.4) and
+asserts the golden result; production never duplicates the formula.
+
+#### 9.2.4 Capability inputs (exact source gates)
+
+Source conditions (`player.kod GetParry/Block/DodgeAbility`;
+`parry.kod`/`dodge.kod` `CanPayCosts`; base `skill.kod CanPayCosts`;
+stroke/monster `CanParry/CanBlock/CanDodge` defaults TRUE with rare
+FALSE overrides, e.g. `avchief.kod` unparryable):
+
+- Parry component is 0 iff ANY holds: no weapon equipped; parry
+  cost-gate fails (source gate is the `NO_FIGHT` player flag; vigor is
+  NOT gated — `vbCheck_exertion = FALSE` — and forget-enchantment /
+  range are future systems folded into the same boolean); the incoming
+  attack advertises CanParry = false. Otherwise the component is the
+  resolved Parry ability (source: weapon `GetParryAbility` returns
+  `GetSkillAbility(PARRY)`; no weapon-type bonus exists — the "TODO:
+  Define standard bonuses" comment was never implemented).
+- Block component is 0 iff ANY holds: no shield equipped; block
+  cost-gate fails (source has NO `NO_FIGHT`/`NO_MOVE` flag check for
+  block — only the base skill gate: forget-enchantment/range, folded
+  into the boolean by future runtime); the incoming attack advertises
+  CanBlock = false. Otherwise the component is the shield block rating
+  (§9.2.5). Content note (M9 wiring, not T2 math): a torch forces
+  rating 0 and a back-slung soldier shield forces rating 0; T2 models
+  these as "no effective shield".
+- Dodge component is 0 iff ANY holds: dodge cost-gate fails (source
+  gate is the `NO_MOVE` player flag; vigor NOT gated); the incoming
+  attack advertises CanDodge = false. Dodge has NO equipment
+  requirement in source. Otherwise the component is the resolved Dodge
+  ability.
+
+T2 receives these as already-resolved immutable booleans/numbers —
+conceptually:
+
+```go
+type DefenseCapability struct {
+    HasWeapon      bool // weapon equipped (parry eligibility)
+    ParryCostOK    bool // parry CanPayCosts resolved (NO_FIGHT + future)
+    AttackCanParry bool // incoming stroke/monster CanParry
+    HasShield      bool // effective shield equipped (block eligibility)
+    BlockCostOK    bool // block CanPayCosts resolved (future gates)
+    AttackCanBlock bool // incoming stroke/monster CanBlock
+    DodgeCostOK    bool // dodge CanPayCosts resolved (NO_MOVE + future)
+    AttackCanDodge bool // incoming stroke/monster CanDodge
+}
+```
+
+Exact Go shape is flexible but the boundary is normative: NO live
+equipped-item lookup, NO live room/flag reads, NO live vigor storage
+inside T2. If capability depends on systems not yet implemented, the
+caller passes the already-resolved boolean.
+
+#### 9.2.5 Component resolvers
+
+```text
+ResolveParryComponent(parryAbility, cap) =
+    0 unless cap.HasWeapon AND cap.ParryCostOK AND cap.AttackCanParry,
+    else parryAbility
+ResolveDodgeComponent(dodgeAbility, cap) =
+    0 unless cap.DodgeCostOK AND cap.AttackCanDodge,
+    else dodgeAbility
+ResolveBlockComponent(blockSkill, shieldBonus, cap) =
+    0 unless cap.HasShield AND cap.BlockCostOK AND cap.AttackCanBlock,
+    else bound(blockSkill + shieldBonus, 1, 120)
+```
+
+- Skill abilities are `GetSkillAbility` values: 0 when the skill is
+  unknown, else 1..99. Negative ability inputs are deterministic
+  domain errors (`ErrInvalidDefenseSkill`); zero is legal (yields
+  component 0 for parry/dodge; for block the rating formula still
+  applies when enabled — see below).
+- Block rating (source `shield.kod GetBlockAbility`): `bound(BlockSkill
+  + piDefense_bonus, 1, 120)`. The bonus is the shield's
+  `piDefense_bonus` (default `viDefense_base`); the `piBlockBonus`
+  property exists in source but is NEVER read (CORRECTED from the
+  research summary which said only "shieldBonus"). The SAME bonus
+  value feeds both the rating here and the block success roll
+  (§9.2.7) — that is source behavior, not double-counting: rating
+  feeds `PlayerDefense`, the roll gates damage reduction. T2 MUST keep
+  these two uses on separate, explicitly-tested paths (the T1
+  quality-mod overlap bug is the cautionary example).
+- Block rating edge (source-faithful): an enabled shield with skill 0
+  and bonus 0 yields `bound(0,1,120) = 1` (a rating contribution with
+  no reduction — reduction additionally requires ability > 0,
+  §9.2.7). Disabled (no shield / gates fail) yields component 0, NOT
+  the 1..120 clamp. Negative skill/bonus are domain errors only when
+  they make the SUM input negative-impossible: negative `blockSkill`
+  is always `ErrInvalidDefenseSkill`; negative `shieldBonus` is a
+  trusted resolved numeric (no content in T2 is negative, but future
+  cursed shields compose here) and flows through the clamp normally.
+- `Agility` requisite values for §9.2.6 are effective attributes;
+  negative is `ErrInvalidDefenseSkill`.
+
+#### 9.2.6 Defensive skill success formula (shared)
+
+All three defensive skills use the GENERIC skill `SuccessChance`
+formula (source `skill.kod`; parry/dodge/block define NO override —
+frozen explicitly). Requisite stat is Agility for all three (no
+`GetRequisiteStat` override exists in any of the three skill
+classes — the base returns `GetAgility`):
+
+```text
+chance = ((100 - requisiteStat) * ability) / 100 + requisiteStat + modifier
+success iff d100 <= chance,   d100 in 1..100 inclusive
+```
+
+- ONE truncation: `((100-req)*ability)/100` evaluates the product
+  first (64-bit intermediate), then adds `requisiteStat`, then adds
+  `modifier`. (CORRECTED from the research shorthand which omitted
+  modifier placement and truncation points.)
+- Source has NO clamp on `chance`: `chance > 100` always succeeds
+  (d100 max 100), `chance < 1` always fails (d100 min 1). T2 preserves
+  this exactly — no invented 5..95 spell-style clamp (that clamp lives
+  in spell code, not `skill.kod SuccessChance`).
+- Normative API (exact names frozen for auditability):
+  `DefenseSkillChance(ability, requisiteStat, modifier) (int, error)`
+  (pure arithmetic, unclamped) and `RollDefenseSkill(rng, ability,
+  requisiteStat, modifier)` returning the deterministic trace
+  `{Chance, Roll, Success}`. Parry, Dodge, and Block contexts all call
+  this ONE function; table tests prove all three contexts against
+  hand-computed vectors.
+- d100 uses the existing sim `RNG` interface and T1's deterministic
+  inclusive helper. No new randomness interface, no global
+  `math/rand`, no `crypto/rand`, no wall clock.
+- Modifier placement for Block: `modifier = shieldBonus`
+  (`piDefense_bonus`), per `shield.kod ModifyDefenseDamage`
+  (`SuccessChance(#modifier=piDefense_bonus)`).
+
+#### 9.2.7 Defensive roll meaning (source-audited, mandatory)
+
+- The T1 Offense-vs-Defense hit roll (`chance >= d100`, `battler.kod
+  TryAttack`) is the ONLY roll that decides whether an attack lands.
+  Parry and Dodge abilities contribute to landing ONLY through the
+  Defense rating (§9.1.4); their `SuccessChance` is NEVER rolled during
+  combat resolution (verified: no `SuccessChance` call on
+  SKID_PARRY/SKID_DODGE exists anywhere in the combat path).
+- On a miss, `AssessMiss` sets `PFLAG_DODGED` on a player victim and
+  selects miss prose via `GetDefenseDesc` weighting
+  (`random(0, parry+block+dodge+50)`); at kill time,
+  `AdvancementCheck` may `ImproveAbility` on dodge/parry/block
+  (weighted 30% parry-if-armed, then 30% block-if-shielded).
+  Advancement is M6-owned: T2 MUST NOT implement `ImproveAbility`.
+- On a hit, ONLY Block rolls: `shield.kod ModifyDefenseDamage`
+  requires `GetSkillAbility(BLOCK) > 0 AND
+  Block.SuccessChance(+piDefense_bonus)` before applying the shield's
+  reduction through the standard defmod algorithm.
+- Consequently T2 implements exactly one combat roll: the Block
+  success roll. Normative API: `RollBlock(rng, blockAbility,
+  requisiteStat, shieldBonus)` returning `{Chance, Roll, Attempted,
+  Succeeded}` where `Attempted = (blockAbility > 0)` and `Succeeded =
+  Attempted AND (Roll <= Chance)`. `RollParry`/`RollDodge` as combat
+  evasion rolls MUST NOT exist — a test MUST prove that a successful
+  generic defensive-skill trace does not negate a landed hit (i.e.
+  there is no second-evasion composition in production).
+- T2 exposes `Attempted/Succeeded` flags (conceptually
+  `UsedBlock`/`SuccessfulDefensiveSkill`) as data for the future M6
+  advancement hook; no mutation, no text.
+- The `GetDefenseDesc` miss-text weighting (`BATTLER_AVOID_CHANCE =
+  50`) is presentation-only with no gameplay consequence and is
+  frozen OUT of T2: no prose tables, no English strings, no outcome
+  enum. A future presentation task owns it.
+
+#### 9.2.8 Defense-power modifiers
+
+Source (`defmod.kod ModifyDefensePower`; `player.kod GetDefense`
+loop; `shield.kod` identity override):
+
+```text
+runningDefense = T1 base formula result (§9.1.4 without ExtraMods)
+for each worn defense modifier, oldest-to-newest equivalent*:
+    runningDefense = runningDefense + modifier.DefensePower
+(*source iterates plDefense_modifiers head-first where Cons-prepend
+makes the head most-recently-worn; addition commutes so iteration
+direction is unobservable — frozen as a plain sum)
+then faction / piFlags3 percent terms (phase-2/future, 0 in T2)
+then bound 1..1000 (T1 owns the clamp)
+```
+
+- Sign semantics are plain addition of a SIGNED bonus (source
+  `defense_power + piDefense_bonus`): Leather +50 raises, Chain −50 /
+  Scale −100 / Plate −200 / Nerudite −150 lower, Robe +20 / Helm +25
+  raise. No per-item clamp exists in source; the ONLY clamp is T1's
+  final 1..1000 bound.
+- Multiple equipped modifiers ALL apply (every element of
+  `plDefense_modifiers`).
+- Shields contribute ZERO DefensePower (source `shield.kod
+  ModifyDefensePower` returns `defense_power` unchanged — the shield
+  bonus flows to Block rating/chance instead). CORRECTED from the
+  research summary, which did not state the shield exclusion.
+- Normative API: `ResolveDefensePowerModifier(mods
+  []DefenseModifier) (int, error)` returns the plain sum, suitable as
+  `PlayerDefenseInput.ExtraMods`. To prevent a T1-style overlap bug,
+  an entry with `RequiresBlock == true` (shield) MUST carry
+  `DefensePower == 0`; otherwise `ErrInvalidDefenseModifier`. T2 never
+  calls `PlayerDefense` internally.
+
+#### 9.2.9 Generic defense-modifier representation
+
+```go
+type DefenseModifier struct {
+    DefensePower  int  // signed ModifyDefensePower bonus; 0 for shields
+    DamageReduce  int  // piDamage_reduce r (>= 0); 0 = no reduction stage
+    RequiresBlock bool // true for standard shields (block-gated reduction)
+}
+```
+
+Exact Go shape is flexible but the contract is normative: generic
+immutable value, NO named armor/shield classes, NO hard-coded Leather/
+Chain/Plate/Gold-Shield content (M9-T13 owns prototypes; golden tests
+may use their documented numbers as vectors without creating catalog
+types). Negative `DamageReduce` is `ErrInvalidDefenseModifier`
+(source behavior for r < 0 is a degenerate NIL trace; unreachable from
+real content which carries 0..6).
+
+#### 9.2.10 Armor/shield damage-reduction algorithm
+
+Source (`defmod.kod ModifyDefenseDamage`; `soldshld.kod` identical
+copy) frozen exactly:
+
+```text
+reduce = 0
+if r != 0:
+    reduce = randomInclusive(floor(r/3), r)   (C_Random: low + rand28%(high-low+1))
+    reduce = clamp(reduce, 0, damage-1)        (C_Bound order: raise to 0, then lower to damage-1)
+if spellBits != 0:
+    if weaponBits != 0:
+        reduce = (reduce * 2) / 3              (single truncation, 64-bit intermediate)
+    else:
+        reduce = 0                             (pure spell bypass)
+return damage - reduce
+```
+
+- `r/3` uses integer division BEFORE the random draw (floor for r ≥
+  0); the 2/3 scaling applies to the ROLLED+CAPPED reduction AFTER
+  the draw (source order: bound first, then `*2/3`). A test MUST
+  distinguish scale-before-random from scale-after-roll (e.g. r = 5,
+  forced max roll 5: correct `(5*2)/3 = 3`; scale-before would draw
+  from `random(1, 3)` — different distribution AND different max).
+- Edge table (normative): r = 0 → reduction 0, damage unchanged;
+  damage = 1 → reduction 0 (`clamp(roll,0,0)`), returns 1; damage = 0
+  → returns 0 unchanged with NO roll (documented freeze: the literal
+  source trace yields `bound(roll,0,-1) = -1` and returns 1, a
+  degenerate artifact of unreachable input — T1 guarantees pre-mit ≥
+  1 — and T2 MUST NOT invent a minimum, §9.2.2); damage < 0 →
+  `ErrInvalidDamageValue`; r < 0 → `ErrInvalidDefenseModifier`.
+- No panic on any input; deterministic under scripted RNG (min/max
+  rolls forcible).
+
+#### 9.2.11 Damage-class rule
+
+Source branch is on the RAW bitvectors (`atype` = weapon bits,
+`aspell` = spell bits), NOT on a precomputed enum:
+
+```text
+aspell == 0                -> full reduction (pure weapon, incl. atype == 0)
+aspell != 0 AND atype != 0 -> reduction scaled 2/3 (weapon+spell)
+aspell != 0 AND atype == 0 -> reduction 0 (pure spell)
+```
+
+Normative domain representation (exact Go shape flexible):
+
+```go
+type DamageClass uint8
+const (
+    DamageClassWeapon ...       // pure weapon (incl. degenerate zero-vector)
+    DamageClassSpell ...        // pure spell
+    DamageClassWeaponSpell ...  // mixed
+)
+func ClassifyDamageClass(weaponBits, spellBits uint32) DamageClass
+```
+
+Unknown enum values on entry points are `ErrInvalidDamageClass`.
+`ClassifyDamageClass(0, 0)` returns `DamageClassWeapon` (matches the
+source branch: `aspell == 0` takes the full-reduction path).
+
+#### 9.2.12 Multiple defensive modifiers
+
+Source (`player.kod AssessDamage` loop) applies EVERY worn modifier
+sequentially in list order; each sees the ALREADY-REDUCED damage and
+draws its own independent RNG roll; each caps against its own current
+`damage-1`:
+
+```text
+current = preMitigationDamage
+for each mod in canonical order:
+    if mod.RequiresBlock AND NOT blockSucceeded: continue
+    current = current - RollDamageReduction(rng, mod.DamageReduce, current, class)
+```
+
+- Canonical Voxilian order is caller slice order, first element
+  applies first. Live runtime feeds most-recently-worn-first to match
+  source `Cons` list order. No Go map iteration anywhere on this path.
+- Order-independence (verified algebraically, frozen): for fixed
+  rolls and damage ≥ 1, sequential application equals `max(damage −
+  Σreductions, 1)` regardless of order (each step is `max(d−r,1)` and
+  `max` absorbs), including under the mixed 2/3 per-item scaling and
+  the pure-spell all-zero case. A property test proves
+  order-independence with an independent oracle (NOT the production
+  function), while a scripted-RNG test pins the canonical draw order
+  (RNG consumption follows slice order deterministically).
+- Normative API: `ApplyDefenseModifiers(rng, damage, class, mods,
+  blockSucceeded)` returning `{FinalDamage, TotalReduced,
+  ModifiersApplied}` where `ModifiersApplied` counts entries that
+  produced nonzero reduction (durability hook for M7/M9, §9.2.19; no
+  mutation here).
+
+#### 9.2.13 Shield block damage-reduction composition
+
+- Shield reduction uses the SAME defmod algorithm (§9.2.10) via the
+  same code path (source `propagate`), gated on the §9.2.7 Block
+  outcome: ability > 0 AND success roll with `modifier =
+  shieldBonus`. Armor reductions apply IN ADDITION in the same
+  sequential loop (§9.2.12) — canonical order is the single worn-order
+  slice containing both armor and shield entries.
+- The shield bonus MUST NOT leak into `DefensePower`
+  (§9.2.8 guard); the rating (§9.2.5) and the chance modifier
+  (§9.2.6) are the only two placements. A composition test composes
+  the REAL `ResolveBlockComponent` + `RollBlock` + shield reduction
+  and proves the bonus lands exactly twice-in-two-places, never
+  twice-in-one.
+- Soldier-shield exception (source `soldshld.kod` override applies the
+  algorithm with NO Block check): frozen as integration wiring, not T2
+  math — the integrator models it as `RequiresBlock: false` with its
+  documented numbers. T2 unit tests cover both gate settings.
+
+#### 9.2.14 Resistance tag domain
+
+Source bits (`blakston.khd`; values preserved exactly):
+
+```text
+weapon domain (ATCK_WEAP_*):
+ALL 0x00001, NONMAGIC 0x00002, MAGIC 0x00004, HIT 0x00008,
+BLUDGEON 0x00010, PIERCE 0x00020, THRUST 0x00040, SLASH 0x00080,
+WHIP 0x00100, CLAW 0x00200, BITE 0x00400, STING 0x00800, ACID 0x01000,
+UNARMED 0x02000, PUNCH 0x04000, KICK 0x08000, NERUDITE 0x10000,
+SILVER 0x20000
+spell domain (ATCK_SPELL_*):
+ALL 0x0001, FIRE 0x0002, SHOCK 0x0004, COLD 0x0008, HOLY 0x0010,
+UNHOLY 0x0020, ACID 0x0040, QUAKE 0x0080, HUNTERSWORD 0x0100
+```
+
+Normative representation (exact Go shape flexible): typed tag
+constants carrying the source bit values plus a domain selector —
+conceptually `ResistanceEntry{ IsSpell bool; Tag uint32; Value int }`
+(source stores spell entries as NEGATED type; T2 uses an explicit
+boolean, never sign tricks). These are COMBAT-domain tags: NOT item
+proto IDs, NOT protocol IDs, NOT PG catalog IDs. Nothing persists in
+T2.
+
+Attack signature (conceptually `DamageSignature{ Weapon uint32; Spell
+uint32 }`): raw bitvectors as passed to source `AssessDamage`
+(`atype`/`aspell`). Callers pass them through; the resolver performs
+ALL matching internally (see §9.2.15). Source note: weapon signatures
+do NOT include the ALL bit (axe = NONMAGIC+SLASH) while spell
+signatures DO (fireball = ALL+FIRE) — both styles resolve identically
+under §9.2.15, so T2 requires no caller normalization.
+
+#### 9.2.15 Resistance matching (exact source rule)
+
+Source `battler.kod ResistanceCheck` frozen exactly. A weapon entry
+with type T matches iff `(sigWeapon & T) != 0` OR (`sigWeapon != 0`
+AND `T == WEAP_ALL`). A spell entry with type T matches iff
+`(sigSpell & T) != 0` OR (`sigSpell != 0` AND `T == SPELL_ALL`).
+Each entry is evaluated at most once; family and subtype entries are
+independent entries (no double application within one entry; e.g.
+signature NONMAGIC+SLASH vs entries WEAP_ALL +5 and SLASH +20
+considers both once each).
+
+#### 9.2.16 Resistance aggregation (exact source rule)
+
+Source frozen exactly (`NO_RESISTANCE = 0`, `MAX_RESISTANCE = 100`,
+`MIN_RESISTANCE = -100`):
+
+```text
+best = 0; worst = 0
+for each matching entry with value v:
+    if v > best:  best = v      (strictly positive only)
+    if v < worst: worst = v     (strictly negative only)
+best = min(best, 100)           (bound(best, $, 100): upper clip only)
+worst = max(worst, -100)        (bound(worst, -100, $): lower clip only)
+effective = best + worst        (structurally in -100..+100)
+```
+
+(CORRECTED from the research shorthand "clipped [−100,100]": source
+clips each SIDE separately, never the sum — the sum is
+structurally bounded because best ∈ [0,100] and worst ∈ [−100,0].)
+Matching zeros change nothing. Normative API:
+`ResolveResistance(entries []ResistanceEntry, sig DamageSignature)
+int`. Duplicate same-(domain,tag) entries are merged by SUMMATION
+before matching (mirrors source `AddResistance`, which sums into one
+list element, so live lists carry unique tags; merging keeps the
+helper total for all inputs). T2 MUST NOT mutate the input slice.
+
+Frozen matrix (hand-computed): no matches → 0; [+20] → +20;
+[+20,+50] → +50; [−10,−30] → −30; [+50,−30] → +20; [+150] → +100;
+[−150] → −100; duplicates [+30,+30 same tag] → +60 (merge, mirrors
+source); [+150,−150 different tags] → +100 + −100 = 0.
+
+#### 9.2.17 Resistance damage transform (exact source rule)
+
+Source `GetDamageFromResistance` has two branches that are
+bit-identical in integer arithmetic; T2 freezes the UNIFIED form
+(CORRECTED from the research shorthand which implied two different
+formulas):
+
+```text
+effective = bound(effective, -100, +100)   (defensive; ResolveResistance output is already in range)
+result = (damage * (100 - effective)) / 100   (single truncation, 64-bit intermediate)
+```
+
+- `damage * (100-effective)` evaluates first (saturating/64-bit; no
+  sign flip on large legal inputs), then ONE truncating division by
+  100. Truncation coincides with floor (result non-negative for
+  damage ≥ 0 and effective ≤ 100).
+- Frozen vectors (hand-computed): damage 100: +0 → 100; +25 → 75;
+  +50 → 50; +100 → 0; −25 → 125 (`100*125/100`); −100 → 200.
+  Truncation probes: damage 7 +50 → 3 (`7*50/100 = 350/100`); damage
+  13 −25 → 16 (`13*125/100 = 1625/100`); damage 29 +25 → 21
+  (`29*75/100 = 2175/100`).
+- `+100` yields EXACTLY 0 (no minimum-one inside T2, §9.2.2);
+  negative damage input is `ErrInvalidDamageValue`; damage 0 yields 0.
+- Normative API: `ApplyResistance(damage, effective int) (int,
+  error)`.
+
+#### 9.2.18 Armor/resistance ordering and spell bypass
+
+Order is normative: armor/shield `ModifyDefenseDamage` FIRST, then
+`ResistanceCheck` + transform (§9.2.2). Never reversed; no T1 caps
+inside either helper. Pure spell bypasses armor `DamageReduce`
+(§9.2.10–§9.2.11) but STILL uses `ResistanceCheck` unless the damage
+is absolute: source `AssessDamage` skips BOTH stages only when
+`absolute = TRUE` (Illusionary Wounds path). `Absolute` spell
+semantics belong to M5-T3; T2 exposes NO absolute flag — T3 composes
+by skipping T2 helpers. No Illusionary Wounds implementation here.
+
+#### 9.2.19 Durability, spell modifiers, content (all OUT)
+
+- Durability (`DefendingHit`: 50% armor wear chance, 75% Nerudite
+  wear, shield wear, shatter, repair, CAS): OUT of T2. Real equipped
+  item instances and CAS ownership are later systems. T2 exposes only
+  data: `ModifiersApplied` + `TotalReduced` (§9.2.12) and the Block
+  outcome flags (§9.2.7) for future durability logic. No item
+  mutation, no `DefendingHit` roll.
+- `Spell_modifier` (casting penalties on armor/shields): OUT (M5-T3
+  owns casting; M9-T13 owns content numbers). T2 defines no casting
+  penalty value.
+- Named equipment (Leather/Chain/Scale/Plate/Nerudite/Robe/Disciple/
+  Helm/SimpleHelm/Circlet/Metal/Gold/Knight/Orc/Guild/Soldier
+  shields/Torch, …): OUT (M9-T13). Their documented numbers appear in
+  tests ONLY as vectors.
+
+#### 9.2.20 Stable domain errors
+
+```text
+ErrInvalidDefenseModifier  (negative DamageReduce; shield entry with nonzero DefensePower)
+ErrInvalidDefenseSkill     (negative ability / requisite-stat inputs)
+ErrInvalidDamageClass      (unknown DamageClass enum value)
+```
+
+plus reuse of existing T1 errors: `ErrNilRNG`, `ErrInvalidDamageValue`
+(negative damage), `ErrInvalidCombatStat` where a negative stat slips
+a T1-owned check. Matching MUST use `errors.Is`, never string
+parsing. No `ErrUnknownResistanceTag` (bitwise matching is total;
+unknown bits are inert) and no `ErrInvalidResistanceValue` (source
+`AddResistance` never clips; any integer entry value is legal and the
+aggregation clip handles it) — errors are not invented beyond need.
+
+#### 9.2.21 Determinism and RNG
+
+Every randomized T2 mechanic uses the existing sim `RNG` interface
+and T1's deterministic inclusive helper. No `math/rand` global, no
+`crypto/rand`, no `time.Now`, no goroutines, no timers. Scripted RNG
+drives: minimum reduction, maximum reduction, defense-success exact
+threshold (`roll == chance` succeeds), `chance+1` fails, d100 1 and
+100 boundaries. Same scripted RNG + same immutable input → same
+output; no helper mutates input slices (resistance merge copies).
+
+#### 9.2.22 Golden vectors (normative minimum)
+
+DefensePower (plain sums): [] → 0; [Leather +50] → +50; [Plate −200]
+→ −200; [Leather +50, Chain −50, Helm +25] → +25; shield entry
+`{0, r, RequiresBlock:true}` → +0. Shield entry with DefensePower ≠
+0 → `ErrInvalidDefenseModifier`.
+
+Block rating: disabled (no shield) → component 0; (skill 0, bonus 0,
+enabled) → 1; (skill 40, Metal bonus 5) → 45; (skill 90, Orc bonus
+20) → 110; (skill 115, bonus 20) → 120 (upper clamp); parry/dodge
+capability matrices per §9.2.4 (each gate's enabled/disabled path).
+
+Skill chance (hand-computed, `((100−req)*abil)/100 + req + mod`):
+(req 25, abil 50, mod 0) → `(75*50)/100+25 = 37+25` = 62; (req 10,
+abil 20, mod 0) → `(90*20)/100+10 = 18+10` = 28; (req 30, abil 0,
+mod 15) → `0+30+15` = 45; (req 40, abil 99, mod 0) → `(60*99)/100+40
+= 5940/100+40 = 59+40` = 99; over-100 (req 40, abil 99, mod 10) →
+109 (unclamped, always succeeds); negative (req 0, abil 0, mod −5) →
+−5 (always fails). Roll boundaries: roll == chance succeeds,
+chance+1 fails, 1 always succeeds unless chance < 1, 100 always fails
+unless chance ≥ 100. Block outcome: ability 0 → `Attempted=false`;
+ability > 0 → attempted with the shared formula.
+
+DamageReduce: r = 0 → 0 for any damage/class; r = 6, damage 20:
+forced-min roll → `random(2,6) = 2` → 18; forced-max → 6 → 14; r =
+30, damage 3, forced-max roll 30 → capped `damage−1 = 2` → 1;
+damage 1, any r → 1; damage 0 → 0 (no roll). Pure-spell class zeroes
+any roll (r = 6 max roll, damage 20 → 20). Mixed class scales AFTER
+cap: r = 5 max roll 5 → `(5*2)/3 = 3` → damage 20 → 17; r = 4 max
+roll 4 → `(4*2)/3 = 2` → 20 → 18. Multi-modifier: damage 20, class
+weapon, mods [{r:6},{r:4}] with scripted max rolls → 20−6−4 = 10;
+same with pure-spell class → 20. Shield composition: REAL
+`ResolveBlockComponent` + `RollBlock` + `ApplyDefenseModifiers`
+with Gold-shield numbers (bonus 10, r 1).
+
+Resistance aggregation matrix (§9.2.16) plus wildcard proofs:
+signature (NONMAGIC+SLASH, 0) vs entries [WEAP_ALL +5 (leather),
+SLASH +10 (gold), BLUDGEON +10] → best +10 (unrelated BLUDGEON
+ignored, each entry counted once); signature (0, ALL+FIRE) vs
+[SPELL_ALL +15 (helm), SPELL_FIRE +20 (nerudite), SPELL_SHOCK +20]
+→ +20; signature (0, ALL+FIRE) vs [SPELL_ALL −20 (knight),
+FIRE −10 (plate)] → −20; knight-disciple style [+10 PIERCE,
+−20 SPELL_ALL] vs (NONMAGIC+PIERCE, 0) → +10 (spell weakness
+ignored); vs (0, ALL+HOLY) → −20 (weapon resist ignored).
+
+Resistance transform vectors (§9.2.17) plus composition:
+T2 zero (`damage 100, +100 → 0`) into T1 `ApplyPlayerDamageCaps` in
+a TEST ONLY yields 1 (stage-ownership proof; production never
+composes them).
+
+At least one real armor number (Plate: DefensePower −200,
+DamageReduce 6, resists FIRE −10 / SHOCK −15) and one real shield
+number (Gold: block bonus 10, DamageReduce 1, resists SLASH/BLUDGEON/
+THRUST +10) appear as test vectors without becoming content types.
+
+#### 9.2.23 Frozen property invariants
+
+Effective resistance always in −100..+100; +100 resistance never
+yields negative damage (exactly 0 for damage ≥ 0); −100 never
+amplifies above exactly 2× damage; positive resistance never
+increases damage; negative resistance never decreases damage; armor
+reduction never exceeds `currentDamage−1` per applied modifier (for
+damage ≥ 1) and never amplifies (damage 0 → 0); pure-spell armor
+reduction is exactly 0; Block rating always within 1..120 when
+enabled, exactly 0 when disabled; same scripted RNG + same immutable
+input → same output; no helper mutates input slices; T2 production
+never calls `ApplyPlayerDamageCaps` (a test asserts the zero case
+stays zero through T2 alone).
+
 ## 10. Config / deployment / ops
 
 - Config: env + file (`config.yaml` default, env override `VOX_*`); MUST
@@ -5081,6 +5724,23 @@ identical scripted RNG + identical inputs yield identical results.
    survives it.
 
 ## 14. Version history
+
+- v0.3.26: freeze M5-T2 defense mitigation semantics (new §9.2:
+  T1/T2/T3/T4/T5 ownership, T1→armor→resistance→caps pipeline with no
+  T2 minimum, T2-resolved PlayerDefense components without duplicating
+  the formula, exact Parry/Block/Dodge capability gates, shared
+  Agility-requisite skill-chance formula with unclamped chance and
+  d100<=chance success, Parry/Dodge never rolled in combat with only
+  Block gating shield reduction, DefensePower sums with shield
+  exclusion, generic DefenseModifier value, exact random(r/3,r) +
+  damage−1 cap + post-roll 2/3 damage-class rule, sequential
+  order-independent multi-modifier application, block rating
+  1..120 with piDefense_bonus placement, source-bit resistance
+  tags/matching/aggregation/transform, durability/spellmod/catalog
+  exclusions, golden vectors, property invariants) + verified
+  `meridian59.md` corrections (capability-gate mapping, Parry/Dodge
+  never rolled, piBlockBonus dead, disciple robe +5/0, per-side
+  resistance clip, unified resistance transform).
 
 - v0.3.24: correct M4-T5b2 fanout closure — targeted outbound state
   cancellation before 206 (§7.1.13, exact 206 ordering in §7.4.5);

@@ -365,9 +365,18 @@ chance = (Offense * 55) / Defense, bound 10–95; hit if chance >= d100
   costs) still consumes the swing, while a too-early attempt returns before
   arming and mutates nothing); spells use `PostCast 2 s`.
 - Player **Defense** = `Parry*2 + Block + Dodge*3 + Agi*4 + BaseMaxHP*3/2`,
-  `+ armor ModifyDefensePower + faction + flag%`, bound 1–1000. Zero components
-  if no weapon/shield or `NO_FIGHT/NO_MOVE`, or `CanParry/Block/Dodge` false.
-  Miss text weighted over parry/block/dodge/avoid pools.
+  `+ armor ModifyDefensePower + faction + flag%`, bound 1–1000. Zero-component
+  rules (verified `player.kod GetParry/Block/DodgeAbility`, `parry/dodge.kod
+  CanPayCosts`): Parry is 0 with no weapon, under `NO_FIGHT`, or when the
+  incoming stroke `CanParry` is false; Block is 0 with no shield or when the
+  stroke `CanBlock` is false (block has NO `NO_FIGHT`/`NO_MOVE` flag gate in
+  source); Dodge is 0 under `NO_MOVE` or when the stroke `CanDodge` is false
+  (no equipment requirement). Parry/Dodge `SuccessChance` is never rolled
+  during combat resolution — the abilities feed the Defense rating,
+  miss-text weighting, and kill-time advancement selection only; only Block
+  rolls (`SuccessChance(+bonus)`) to gate shield damage reduction. Miss text
+  weighted over parry/block/dodge/avoid pools (`random(0, parry+block+dodge
+  +BATTLER_AVOID_CHANCE(50))`, presentation only).
 - Monster **Off/Def** = `3*Level + 60*Difficulty`, bound 1–1500 (can exceed
   player cap — endgame hits hard). Dodge = `Difficulty*10`. Palsy ×3/4.
 - Example: Orc (45/6) → 495. Mid player (50/50/40 HP → ~430 off / ~450 def)
@@ -433,12 +442,15 @@ Leather +50/0/±0 (300–350, WEAP_ALL 5); Chain −50/2/−15 (550–650, thrus
 pierce 25, bludgeon 15, slash 20); Scale −100/4/−20 (+heat 3, bludgeon 10);
 Plate −200/6/−30 (+heat 4, fire −10 = weak, shock −15 = weak); Nerudite
 −150/5/−20 (850–900, fire/shock/cold/acid +20, quake −20, 75% dmg chance,
-shatter self); Robe +20/0/+10 (mage gear); Disciple robe +5/+10 (WEAP −10,
+shatter self); Robe +20/0/+10 (mage gear); Disciple robe +5/0 (WEAP −10,
 fire −20, shock +15); Helm +25/1/−5 (SPELL_ALL +15); Simple helm +20/1/−5
 (bludgeon 10); Circlet +5; Ivy +10; Royal shirt +10; Gauntlet +15 (attack).
 
-Shields: `Block = bound(BlockSkill + bonus, 1, 120)`; reduction only on
-successful `Block.SuccessChance(+bonus)`. Metal 5/1 (+slash 10); Gold 10/1
+Shields: `Block = bound(BlockSkill + bonus, 1, 120)` where the bonus is
+`piDefense_bonus` (the `piBlockBonus` property exists but is never read);
+reduction only on successful `Block.SuccessChance(+bonus)`. Soldier shield
+uniquely applies its reduction without the Block check (copied defmod
+algorithm); torch forces `GetBlockAbility = 0`. Metal 5/1 (+slash 10); Gold 10/1
 (+slash/bludgeon/thrust 10); Knight 15/2 (SPELL −20, pierce 10); Orc 20/2
 (pierce 15, holy −20); Guild/Soldier 20/2 (pierce 10); Torch 50 hits only.
 250–300 hits (guild 350–400).
@@ -457,8 +469,15 @@ Nodeburst/ManaBomb mana-based; Slitherbolt 12–19 (DM only).
 
 ### 7.6 Resistances (`battler.kod:ResistanceCheck`)
 
-Largest resist + worst weakness among `plResistances`, clipped [−100,100];
-`>0: dmg*(100−v)/100`, else vuln amplify. Sources: armor/shield tables,
+Per matching entry (weapon entries carry a positive type, spell entries a
+negated type): track the largest value strictly >0 and the most-negative
+value strictly <0 (matching zeros change nothing); clip the positive side
+above at +100 and the negative side below at −100, return the sum
+(structurally −100..+100). Unified transform `dmg*(100−v)/100` with a single
+truncation (`+100 → 0`, `−100 → dmg×2`, `0 → dmg`). An entry tagged
+`WEAP_ALL`/`SPELL_ALL` matches any nonzero weapon/spell vector (special
+case); specific entries match by bit overlap. Same-tag duplicates cannot
+occur live (`AddResistance` sums them into one element). Sources: armor/shield tables,
 `ResistanceEnchantment` (`power/2+1`, 1–50, 5–10 min), Fire/Cold/Shock/Acid
 rings (50), necklaces/charms, Gort/MShield/Umbrella (defense-mod, not resist
 list). Types `blakston.khd`: spell ALL/FIRE/SHOCK/COLD/HOLY/UNHOLY/ACID/QUAKE/

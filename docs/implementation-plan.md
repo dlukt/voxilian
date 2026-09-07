@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.9)
+# Voxilian Backend — Implementation Plan (v1.10)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.25).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.26).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -167,7 +167,7 @@ Exit: 20 Hz tick loop, cells, server-authoritative movement with reconciliation 
 Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested.
 
 - [x] **M5-T1** Offense/defense/hit + weapon tables: `(Off*55)/Def` 10–95%, weapon type/quality, 1 swing/s, vigor costs, 30/hit + ⅓-HP caps, severity text hooks. Golden vectors from `meridian59.md` §7. Spec: §9.1, meridian59 §7. Pure sim-domain math only: NO gateway/opcode-103 wiring (103..120 stay rate-gate-then-delegate), NO armor/resist/spell/vitals/death work, NO `entity.go` fields.
-- [ ] **M5-T2** Armor/shields/resists: `ModifyDefensePower/Damage`, block/parry/dodge rolls, ±100 resist clip, spell-vs-weapon reduction rules. Golden vectors. Spec: §9.
+- [ ] **M5-T2** Armor/shields/resists: `ModifyDefensePower/Damage`, block/parry/dodge rolls, ±100 resist clip, spell-vs-weapon reduction rules. Golden vectors. Spec: §9.2 (frozen v0.3.26).
 - [ ] **M5-T3** Spell damage + touch/walls/AoE: `rand*(50+power/2)/99`, wall ticks, touch scaling, Illusionary-Wounds rules, quake falloff; mana/vigor/reagent/karma gates; cast/post-cast timing. Spec: §9.
 - [ ] **M5-T4** Vitals/regen/hunger: HP=level caps, mana+nodes, exertion/rest/thresholds, regen tick formulas, stomach decay. Golden vectors + timer tests (fake clock). Spec: §9, meridian59 §4.
 - [ ] **M5-T5** Death pipeline: corpse + full droppable drop (PK tags), advancement wipe/halve, Underworld-region respawn, leaving penalties (Stam saves), Portal-of-Life hook; single-txn state+ledger. Crash-during-death test. Spec: §9, §8.1.
@@ -306,6 +306,17 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 
 ## Plan history
 
+- v1.10: freeze M5-T2 defense mitigation semantics (spec v0.3.26 §9.2:
+  T2 ownership/pipeline boundaries, T2-resolved PlayerDefense
+  components, exact capability gates, shared skill-chance formula,
+  Parry/Dodge-never-rolled with Block-only shield gating, DefensePower
+  sums with shield exclusion, exact damage-reduction/damage-class/
+  multi-modifier rules, block rating, resistance tag/matching/
+  aggregation/transform contracts, durability/spellmod/catalog
+  exclusions, golden vectors, property invariants) + verified
+  `meridian59.md` corrections (capability mapping, piBlockBonus dead,
+  disciple robe, per-side resistance clip, unified transform). M5-T2
+  stays `[ ]`, M5 exit stays `[ ]`.
 - v1.9: freeze M5-T1 weapon-combat semantics (spec v0.3.25 §9.1: T1/T2/T3/
   T4/T5 ownership boundaries, exact offense/defense/monster-rating/hit/
   weapon-table/damage-stage/cap/severity/cooldown/vigor contracts, no
