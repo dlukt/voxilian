@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.23 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.24 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -2766,6 +2766,56 @@ label series — ignoring an unknown internal value is preferable to
 accidental high-cardinality metric creation. No user-provided
 diagnostic string ever becomes a metric label.
 
+#### 7.1.13 Targeted outbound state cancellation (frozen, v0.3.24)
+
+The visibility contract (§7.4.5) requires a non-blocking way to
+invalidate ONE queued `205` before admitting its terminal `206`, so a
+stale queued `205` can never physically appear after a later `206`
+for a retired handle. The existing outbound producer therefore
+exposes a narrow operation over the EXISTING per-session outbound
+queue — conceptually `CancelState(key)`, exact Go naming may differ.
+It is NOT a new queue, NOT a coarse queue flush, and NEVER cancels
+unrelated entity state.
+
+Result classification (exact Go names may differ):
+
+```text
+Canceled  — a matching queued state item existed; it was removed
+InFlight  — the matching item is the current physical in-flight write
+NotQueued — neither queued nor writing
+Closed    — the queue is closed
+```
+
+Semantics:
+
+```text
+MUST return immediately
+MUST NOT wait for writer ownership
+MUST NOT write a socket
+MUST use only the outbound queue's existing short mutex
+```
+
+A matching queued state item is removed, its message + byte
+residency is released, capacity waiters are woken, and normal
+post-mutation queue-depth observations MAY be emitted. The
+currently-writing item is NEVER cancelled: an in-flight match
+returns `InFlight` and is allowed to finish, which is safe because
+it already owns physical writer serialization and therefore MUST
+physically complete before any later `206` can write. `NotQueued`
+means no queued or writing match. `Closed` means the queue is
+closed; the recipient already requires resync.
+
+A canceled queued state frame receives no S→C sequence, creates no
+ACK debt, and is never physically written, because sequence
+allocation still occurs only at physical writer selection (§7.1.8).
+
+Targeted cancellation is intentional semantic invalidation, NOT
+backpressure: a successful cancellation MUST NOT increment
+`vox_outbound_state_drops_total` and MUST NOT increment
+`vox_outbound_state_coalesced_total`. No new Prometheus family and
+no new reason label are added; the frozen state-drop reason
+whitelist (`evicted`, `saturated`, `closed`) remains unchanged.
+
 ### 7.3 Gateway-to-sim ingress and world-presence lifecycle
 (frozen, v0.3.22)
 
@@ -3008,7 +3058,7 @@ changes (`proto` and `testdata/protocol` unchanged; the existing
 204/205/206 and implements no MovementSink adapter, viewer index,
 presentation lookup, fanout throttler, heartbeat, or sweep.
 
-### 7.4 AOI fanout and transport liveness (frozen, v0.3.23)
+### 7.4 AOI fanout and transport liveness (frozen, v0.3.23; closure corrected v0.3.24)
 
 T5b2 completes the M4 runtime: the Presence viewer reverse index,
 one bounded fanout pump consuming authoritative `sim.MovementUpdate`
@@ -3076,14 +3126,37 @@ with low-rate sampled logging (`queue_full`/`closed`), but T5b2
 adds NO Prometheus series and never logs every flooded packet.
 Bootstrap/Remove controls are reliable: callers may wait a bounded
 `FanoutControlTimeout = 1s` admission budget (internal constant, no
-config); before admission cancellation may abort, after admission
-the event is authoritative with a cap-1 completion signal and no
-waiter goroutine. One queue is the visibility barrier: controls
+config); BEFORE successful publication, context cancellation /
+admission timeout / Close may reject; AFTER successful publication
+the event is authoritative — the caller waits ONLY for that event's
+cap-1 completion signal (no waiter goroutine) and a later Close
+never changes that event's definitive result. The pump/drain
+remains responsible for producing exactly one result for every
+admitted control. One queue is the visibility barrier: controls
 order after earlier movements and before later ones, so no 205
 precedes its bootstrap 204 and no stale 205 follows a 206. Shutdown
-is idempotent: movements discarded, queued control waiters receive
-`ErrFanoutClosed`, future movement dropped, future control
-rejected, no send-on-closed panic, no restart required.
+is idempotent: movements discarded, queued-but-never-admitted
+control waiters receive `ErrFanoutClosed`, future movement dropped,
+future control rejected, no send-on-closed panic, no restart
+required. No control may be published after the closing runtime has
+completed its final drain: admission holds a short admission-vs-close
+synchronization (recommended: a small `sync.RWMutex` with a `closed`
+flag used ONLY around event admission/Close transition —
+admission takes read ownership, checks closed, waits up to
+`FanoutControlTimeout` for queue publication, releases after
+publication, then waits only for event completion; Close takes
+write ownership, marks closed, closes done, releases, then waits
+for the pump — so Close waits at most the already-frozen bounded
+control-admission interval and concurrent admissions still share
+read ownership instead of serializing behind one 1-second mutex
+wait). `OnMovement` stays NON-BLOCKING and MUST NOT acquire that
+gate in a waiting mode (use `TryRLock` or another race-free
+immediate mechanism): runtime open + immediate admission
+ownership → existing select/default queue send; closing/closed or
+gate unavailable → drop immediately counted as closed; queue full
+→ drop immediately counted as queue_full. After `Close()`
+completes, no future movement event may be left stranded in the
+event channel.
 
 #### 7.4.4 Readiness and bootstrap
 
@@ -3149,11 +3222,36 @@ with that session's handle (same entity may be 4 to A and 17 to B);
 Presence locks are never held across TryCritical/TryState/source
 calls; one pump serializes ready/throttle/ordering state.
 
-204 uses TryCritical (visibility transitions are reliable); 206
-uses TryCritical with the old handle, then retires (critical
-failure still retires — the recipient is already failed closed and
-reconnects/resyncs; never preserve a stale handle for a dying
-socket). New-handle 204 admission failure retires the handle via
+204 uses TryCritical (visibility transitions are reliable); every
+visibility-retiring 206 MUST first invalidate the queued predecessor
+state, then admit, then retire — exact order with the OLD handle
+captured before `HideVisible` (frozen v0.3.24):
+
+```text
+capture old NetEntityID H
+key = StateKey{ Kind: OpcodeEntityMove, ID: uint64(H) }
+CancelState(key)
+TryCritical(206 using H)
+HideVisible(...)
+clear throttle epoch
+```
+
+Interpretation: `Canceled` → the stale queued 205 is gone and the
+206 may proceed; `InFlight` → that 205 already owns physical writer
+serialization and MUST physically complete before the later 206 can
+write, so the 206 may proceed; `NotQueued` → the 206 may proceed;
+`Closed` → retire the mapping because the recipient already
+requires resync. Because one FanoutRuntime pump is the sole M4
+producer of 205 visibility state for that recipient/entity, no new
+same-key 205 can race between cancellation and 206 admission. No
+coarse queue flush; no cancellation of unrelated entity state.
+Critical failure of the 206 still retires — the recipient is
+already failed closed and reconnects/resyncs; never preserve a
+stale handle for a dying socket. `204` ordering is unchanged
+(v0.3.24): `204` is critical and any later `205` is state, so
+critical-first scheduling already guarantees a `204` cannot be
+overtaken by a later `205` — only the terminal `205 → 206`
+direction needs the targeted invalidation above. New-handle 204 admission failure retires the handle via
 HideVisible (never reused) and fails the recipient; own-handle
 failure closes/resyncs the owner without HideVisible(own). 205 is
 coalescible state via `TryState(sid, StateKey{Kind:
@@ -3195,11 +3293,39 @@ sim-remove failure skips fanout entirely (retry-safe). RemovePresence
 is ordered after earlier movements: the source goes not-ready,
 other ready viewers get 206 with mapping retirement, the source
 gets no own-206 and its throttle clears. No future MovementUpdate
-can exist after sim removal, so no stale 205 follows. If reliable
-removal cannot complete after real sim removal, every currently
-indexed viewer is closed/resynced with mappings retired, the source
-marked not-ready, and local teardown continues — never resurrecting
-the entity or leaving stale addressable handles. Takeover order is
+can exist after sim removal, so no stale 205 follows. The healthy
+queued RemovePresence path remains the SOLE normal cleanup owner:
+source not-ready, source/entity throttle cleared, 206 to ready
+observers, old observer handles retired, source ready cleared.
+
+Fanout local-state locking (v0.3.24): the normal pump remains the
+sole DECISION executor of visibility, but the pump-only `ready` and
+`throttle` maps gain ONE short fanout-local metadata mutex because
+the emergency primitive below may run outside the pump. The mutex
+protects ONLY `ready` and `throttle` and is NEVER held across
+Presence calls, PresentationSource calls, TryCritical/TryState,
+socket close, or event admission waits — no broad fanout lock.
+
+Emergency fanout-state invalidation (v0.3.24): the fanout runtime
+exposes a narrow synchronous local-state primitive — conceptually
+`ForgetSession(sid)` or `FailClosedSession(sid)`, exact naming
+flexible — that is idempotent, performs NO socket I/O, NO Presence
+operation, NO PresentationSource call, NO event enqueue, removes
+`ready[sid]`, removes every throttle entry whose recipient sid ==
+sid, and works even while the fanout runtime is closing/closed. It
+does NOT replace the normal queued RemovePresence path.
+
+If sim removal SUCCEEDED but the reliable `Fanout.RemovePresence`
+FAILED before cleanup could complete, the `WorldSessionRuntime`
+fallback MUST snapshot currently indexed viewers and, for each
+affected viewer including the source, fail/CloseNow the transport
+(as already required) plus call the emergency invalidation for
+that viewer sid; for each non-source viewer it additionally retires
+the removed entity's Presence mapping; then it continues with
+source `Presence.Deactivate`. After the fallback no affected
+closed session retains `ready=true`, 205 throttle metadata, or an
+addressable removed-entity handle. The removed sim entity is never
+resurrected. Takeover order is
 old flush → old sim remove → old fanout remove → old deactivate →
 old CompleteLeaveWorld → old kick → new stage/219/Presence/fresh
 bootstrap epoch; old handles never transfer, and flush/remove
@@ -3243,9 +3369,29 @@ TouchHeartbeat-not-found is normal convergence. The 30 s sweep uses
 sorted `StaleSessions(Now())`: CloseNow live conns, reap each,
 retain-then-retry on WorldExit failure. Presence without a session
 entry is a loud internal invariant. One `TransportLiveness`
-(Presence + Reaper + NowFunc + ticker factory) owns the sweep and
-ping loops with manually-pulsable timers (no scattered
-time.NewTicker); Server takes it as optional/explicit composition
+(Presence + Reaper + NowFunc + ticker factory) owns the sweep AND
+every started per-connection Ping loop strongly enough that
+`Close()` can stop them (v0.3.24; exact representation flexible —
+e.g. a `pingers` map of idempotent `{stop, done}` loop handles).
+`StartPinger` under the existing liveness mutex: if closed, start
+NO ticker, start NO goroutine, and return an idempotent no-op
+stop; otherwise register the loop, account for it before releasing
+the mutex, and start exactly one goroutine. A session never has
+two simultaneously registered Ping loops; a completed/stopped loop
+removes itself from the registry safely. `Close()` marks liveness
+closed atomically under the mutex, stops the stale-sweep loop,
+snapshots/stops EVERY active registered Ping loop, prevents any
+future `StartPinger` from creating another loop, then waits for
+the sweep + all Ping loops to exit, and returns — without
+requiring the WebSocket transport itself to close first, and
+without reaping/closing the active sessions merely to stop
+liveness. The per-connection returned stop and global `Close()`
+may race; both are idempotent with no close-of-closed-channel,
+no WaitGroup misuse, no double ticker-stop panic, and no goroutine
+leak. After global Close begins, no positive WaitGroup Add may
+race a zero-count Wait: mutex/lifecycle ordering prevents
+`StartPinger` from adding after closed (splitting sweep and pinger
+wait groups is allowed). Server takes it as optional/explicit composition
 (nil keeps frame/auth/ACK tests world-free), gains idempotent
 `Close()` for the sweep goroutine, stops the per-conn ping loop in
 teardown, and takeover CloseNow ends the old ping loop (heartbeat
@@ -3262,8 +3408,9 @@ changes (in-memory injected presentation); no config changes
 (Keycloak/PG/WorldSource/SIGTERM stay M10–M12); no new
 dependencies; no new Prometheus family (existing metrics only);
 no M5 gameplay; no M10 real-baseline replacement (204 bootstrap
-bridges to M10-T4); `outbound.go` needs no semantic change — if
-one appears necessary, freeze the spec first.
+bridges to M10-T4); `outbound.go` gains ONLY the narrow v0.3.24
+targeted state-cancellation operation (§7.1.13) — no second queue,
+no new metric, no seq/ACK change.
 
 T5a exposes only a narrow no-op-by-default observer seam — sufficient
 to observe queue depth messages/bytes per lane, state dropped, state
@@ -4566,6 +4713,14 @@ pgx/generated sqlc; tests may use pgx/raw SQL for fixtures only.
    survives it.
 
 ## 14. Version history
+
+- v0.3.24: correct M4-T5b2 fanout closure — targeted outbound state
+  cancellation before 206 (§7.1.13, exact 206 ordering in §7.4.5);
+  exact post-admission fanout-control completion with a race-free
+  Close/admission boundary and non-blocking OnMovement (§7.4.3);
+  emergency fanout ready/throttle invalidation with one short
+  metadata mutex and exact post-sim-remove fallback (§7.4.6); and
+  TransportLiveness.Close ownership of all Ping loops (§7.4.7).
 
 - v0.3.23: freeze M4-T5b2 AOI fanout and transport liveness —
   gateway Presence gains an entity->viewer reverse index; one bounded

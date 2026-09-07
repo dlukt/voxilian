@@ -1,6 +1,6 @@
 # Voxilian Backend — Implementation Plan (v1.7)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.23).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.24).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -139,7 +139,7 @@ Exit: 20 Hz tick loop, cells, server-authoritative movement with reconciliation 
   Deterministic/race/real-WS integration tests. NO AOI 204/205/206
   fanout yet. NO heartbeat runtime yet.
   Spec: §5.2.10, §5.3–§5.4, §6.3, §7, §7.2, §7.3.
-- [x] **M4-T5b2** AOI fanout + transport liveness:
+- [ ] **M4-T5b2** AOI fanout + transport liveness (REOPENED v0.3.24 corrective closure):
   Presence entity->viewer reverse index; in-memory EntityPresentation
   source; one bounded 1024-event fanout pump over sim MovementUpdate
   (non-blocking sink, drop-counted); post-world-ready deterministic
@@ -149,8 +149,17 @@ Exit: 20 Hz tick loop, cells, server-authoritative movement with reconciliation 
   flush-first exit/takeover with fanout remove; raw-disconnect reaper
   with stale retention; 15 s Ping/Pong + 30 s stale sweep; real WS
   two-client/crossing/slow-viewer proofs. No M5 gameplay, no M10
-  baseline replacement.
-  Spec: §4, §5.2.10, §6.3, §7, §7.1, §7.2, §7.3, §7.4.
+   baseline replacement.
+   Corrective v0.3.24 scope (spec §7.1.13 + §7.4.3/§7.4.5/§7.4.6/§7.4.7):
+   targeted outbound CancelState before every 206 (queued
+   205 → canceled, in-flight 205 → completes first; no new metric,
+   no seq/ACK debt); exact post-admission control completion with a
+   race-free Close/admission boundary and non-blocking OnMovement;
+   emergency fanout ForgetSession ready/throttle invalidation in the
+   post-sim-remove fallback; TransportLiveness.Close ownership of
+   all Ping loops (stop sweep + every pinger, no future pinger,
+   race-safe stop vs Close).
+   Spec: §4, §5.2.10, §6.3, §7, §7.1, §7.2, §7.3, §7.4.
 - [ ] **M4 exit criteria met** (movement + handoff race tests green; saver property tests green).
 
 ## M5 — Combat + vitals + death
@@ -297,6 +306,12 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 
 ## Plan history
 
+- v1.8: correct M4-T5b2 fanout closure semantics (spec v0.3.24) and
+  REOPEN M4-T5b2 `[ ]` — targeted outbound state cancellation before
+  206, exact post-admission control completion, race-free
+  Close/admission boundary, emergency fanout ready/throttle
+  invalidation, TransportLiveness.Close pinger ownership. M4 exit
+  stays `[ ]`.
 - v1.7: freeze M4-T5b2 AOI fanout + transport liveness in spec §7.4
   (viewer reverse index, in-memory presentation seam, bounded 1024-event
   pump, 204 bootstrap + readiness barrier, recipient-local ≤10 Hz 205,
