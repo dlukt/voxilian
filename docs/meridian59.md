@@ -253,8 +253,8 @@ Anonymity L1, Blink L1 (15 mana room teleport — the free starter),
 Feign Death L1 (minHP 5 = needs BaseMaxHP 5, §5), Flash L1 (interrupt trance, O/H), Shadow Form L1,
 Bait L2 (taunt mobs), Eavesdrop L2, Foresight L2 (reveal victim stats, O/H),
 Forget L2 (victim forgets ability, O/H), Illusionary Firewall L3 (fake wall,
-H), Illusionary Form L3, Illusionary Wounds L3 (absolute damage, leaves 1 HP,
-⅓ cap — see §7), Reflection L3 (mirror summon), Vertigo L3 (O/H), Dement L4
+H), Illusionary Form L3, Illusionary Wounds L3 (absolute damage, floor MaxHP/3
+then HP−1 caps, never lethal — see §7), Reflection L3 (mirror summon), Vertigo L3 (O/H), Dement L4
 (O/H), Apparition L4 (illus attacker, O/H), Denial L4 (unrealize wounds),
 Artifice L5 (random enchant), Morph L5 (turn to beast), Evil Twin L5 (dark
 double, H), Elusion L6 (escape), Seduce L6 (control weak mob, O/H), Summon
@@ -463,10 +463,12 @@ algorithm); torch forces `GetBlockAbility = 0`. Metal 5/1 (+slash 10); Gold 10/1
 Fireball 8–12 (7 mana, bolt); Lightning 13–18 (10, bolt); Blast of Fire
 15–23 (8, range 4); Explosive Frost 13–25 (8, r4); Shocking Fury 12–20 (8,
 r5); Splash Acid 16–25 (10, r3); Vampiric Drain 12–18 + heal half (10+4v,
-r4); Illusionary Wounds `17+(50−Int)/10` vs players / `30−diff*2` vs mobs
-×power/100, leaves 1 HP, ⅓ cap, **ignores resist** (10+3v, r4); Earthquake
-`rand(5,9)×severity×falloff`, full ≤8 sq (12, room AoE); Walls `bound(power/6,
-1,16)`/tick; Touch 3–9 base scaled `d/2+(d/2)*power/99+1` (Acid 4–8, Flame
+r4); Illusionary Wounds `17+(50−Int)/10` vs players / `30−bound(diff*2,1,20)`
+vs mobs ×power/100, floor MaxHP/3 (buffed Max) then HP−1 caps (never lethal,
+can be 0), **ignores resist** (10+3v, r4); Earthquake
+`rand(5,9)×severity×falloff`, full ≤8 sq (12, room AoE); Walls fire maxDamage
+`bound(power/6, 1,16)` / lightning `bound(power/4, 1,25)` with per-tick
+`Random(0,maxDamage)` (illusionary passes power directly, `<35` no effect); Touch 3–9 base scaled `d/2+(d/2)*power/99+1` (Acid 4–8, Flame
 4–9, Holy 3–6 ×2 vs undead ±karma, Icy 5–8, Zap 3–8; 6–12 mana melee);
 Nodeburst/ManaBomb mana-based; Slitherbolt 12–19 (DM only).
 

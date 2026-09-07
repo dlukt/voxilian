@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.11)
+# Voxilian Backend — Implementation Plan (v1.12)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.27).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.28).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -182,7 +182,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   falloff, Illusionary Wounds, Vampiric Drain / damage-derived side-effect
   hooks, other special spell-damage formulas needed by the MVP. Still no
   authoritative HP mutation, no room/world-object scheduler, no gateway, no
-  real inventory/reagent mutation. Spec: §9.3b (boundary frozen v0.3.27).
+  real inventory/reagent mutation. Spec: §9.3b (frozen v0.3.28).
 - [ ] **M5-T4** Vitals/regen/hunger: HP=level caps, mana+nodes, exertion/rest/thresholds, regen tick formulas, stomach decay. Golden vectors + timer tests (fake clock). Spec: §9, meridian59 §4.
 - [ ] **M5-T5** Death pipeline: corpse + full droppable drop (PK tags), advancement wipe/halve, Underworld-region respawn, leaving penalties (Stam saves), Portal-of-Life hook; single-txn state+ledger. Crash-during-death test. Spec: §9, §8.1.
 - [ ] **M5-T6** Personal/world-light intents: `115 rest`, `116 eat` (hunger/vigor effects), `105 use` (skill/item dispatch incl. Second Wind), `119 safety_toggle`, `117/118 → 209` chat (+channel rules, length caps, rate limits). Owner of these opcodes: this task, no other. Spec: §6.3, §9.
@@ -333,6 +333,14 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 
 ## Plan history
 
+- v1.12: freeze M5-T3b special spell semantics (spec v0.3.28 §9.3b:
+  touch proficiency/damage/duration/Holy Touch with dead viHit_Factor
+  excluded, Illusionary Wounds /100 bases with MaxHP/3 then HP-1 caps
+  and applied-amount refund, Vampiric Drain post-application heal,
+  Earthquake severity/squared-falloff/modes, wall max-damage/lifetime/
+  period/ordinary/illusionary mechanics with IW reuse) + verified
+  `meridian59.md` corrections (wall families, IW precision). M5-T3b
+  stays `[ ]`, M5 exit stays `[ ]`.
 - v1.11: split M5-T3 into generic core T3a + special archetypes T3b and
   add M5-T7 authoritative 103/104 combat runtime after T1..T6 (spec
   v0.3.27 §9.3/§9.3a/§9.3b/§9.3c: T3a generic success/cost/timing/damage

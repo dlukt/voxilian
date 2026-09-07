@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.27 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.28 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -6153,42 +6153,623 @@ RNG/input → identical result. Monotonicity is asserted
 only where source guarantees it (no invented monotonicity
 across the strict `>`/`>=` tier edges).
 
-#### 9.3b M5-T3b special spell-damage archetypes (deferred, boundary only)
+#### 9.3b M5-T3b special spell-damage archetypes (normative, v0.3.28)
 
-T3b owns pure/value deterministic mechanics for touch
-attacks, wall periodic damage/timing, Earthquake/AoE
-falloff, Illusionary Wounds, Vampiric Drain /
-damage-derived side-effect hooks, and other special
-spell-damage formulas needed by the MVP. Still: no
-authoritative HP mutation, no room/world-object scheduler,
-no gateway, no real inventory/reagent mutation. Source
-families verified for the boundary (exact T3b normative
-formulas may be finalized in the T3b task if more audit is
-needed):
+T3b remains a PURE/VALUE sim-domain layer: deterministic mechanics
+over immutable scalar/value inputs plus the injected RNG. Normative
+source: this section. Research reference: `docs/meridian59.md` §7.5
+(as corrected by the v0.3.28 audit). Vendored sources audited:
+`kod/object/passive/spell/persench/touchatk.kod` (+ `touchatk/
+zap.kod`, `icyfing.kod`, `acidtch.kod`, `holytch.kod`,
+`flametch.kod`), `kod/object/passive/spell/persench.kod`
+(identity `ModifyHitRoll`), `.../battler/player.kod`
+(`GetOffense`, `TryAttack` cost gates, touch wield rule),
+`kod/object/passive/spell/atakspel/illwound.kod`
+(`CastSpell` override, `GetHPLoss`, `GetDuration`,
+`EndEnchantmentEffects`), `kod/object/passive/spell/atakspel/
+vampdrn.kod` (`DoSideEffect`), `kod/object/passive/spell/
+earthqua.kod` (`CastSpell` severity, `ComputeDamage`,
+item-self, environmental), `kod/object/passive/spell/
+walspell.kod` (+ `walspell/firewall.kod`, `ltngwall.kod`,
+`ifirewal.kod`), `kod/object/active/wallelem.kod`
+(`CheckForEffect`, `PeriodicEffect`, affected dedup, gates),
+`kod/object/active/wallelem/wallfire.kod`,
+`wallltng.kod`, `kod/object/passive/pfirewll.kod`,
+`pltngwll.kod`. No GPL KOD/C text is copied: mechanics only
+are reimplemented. All integer division truncates toward zero
+(C semantics); intermediate products use 64-bit widths, with
+overflow-safe SIGNED arithmetic wherever a signed operand
+(negative karma, `HP-1`) can occur — never a non-negative-only
+helper on a signed operand.
+
+T3b OWNS: TouchAttackSpell combat composition values, touch
+base-damage scaling, touch duration, the source-audited Holy
+Touch damage modifier; Illusionary Wounds HP-loss formula,
+duration/refund contract; Vampiric Drain heal-from-damage
+side-effect formula; Earthquake severity, squared-distance
+falloff, normal/environmental/item-self damage formulas; wall
+max-damage arithmetic, element lifetime arithmetic, periodic
+jitter, ordinary fire/lightning rolls, illusionary-wall
+damage/refund calculation; special-spell damage
+policy/signature values; golden/property/fuzz tests.
+
+T3b does NOT own (and MUST NOT implement): authoritative HP
+mutation or healing (M5-T4/T7); death (M5-T5/T7); real cast
+routing (M5-T7); 103/104 gateway handling (M5-T7); world
+target enumeration, room object creation, wall placement
+geometry (later runtime/world); wall goroutines/timers
+(NEVER — later deterministic sim/runtime owns scheduling);
+per-target wall affected-set runtime state (later
+deterministic sim/runtime; T3b documents the contract only);
+LOS queries, room flags, safety/PK checks (world/runtime,
+M5-T6/T7); kill attribution (M5-T5/T7); advancement (M6);
+named spell/item catalog (M9); inventory/reagents (M7/M9/T7
+seam); Store/PG (NONE); protocol changes (NONE).
+
+The live sim entity gains NO new fields in T3b
+(`entity.go`, `engine.go`, `ingress.go` untouched): no
+HP/MaxHP/Mana/Vigor/Stomach/regen/healing state.
+
+Damage pipeline boundaries (no universal `ResolveDamage`):
 
 ```text
-Touch: weapon-hit pipeline (not AttackSpell); spell ability as
-  Stroke; max(Punch, 1.5*Mysticism) proficiency;
-  damage/2 + ((damage/2)*power)/99 + 1 scaling.
-Illusionary Wounds: absolute; resistance bypass; player/intellect
-  and monster/difficulty formulas with /100 (not /99) divisor;
-  floor MaxHP/3 cap; leave-1-HP rule; duration/refund value contract.
-Earthquake: 5..9 base; severity 1 + power/25; squared-distance
-  falloff, full <= 8, zero > 20; environmental flat mode.
-Walls: periodic ~1.5 s with 90..110% jitter; per-cycle affected
-  suppression; family-specific 0..MaxDamage rolls.
-Vampiric Drain: generic AttackSpell pipeline + half-damage heal
-  side-effect hook (kill uses half of max instead).
+Ordinary special spell (quake, ordinary walls, vamp raw):
+  T3b raw/special damage -> T2 defense-class handling -> T2 resistance
+  -> future resolved bonuses -> applicable T1 player caps
+  -> T4 HP mutation -> T5 death
+Touch attack (COMBAT-STROKE spell, weapon AND spell domains):
+  T3b touch raw damage -> T2 mixed weapon+spell defense handling
+  -> T2 resistance -> future resolved bonuses -> T1 player caps
+  -> T4 HP mutation
+Illusionary Wounds / illusionary wall (absolute):
+  T3b absolute loss calculation -> bypass T2 numeric resistance
+  -> bypass ordinary T1 player hit caps -> T4/T7 exact HP application
 ```
 
+##### 9.3b.1 Touch offense components
+
+Touch is a combat-stroke spell: the touch spell ability is the
+Stroke, and proficiency is (source `touchatk.kod GetProf`):
+
+```text
+MysticismContribution = (Mysticism * 3) / 2
+Proficiency = max(PunchAbility, MysticismContribution)
+```
+
+Integer order is binding: `Mysticism * 3` first (64-bit),
+then `/ 2` — NOT `Mysticism * (3/2)`. `Mysticism` is the
+already-resolved effective attribute; `PunchAbility` the
+already-resolved Punch skill (0 when unknown). Negative
+inputs are `ErrInvalidCombatStat`. Normative API conceptually
+`TouchProficiency(punchAbility, mysticism int) (int, error)`.
+
+Future composition uses the REAL T1 functions (no second
+offense/hit formula): Touch Stroke + Touch Proficiency +
+resolved Aim + resolved BaseMaxHP + resolved attack modifiers
+→ T1 `PlayerOffense` → T1 `HitChance`/`RollHit`. A test MUST
+compose T3b with the real T1 functions and MUST fail if a
+hit-factor bonus is added, if Mysticism 1.5 rounds wrong, or
+if the Punch/Mysticism max is reversed.
+
+`viHit_Factor` audit conclusion (mandatory anti-footgun,
+verified by exhaustive consumer grep): touch subclasses
+carry `viHit_Factor` classvars (generic 80, Zap 50, Icy 60,
+Acid 10, Holy 15, Flame 25) but the current live Player
+`GetOffense` path (GetStroke/GetProf/Aim/BaseMaxHP/weapon
+`ModifyHitRoll`/attack modifiers; touch `ModifyHitRoll` is
+identity) NEVER reads them. Voxilian MUST NOT add a
+hit-factor bonus merely because the classvar exists.
+
+Touch attack-modifier behavior (source `touchatk.kod`): the
+generic TouchAttackSpell reports `GetParryAbility() = 0`,
+`CanBlock() = TRUE`, `CanParry() = TRUE`, `CanDodge() =
+TRUE`. Meaning: an incoming touch attack CAN be defended
+against with the victim's ordinary defensive capabilities
+(T2 owns defense semantics; no additional evasion rolls),
+while a touch spell as the caster's effective weapon
+contributes zero parry ability.
+
+##### 9.3b.2 Touch damage base
+
+Source `touchatk.kod FindDamage` frozen exactly:
+
+```text
+r = inclusive Random(minDamage, maxDamage)
+half = r / 2                  (integer truncation BEFORE power multiply)
+damage = half + (half * spellPower) / 99 + 1
+damage = DamageFactors(damage)   (generic identity; §9.3b.3 overrides)
+damage = bound(damage, 1, $)
+```
+
+- Divisor is `SPELLPOWER_MAXIMUM = 99`. Generic
+  `DamageFactors` is identity. Final floor is 1
+  (`bound(damage,1,$)`); no upper cap here (later
+  `AssessDamage` caps belong to T1/T7 composition).
+- No Might bonus, no weapon quality, no weapon proficiency
+  flat bonus, no generic T1 `RawWeaponDamage`: touch has its
+  OWN source formula. Spell power is the T3a valid `1..99`
+  domain; `min > max` is `ErrInvalidRange`; negative bounds
+  are `ErrInvalidDamageValue`.
+
+##### 9.3b.3 Touch damage signature
+
+Touch attacks carry BOTH domains (source defaults
+`viAttackType = ATCK_WEAP_UNARMED+ATCK_WEAP_PUNCH =
+0x2000+0x4000`, subclass `viSpellType` overrides; source
+bits preserved): T3b takes already-resolved
+`WeaponAttackBits`/`SpellAttackBits` (or reuses the T2
+`DamageSignature`) — NO named spell IDs. The default/source
+family pairs unarmed/punch weapon bits with one spell
+subtype (SHOCK/COLD/ACID/HOLY/FIRE `+ SPELL_ALL 0x0001`)
+supplied by the touch spell. A touch with both domains
+nonzero MUST classify through the existing T2 mixed
+weapon+spell rule (`ClassifyDamageClass`); neither domain
+is counted twice. T3b implements no resistance itself.
+
+##### 9.3b.4 Touch duration
+
+Source `touchatk.kod GetDuration` frozen exactly:
+
+```text
+secondsUnit = inclusive Random(spellPower/3, spellPower/2)
+secondsUnit = bound(secondsUnit, 10, 75)
+durationMs = secondsUnit * 6 * 1000
+```
+
+Truncation points: integer `spellPower/3` and
+`spellPower/2` BEFORE the random draw; `*6*1000` after the
+10..75 bound (64-bit; product overflow is a domain error).
+Spell power is T3a `1..99`. Value-only: no timers. Future
+runtime composes with the existing T3a `CastTicks`
+conversion; no duplicate tick conversion.
+
+##### 9.3b.5 Touch per-hit resource cost
+
+Source `player.kod TryAttack` frozen: the CanPayCosts gate
+and the PayCosts charge apply ONLY to `Skill` strokes
+("spells have already been cast" / "Only check skills,
+because spells are already cast"). A touch spell, already
+cast, pays NO mana, NO spell exertion, NO skill exertion,
+NO reagents per swing. T3b charges nothing per hit. Normal
+combat swing timing remains T1/T7 runtime ownership.
+
+##### 9.3b.6 Touch subclass audit and Holy Touch modifier
+
+Source-audited: Zap, Icy Fingers, Acid Touch, Touch of
+Flame override ONLY damage signature (spell subtype),
+range, mana/cost, the dead `viHit_Factor` classvar,
+presentation, and reagents — NOT the damage formula. ONLY
+Holy Touch overrides `DamageFactors`. Frozen explicitly
+(source `holytch.kod DamageFactors`; victim-undead and
+victim-karma are already-resolved inputs — no victim
+object, no `IsUndead`/`GetKarma` callbacks, no HolyTouch
+catalog/proto ID):
+
+```text
+undead victim:  damage = damage * 2
+non-undead:     damage = damage + ((-victimKarma) * damage) / 200
+```
+
+- C integer truncation toward zero on the `/200`
+  (64-bit SIGNED intermediate; negative karma is an
+  ordinary resolved input, NOT an error).
+- Consequences: negative karma → more damage, zero karma
+  → unchanged, positive karma → less damage
+  (≈ ±50% at ±100 karma); undead → exactly double with
+  the karma path skipped. No karma lookup in T3b.
+
+##### 9.3b.7 Illusionary Wounds victim and base formulas
+
+Immutable victim snapshot (conceptually
+`IllusionaryVictim{Kind PlayerOrMonster, Intellect,
+Difficulty, MaxHP, HP}`; only the selected kind's fields
+are consumed; no live entity pointer):
+
+- Player: `MaxHP` = source `GetMaxHealth` (BUFFED max
+  health, NOT BaseMaxHP); `Intellect` = already-resolved
+  effective Intellect within the source-valid domain
+  (hostile huge integers MUST NOT overflow silently —
+  validate or bound before multiplying).
+- Monster: `MaxHP` = source `ReturnMaxHitPoints`;
+  `Difficulty` = already-resolved difficulty.
+- Living target only: `HP >= 1`, `MaxHP >= 1`;
+  otherwise `ErrInvalidSpecialVictim`.
+
+Source `illwound.kod GetHPLoss` frozen exactly:
+
+```text
+Player:   baseDamage = 17 + (50 - Intellect) / 10
+Monster:  baseDamage = 30 - bound(Difficulty * 2, 1, 20)
+loss = (baseDamage * spellPower) / 100
+```
+
+- Divisor is literally `100`, NOT 99. `Difficulty*2`
+  uses 64-bit signed math before the `bound(...,1,20)`.
+  Spell power is T3a `1..99`.
+
+##### 9.3b.8 Illusionary Wounds caps, policy, duration, refund
+
+Binding cap order (source: MaxHP/3 first, then HP−1):
+
+```text
+loss = bound(loss, 0, MaxHP/3)     (floor division)
+loss = bound(loss, 0, HP-1)
+```
+
+Thus: never lethal (HP=1 → loss 0); CAN return 0 (low
+power, high Intellect/Difficulty, low HP, floor
+division). Do NOT call `ApplyPlayerDamageCaps`,
+`ApplyResistance`, or `ApplyDefenseModifiers`: this is
+the absolute path (`pbAbsolute = TRUE`; source player
+`AssessDamage` skips defense+resistance+bonus+floor-1+
+both-caps; monster `AssessDamage` skips resistance).
+T3b produces the loss value with `PolicyAbsolute` only;
+T4/T7 own HP application.
+
+Source `GetHPLoss` exposes an optional final `iFactor`
+division (`if iFactor > 1 { loss = loss / iFactor }`
+after both caps). Exhaustive caller audit: NO live
+MVP-relevant caller passes `iFactor > 1` (both call
+sites — direct cast and illusionary wall — omit it).
+Frozen: Voxilian T3b implements the reachable factor-1
+behavior ONLY (division skipped); no generic public
+factor parameter mirrors unreachable source API.
+
+Duration (source `GetDuration`):
+
+```text
+durationMs = 20000 + spellPower * 750
+durationMs = bound(durationMs, 20000, 80000)   (20 s..80 s)
+```
+
+64-bit intermediate; spell power T3a `1..99`
+(power 99 → 94250 → capped 80000). Value-only, no timer.
+
+Refund (source `StartEnchantment #state=iDamage` +
+`EndEnchantmentEffects`): the INITIALLY APPLIED loss
+becomes enchantment state; on expiration, if the victim
+is alive restore that STORED applied amount, else
+restore 0. Never a re-roll, never a re-computation.
+T3b exposes conceptually
+`IllusionaryRefund(appliedLoss int, victimAlive bool)
+int` (or encodes it in a result value): no healing
+mutation, no timer state, no enchantment map.
+
+Source randomly chooses an apparent elemental spell for
+presentation/messages; this does NOT affect the absolute
+arithmetic. T3b MUST NOT implement random fake-spell
+selection, localized text, sound, or animation.
+
+##### 9.3b.9 Vampiric Drain side effect
+
+Vampiric Drain uses the GENERIC T3a AttackSpell pipeline
+(source `vampdrn.kod`: `piDamageMin/piDamageMax =
+12/18`, `piManaFocusBonus = 0` — the focus `+1` still
+applies when focused per §9.3a.15; no `CastSpell`
+override). T3b owns ONLY the heal number, computed from
+the POST-application damage result (source `DoSideEffect`
+receives `iDamage` AFTER `AssessDamage`; `$` = killed).
+Future runtime order: T3a raw → T2 mitigation/resistance
+→ T1 applicable caps → T4 apply damage → T3b heal
+formula from the applied result → T4 apply healing.
+
+Source `DoSideEffect` frozen (divisor constant
+`DAMAGE_FACTOR_TO_HEAL = 2`):
+
+```text
+nonlethal appliedDamage:  heal = bound(appliedDamage / 2, 1, $)
+lethal (killed):          heal = bound(resolvedBaseDamageMax / 2, 1, $)
+```
+
+- Voxilian uses an explicit `killed bool` (never nil
+  magic). Integer truncation: applied 0→1, 1→1, 2→1,
+  3→1, 4→2, 17→8. The lethal path IGNORES the applied
+  scalar and uses the caller-supplied resolved prototype
+  max (source Vampiric Drain `piDamageMax = 18` → heal 9;
+  `18` is a TEST vector only, never production catalog
+  content). No HP state, no `GainHealth`, no T3a raw
+  damage duplication in T3b.
+
+##### 9.3b.10 Earthquake severity and squared-distance falloff
+
+Source normal cast (`earthqua.kod`): `viMin_damage = 5`,
+`viMax_damage = 9` (mechanics constants for this
+archetype, not a catalog spell ID).
+
+```text
+severity = 1 + spellPower / 25        (integer division)
+```
+
+Spell power T3a `1..99`; no invented clamp. Golden
+boundaries: 24→1, 25→2, 49→2, 50→3, 74→3, 75→4, 99→4.
+Invalid severity inputs to downstream helpers are
+`ErrInvalidEarthquakeSeverity` (severity < 1).
+
+Source constants: full-damage distance 8, zero-damage
+distance 20; input is already-resolved SQUARED distance
+(no sqrt, no float; negative is
+`ErrInvalidSquaredDistance`):
+
+```text
+if squaredDistance <= 64:   percent = 100
+else if squaredDistance > 400: percent = 0
+else: percent = 100 * (400 - squaredDistance) / (400 - 64)
+```
+
+- Integer truncation AFTER the `100*(...)` multiplication
+  (64-bit). Exactly 400 yields 0 via the interpolation
+  branch; above 400 is also 0. Full table: 0→100,
+  64→100, 65→interpolated, mid literal required, 399→,
+  400→0, 401→0. Tests MUST include vectors that fail if
+  linear distance is used instead of squared distance.
+
+##### 9.3b.11 Earthquake damage modes
+
+Caster mode (source `ComputeDamage`), operation order
+binding:
+
+```text
+roll = inclusive Random(5, 9)
+damage = (roll * severity) * percent / 100
+```
+
+Left-to-right: `(roll*severity)` first (64-bit), then
+`*percent`, then ONE truncation at `/100`. Zero percent
+may produce zero intermediate damage — do NOT floor to
+1 in T3b (T2/T1/runtime own later stages).
+
+Environmental mode (source, no caster position):
+
+```text
+damage = inclusive Random(5, 9) * severity
+```
+
+Item-cast self damage (source scroll-punishment rule):
+for a PLAYER using an Earthquake item, caster
+self-damage is `MaxDamage * severity` with `MaxDamage =
+9` (mechanics constant, not a catalog ID) — NO RNG for
+this self-hit. Normal non-item player self-damage uses
+caster-mode `ComputeDamage` at squared distance zero
+instead. Freeze the distinction; represent
+caster/environmental modes explicitly. No room object or
+blame target in T3b.
+
+Signature/policy: `viAttack_spell = SPELL_ALL +
+QUAKE` (0x0001+0x0080); weapon domain none; policy
+ORDINARY (all source `AssessDamage` calls omit
+`#absolute=TRUE`). Therefore T2 armor DamageReduce is
+bypassed as pure spell, T2 resistance still applies,
+and normal player caps may later apply. No absolute
+behavior.
+
+World behavior OUT (lives in source, NOT ported): room
+target enumeration, guildhall foyer filtering, boss
+exceptions, NPC/shopkeeper filtering, rumble/cast
+disruption, messages, kill attribution, player flags.
+T3b returns damage math only.
+
+##### 9.3b.12 Wall mechanics domain
+
+Pure mechanics for three source wall archetypes only —
+ordinary fire, ordinary lightning, illusionary fire —
+via a small mechanics enum (conceptually
+`WallDamageKind{WallFire, WallLightning,
+WallIllusionaryFire}`). This is NOT a spell/proto/item/
+database/protocol ID; no named catalog table in sim; no
+names/descriptions/resources. Additional formations
+(e.g. Ring of Flames) may later reuse these generic
+primitives with content-supplied values; do NOT expand
+this task into every WallSpell subclass.
+
+Placement arithmetic (source spell side):
+
+```text
+Fire:       maxDamage = spellPower / 6,  bound(maxDamage, 1, 16)
+Lightning:  maxDamage = spellPower / 4,  bound(maxDamage, 1, 25)
+```
+
+Pin fire vectors power 1/5/6/95/96/99 (truncation +
+clamps) and lightning low/ordinary/upper-bound vectors.
+
+Illusionary Firewall does NOT convert power to
+ordinary wall `maxDamage`: it passes `spellPower`
+DIRECTLY to the illusionary WallOfFire element, later
+consumed as Illusionary-Wounds spell power. Never run
+`power/6` on the illusionary wall (§9.3b.14 reuses IW).
+
+Base lifetimes (placement; NOT yet final element
+lifetime):
+
+```text
+Fire/Illusionary:  baseDurationSeconds = spellPower * 2 + 30,
+                   bound(..., 30, 180)
+Lightning:         baseDurationSeconds = spellPower * 2 + 20,
+                   bound(..., 20, 120)
+```
+
+Element final lifetime (active fire/lightning AND both
+passive fillers apply the constructor jitter; source
+`GetDuration`/inline constructor):
+
+```text
+seconds = inclusive Random(baseDurationSeconds - 20,
+                           baseDurationSeconds + 20)
+durationMs = seconds * 1000
+durationMs = bound(durationMs, 30000, 200000)
+```
+
+Pure function over injected RNG; no timer, no
+`time.Now`. Note the 30 s floor matters at the low
+end (spell-side durations reach 20 s).
+
+Periodic interval (active elements; source
+`EFFECT_INTERVAL = 1500 ms`): every period draws a fresh
+`percent = inclusive Random(90, 110)` and returns
+`delayMs = (1500 * percent) / 100` — exact range
+1350..1650 ms with integer source arithmetic. No
+scheduler, no ticker, no goroutine: return the next
+delay value only. Each source random operation gets
+exactly one RNG draw (lifetime/period/damage draws are
+never combined or pre-rolled).
+
+Ordinary wall damage (fire/lightning active element
+effect):
+
+```text
+rawDamage = inclusive Random(0, maxDamage)
+```
+
+Future runtime applies ordinary T2 spell resistance
+(Fire → FIRE signature, Lightning → SHOCK signature);
+policy ORDINARY, no absolute flag. Zero is a legitimate
+pre-application value — T3b MUST NOT floor it to 1. Do
+not run T2 inside the wall primitive; cross-stage tests
+compose it separately.
+
+Active vs passive elements: source 9-element placement
+alternates 5 active damaging elements + 4 passive
+filler elements (`PassiveWallofFire`,
+`PassiveWallofLightning`); passives provide
+appearance/lifetime only and NEVER run the active
+periodic damage path. Freeze the distinction; do NOT
+implement eight-direction placement geometry, rows/
+cols, angles, or world objects.
+
+Once-per-period contract (for future runtime; T3b
+documents it and exposes only pure policy values —
+NO `map[EntityID]`, mutex, timer queue, scheduler, or
+wall registry in T3b): an active wall element affects a
+target at most once per wall-element period;
+movement-triggered effect and periodic scan share that
+suppression domain; the affected set clears at the
+beginning of each periodic cycle.
+
+Wall targeting policy is DEFERRED runtime (documented,
+not implemented, no live room/player objects in any
+wall math function): active walls do not affect their
+caster by default; target must be in range + LOS;
+NO_COMBAT/NO_MOB_COMBAT can suppress; the player
+moved-since-entry gate applies; player safety/
+AllowPlayerAttack can suppress harmful effects; a
+suppressed player is still considered affected for
+that cycle.
+
+##### 9.3b.13 Illusionary wall damage
+
+Source element threshold (exact):
+
+```text
+if spellPower < 35:  no illusionary damage effect
+```
+
+Eligible at exactly 35. Test 34 → no effect, 35 →
+effect path.
+
+When eligible:
+
+```text
+maxIllusionaryLoss = IllusionaryWoundsLoss(victim, spellPower)
+if maxIllusionaryLoss <= 0:  no damage/enchantment effect
+else: rawLoss = inclusive Random(0, maxIllusionaryLoss)
+```
+
+- Policy ABSOLUTE (source `#absolute=TRUE`):
+  ordinary numeric resistance/caps bypassed.
+- MANDATORY stage ownership: the illusionary wall MUST
+  call/reuse the production IW loss primitive — no
+  copy/paste of the IW formula inside wall code (a test
+  proves the shared path).
+- The refund-state amount derives from the ACTUALLY
+  APPLIED absolute loss (the rolled `rawLoss` as passed
+  to future application), never from the maximum
+  possible loss. Use the regular IW duration for that
+  spell power. No enchantment is started in T3b.
+- Non-lethal by construction (`maxIllusionaryLoss <=
+  HP-1`, `rawLoss <= maxIllusionaryLoss`): prove the
+  property; do NOT add a second arbitrary non-lethal
+  cap.
+
+Wall presentation OUT: burn/shock text, sounds, light
+source, animation, outlaw warning prose, dissipate
+prose. Domain results only.
+
+##### 9.3b.14 Stable domain errors
+
+Reuse existing errors where ownership is exact:
+`ErrInvalidSpellPower`, `ErrInvalidCombatStat`,
+`ErrInvalidSquaredDistance`, `ErrInvalidDamageValue`,
+`ErrInvalidRange`, `ErrNilRNG`, `ErrInvalidCastTiming`.
+Narrow T3b additions only where genuinely needed:
+
+```text
+ErrInvalidSpecialVictim      (impossible IW victim snapshot:
+                              unknown kind, MaxHP < 1, HP < 1)
+ErrInvalidWallKind           (unknown WallDamageKind value)
+ErrInvalidEarthquakeSeverity (severity < 1)
+ErrInvalidWallLifetime       (impossible wall lifetime input:
+                              negative base seconds)
+```
+
+`errors.Is` matching; no string parsing. Exact names
+flexible but frozen once implemented.
+
+##### 9.3b.15 Golden vectors and property invariants (normative minimum)
+
+Touch: proficiency Punch-wins / Mysticism-wins /
+equality / odd-Mysticism truncation (`(m*3)/2`
+before max); damage min/max rolls at power 1/50/99
+plus an odd raw roll proving half-before-multiply;
+one REAL `TouchProficiency → PlayerOffense →
+RollHit` composition; one REAL touch raw →
+`ClassifyDamageClass` (mixed) →
+`ApplyDefenseModifiers` (existing T2 2/3 behavior) →
+resistance composition. Holy Touch: undead 2x;
+karma negative/zero/positive; one /200-truncation
+vector; overflow-safe signed proof.
+
+Illusionary Wounds: player Intellect 50 / lower
+Intellect at power 1/50/99; monster low/ordinary/
+high-clipped difficulty; caps MaxHP/3 boundary,
+HP−1 tighter, HP=1 → 0; duration power 1 /
+80 s-cap threshold / 99; refund alive→exact,
+dead→0. Properties: loss ≥ 0, ≤ floor(MaxHP/3),
+≤ HP−1, never lethal; duration 20 s..80 s.
+
+Vampiric Drain: applied 0→1, 1→1, 2→1, 3→1, 4→2,
+17→8; lethal base-max 18→9 with applied scalar
+ignored. Heal ≥ 1 on a valid side-effect event.
+Cross-stage test: T3a raw → T2 resistance →
+test-only applied → T3b heal, with a raw-direct
+control proving order matters.
+
+Earthquake: severity 24→1, 25→2, 49→2, 50→3, 74→3,
+75→4, 99→4; squared 0/64→100, 65→interpolated,
+mid literal, 399, 400→0, 401→0 (with linear-distance
+killers); damage forced rolls 5/9, zero-percent
+result, environmental mode, normal self at sq=0,
+item self `9*severity`. Properties: percent 0..100;
+sq≤64→100; sq≥400→0; monotonic non-increasing in
+distance. One REAL quake raw → T2 pure-spell class
+→ quake resistance composition (armor bypassed,
+resistance applies; no T3b cap).
+
+Walls: fire maxDamage power 1/5/6/95/96/99;
+lightning low/ordinary/upper; base durations
+fire/lightning/illusionary; final lifetime forced
+min/max jitter + 30 s clamp + upper behavior;
+period 90→1350, 100→1500, 110→1650; ordinary
+damage forced 0 and forced max; illusionary power
+34/35, maxLoss 0, forced random 0/maxLoss.
+Properties: delay 1350..1650; ordinary raw
+0..maxDamage; illusionary raw ≤ IW max; illusionary
+never lethal; same inputs + same scripted RNG →
+same output.
+
 T3a/T3b math MUST NOT introduce room goroutines, wall
-timers, world-object goroutines per effect, `time.Sleep`,
-or per-spell `time.Ticker`. Later runtime/world integration
-uses deterministic sim ownership. T3b production contains
-no `TouchAttackDamage`, `EarthquakeDamage`,
-`WallTickDamage`, `IllusionaryWounds`, `VampiricDrain`, AoE
-target enumeration, wall objects, or wall timers — and T3a
-MUST NOT implement them either (§9.3a.16–§9.3a.17).
+timers, world-object goroutines per effect,
+`time.Sleep`, or per-spell `time.Ticker`. Later
+runtime/world integration uses deterministic sim
+ownership.
 
 #### 9.3c M5-T7 authoritative attack/cast runtime integration (deferred)
 
@@ -6361,6 +6942,28 @@ handlers. The M5 exit gate sits after T7.
    survives it.
 
 ## 14. Version history
+
+- v0.3.28: freeze M5-T3b special spell semantics (normative §9.3b:
+  touch proficiency max(Punch,(Myst*3)/2) with dead viHit_Factor
+  excluded, real-T1 hit composition, touch damage half+(half*power)/99+1
+  with truncation order, mixed weapon+spell signature, duration
+  Random(power/3,power/2) bound 10..75 ×6×1000 ms, no per-hit costs,
+  Holy Touch undead-2x and karma/200 modifier; Illusionary Wounds
+  player/monster /100 bases over buffed MaxHP with MaxHP/3 then HP-1
+  caps, PolicyAbsolute, 20 s..80 s duration, applied-amount refund,
+  factor-1-only reachability; Vampiric Drain post-application
+  bound(dmg/2,1) and lethal bound(max/2,1) with explicit killed flag;
+  Earthquake severity 1+power/25, squared-distance 64/400 falloff with
+  100*(400-sq)/336 interpolation, caster/environmental/item-self
+  (9*severity) modes, ordinary ALL+QUAKE policy; walls fire power/6
+  (1..16) / lightning power/4 (1..25), illusionary direct-power with
+  <35 threshold, base lifetimes, ±20 s jittered final lifetime
+  30 s..200 s, 1350..1650 ms periodic jitter, Random(0,max) ordinary
+  rolls, 5-active/4-passive distinction, once-per-period contract,
+  illusionary IW reuse with non-lethal proof; new narrow sentinels;
+  golden/property minimums) + verified `meridian59.md` corrections
+  (wall maxDamage/duration per family, IW difficulty bound and
+  buffed-Max cap precision).
 
 - v0.3.27: split M5-T3 into generic core T3a + special archetypes T3b
   (new §9.3/§9.3a normative: spell-power 1..99 domain, generic
