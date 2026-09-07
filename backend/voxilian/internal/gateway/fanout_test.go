@@ -1011,19 +1011,63 @@ func TestFanoutStateDropKeepsSession(t *testing.T) {
 	f.activate(sid, 101, 1001, world.CellCoord{})
 	f.source.put(EntityPresentation{EntityID: 1001, Position: world.Vec3{}, Yaw: 1, Speed: 0, Kind: 2, Proto: 7})
 	f.bootstrap(sid)
-	// Park the writer and fill the tiny shared budget with critical
-	// frames: bootstrap 204 (1) + 3 direct criticals = 4/4.
-	hold := make(chan struct{})
-	f.trans[sid].setHold(hold)
-	for i := 0; i < 3; i++ {
-		if err := f.prods[sid].TryCritical(sid, proto.OpcodeEntityCreate, proto.MessageVersion1,
-			func(e *proto.Encoder) error {
-				proto.EntityCreate{Entity: proto.EntityEntry{Entity: 77}}.Encode(e)
-				return nil
-			}); err != nil {
-			t.Fatalf("fill critical %d: %v", i, err)
+	// White-box barrier over the REAL outbound queue: BootstrapSession
+	// proves admission (TryCritical) only, not physical-write
+	// completion, so the bootstrap 204 may already have drained by the
+	// time bootstrap returns. Never assume its residency.
+	oc, ok := f.prods[sid].OutboundProducer.(*outboundConn)
+	if !ok {
+		t.Fatalf("producer is %T, want *outboundConn", f.prods[sid].OutboundProducer)
+	}
+	q := oc.q
+	waitQueue := func(desc string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for !cond() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timeout waiting for %s", desc)
+			}
+			time.Sleep(time.Millisecond)
 		}
 	}
+	// Prove bootstrap is fully gone from queue residency before
+	// filling the 4-slot budget deterministically.
+	waitQueue("bootstrap outbound drained", func() bool {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		return q.resMsg == 0 && len(q.crit) == 0 && q.order.Len() == 0 && q.writing == nil
+	})
+	// Park the physical writer, then admit one explicit unrelated
+	// critical blocker and wait until it is physically in-flight
+	// (parked inside the transport write).
+	hold := make(chan struct{})
+	f.trans[sid].setHold(hold)
+	putCritical := func(entity uint32) {
+		t.Helper()
+		if err := f.prods[sid].TryCritical(sid, proto.OpcodeEntityCreate, proto.MessageVersion1,
+			func(e *proto.Encoder) error {
+				proto.EntityCreate{Entity: proto.EntityEntry{Entity: entity}}.Encode(e)
+				return nil
+			}); err != nil {
+			t.Fatalf("fill critical: %v", err)
+		}
+	}
+	putCritical(77)
+	waitQueue("blocker in-flight", func() bool {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		return q.resMsg == 1 && q.writing != nil
+	})
+	// Exactly three more critical frames: blocker writing (1) +
+	// queued criticals (3) = 4/4 resident.
+	for i := 0; i < 3; i++ {
+		putCritical(78)
+	}
+	waitQueue("budget 4/4 resident", func() bool {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		return q.resMsg == 4
+	})
 	// The next 205 (new state key) cannot fit: StateDropped, and the
 	// observer records the shed.
 	f.move(1001, world.Vec3{X: 1}, 10, 35, 10, 10)
@@ -1031,6 +1075,9 @@ func TestFanoutStateDropKeepsSession(t *testing.T) {
 	drops, _, _ := f.obs[sid].snapshot()
 	if len(drops) != 1 {
 		t.Fatalf("state drops = %v, want exactly one shed", drops)
+	}
+	if drops[0] != "saturated" {
+		t.Fatalf("state drop reason = %q, want saturated", drops[0])
 	}
 	// Session alive solely despite the drop: presence intact, handle
 	// resolves, mapping retained.
@@ -1041,6 +1088,14 @@ func TestFanoutStateDropKeepsSession(t *testing.T) {
 		t.Fatalf("own handle lost to state drop")
 	}
 	close(hold)
+	// Wait for the parked backlog to drain before proving later
+	// traffic flows again; otherwise the follow-up 205 races the
+	// outbound pump's drain of the 4 held criticals.
+	waitQueue("held backlog drained", func() bool {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		return q.resMsg == 0 && len(q.crit) == 0 && q.order.Len() == 0 && q.writing == nil
+	})
 	// A later movement may still be delivered.
 	f.move(1001, world.Vec3{X: 2}, 11, 35, 12, 12)
 	f.drainPump()
