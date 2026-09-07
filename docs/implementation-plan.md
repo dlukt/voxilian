@@ -160,7 +160,7 @@ Exit: 20 Hz tick loop, cells, server-authoritative movement with reconciliation 
    all Ping loops (stop sweep + every pinger, no future pinger,
    race-safe stop vs Close).
    Spec: §4, §5.2.10, §6.3, §7, §7.1, §7.2, §7.3, §7.4.
-- [ ] **M4 exit criteria met** (movement + handoff race tests green; saver property tests green).
+- [x] **M4 exit criteria met** (movement + handoff race tests green; saver property tests green).
 
 ## M5 — Combat + vitals + death
 
