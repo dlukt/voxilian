@@ -177,7 +177,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   resource-payment plan, item-cast differences, absolute/resistance policy
   representation. No live mutation, no gateway, no world/target lookup.
   Spec: §9.3a (frozen v0.3.27).
-- [ ] **M5-T3b** Special spell-damage archetypes (pure/value deterministic
+- [x] **M5-T3b** Special spell-damage archetypes (pure/value deterministic
   mechanics): touch attacks, wall periodic damage/timing, Earthquake/AoE
   falloff, Illusionary Wounds, Vampiric Drain / damage-derived side-effect
   hooks, other special spell-damage formulas needed by the MVP. Still no
