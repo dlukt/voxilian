@@ -229,16 +229,18 @@ func NewTransportLiveness(presence *PresenceRegistry, registry *session.Registry
 func (l *TransportLiveness) Reaper() *SessionReaper { return l.reaper }
 
 // Start starts the single 30 s stale-sweep goroutine. Idempotent; a
-// closed liveness never restarts.
+// closed liveness never restarts. The open/closed decision, stopSweep
+// publication, WaitGroup accounting, and sweep launch ownership form
+// one lifecycle transition under the mutex, so no positive Add can
+// race a zero-count Wait after Close begins.
 func (l *TransportLiveness) Start() {
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.closed || l.stopSweep != nil {
-		l.mu.Unlock()
 		return
 	}
 	stop := make(chan struct{})
 	l.stopSweep = stop
-	l.mu.Unlock()
 	l.wg.Add(1)
 	go l.sweepLoop(stop)
 }

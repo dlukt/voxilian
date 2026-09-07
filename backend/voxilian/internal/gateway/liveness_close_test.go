@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -259,4 +260,256 @@ func TestServerCloseWithLiveConnection(t *testing.T) {
 		t.Fatalf("Server.Close hung with a live WebSocket (ping loop not owned)")
 	}
 	srv.Close() // idempotent
+}
+
+// ---------------------------------------------------------------------------
+// TransportLiveness.Start sweep lifecycle ordering (spec §7.4.7,
+// v0.3.24 corrective closure).
+//
+// Start's open/closed decision, stopSweep publication, WaitGroup Add,
+// and sweep launch must form one lifecycle transition under the
+// mutex. Otherwise Close could snapshot stopSweep, close it, Wait on
+// a zero count, and return — while a losing Start still runs wg.Add
+// and launches a sweep on the closed channel afterwards.
+// ---------------------------------------------------------------------------
+
+// waitSweepTicker spins (no sleeps) until the sweep loop creates its
+// ticker, proving the goroutine reached sweepLoop.
+func waitSweepTicker(t *testing.T, tf *manualTickerFactory) *manualTicker {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if tk := tf.last(StaleSweepInterval); tk != nil {
+			return tk
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sweep ticker never created")
+		}
+		runtime.Gosched()
+	}
+}
+
+// waitSweepLive spins (no sleeps) until the sweep loop is parked in
+// its select (a pulse is consumed), proving exactly one live loop.
+func waitSweepLive(t *testing.T, tk *manualTicker) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if tk.tryPulse() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sweep loop never became live")
+		}
+		runtime.Gosched()
+	}
+}
+
+// assertNoSweepLive proves no sweep ticker has a live receiver. Valid
+// only after Close has returned (Wait guarantees an accounted loop
+// exited), so a single non-blocking pass is deterministic.
+func assertNoSweepLive(t *testing.T, tf *manualTickerFactory) {
+	t.Helper()
+	tf.mu.Lock()
+	tickers := append([]*manualTicker(nil), tf.tickers[StaleSweepInterval]...)
+	tf.mu.Unlock()
+	for i, tk := range tickers {
+		if tk.tryPulse() {
+			t.Fatalf("sweep ticker %d still has a live receiver after Close", i)
+		}
+	}
+}
+
+func livenessIsClosed(lv *TransportLiveness) bool {
+	lv.mu.Lock()
+	defer lv.mu.Unlock()
+	return lv.closed
+}
+
+// TestLivenessStartCloseDeterministic (A): Start -> Close leaves
+// exactly one sweep that Close waits out; no receiver survives.
+func TestLivenessStartCloseDeterministic(t *testing.T) {
+	lv, _, _, tf := closedLiveness(t)
+	lv.Start()
+	// The ticker is created inside the sweep goroutine: wait for it
+	// to prove the single loop exists, then re-Start idempotently.
+	waitSweepTicker(t, tf)
+	lv.Start() // idempotent: still one sweep
+	if got := tf.count(StaleSweepInterval); got != 1 {
+		t.Fatalf("sweep tickers = %d after Start x2, want exactly 1", got)
+	}
+	waitSweepLive(t, tf.last(StaleSweepInterval))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		lv.Close()
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("Close hung after Start")
+	}
+	assertNoSweepLive(t, tf)
+	if got := tf.count(StaleSweepInterval); got != 1 {
+		t.Fatalf("sweep tickers = %d after Close, want 1 (no new loop)", got)
+	}
+	lv.Close() // idempotent
+}
+
+// TestLivenessCloseStartNoRestart (B): Close -> Start creates no
+// ticker and no goroutine.
+func TestLivenessCloseStartNoRestart(t *testing.T) {
+	lv, _, _, tf := closedLiveness(t)
+	lv.Close()
+	before := tf.count(StaleSweepInterval)
+	lv.Start()
+	lv.Start()
+	if got := tf.count(StaleSweepInterval); got != before {
+		t.Fatalf("sweep tickers = %d after Close->Start, want %d", got, before)
+	}
+	assertNoSweepLive(t, tf)
+	if !livenessIsClosed(lv) {
+		t.Fatalf("liveness not marked closed")
+	}
+	lv.Close() // idempotent
+}
+
+// TestLivenessConcurrentStartSingleSweep (C): concurrent Start x 32
+// yields exactly one sweep loop.
+func TestLivenessConcurrentStartSingleSweep(t *testing.T) {
+	const n = 32
+	lv, _, _, tf := closedLiveness(t)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			lv.Start()
+		}()
+	}
+	close(start)
+	waited := make(chan struct{})
+	go func() {
+		defer close(waited)
+		wg.Wait()
+	}()
+	select {
+	case <-waited:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("concurrent Start hung")
+	}
+	// No Close ran here, so exactly one Start won and its goroutine
+	// must materialize exactly one ticker; all Starts already
+	// returned so the count cannot grow beyond that.
+	waitSweepTicker(t, tf)
+	if got := tf.count(StaleSweepInterval); got != 1 {
+		t.Fatalf("sweep tickers = %d after concurrent Start x%d, want exactly 1", got, n)
+	}
+	waitSweepLive(t, tf.last(StaleSweepInterval))
+	lv.Close()
+	assertNoSweepLive(t, tf)
+	lv.Close() // idempotent
+}
+
+// TestLivenessConcurrentStartCloseQuiesces (D): concurrent Start x 32
+// + Close. After all operations return: zero live sweep loops, zero
+// restart ability, no panic, no WaitGroup misuse.
+func TestLivenessConcurrentStartCloseQuiesces(t *testing.T) {
+	const n = 32
+	lv, _, _, tf := closedLiveness(t)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(n + 1)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			lv.Start()
+		}()
+	}
+	go func() {
+		defer wg.Done()
+		<-start
+		lv.Close()
+	}()
+	close(start)
+	waited := make(chan struct{})
+	go func() {
+		defer close(waited)
+		wg.Wait()
+	}()
+	select {
+	case <-waited:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("concurrent Start+Close hung (WaitGroup misuse?)")
+	}
+	// At most one sweep was ever created, none is live, restart is
+	// impossible, and Close stays idempotent.
+	if got := tf.count(StaleSweepInterval); got > 1 {
+		t.Fatalf("sweep tickers = %d, want at most 1", got)
+	}
+	assertNoSweepLive(t, tf)
+	lv.Close()
+	before := tf.count(StaleSweepInterval)
+	lv.Start()
+	if got := tf.count(StaleSweepInterval); got != before {
+		t.Fatalf("sweep restarted after Close: %d -> %d", before, got)
+	}
+	if !livenessIsClosed(lv) {
+		t.Fatalf("liveness not marked closed")
+	}
+}
+
+// TestLivenessStartVsCloseRace races Start against Close from a
+// common barrier over many iterations. After BOTH return: the
+// liveness is closed, a later Start does nothing, no sweep ticker
+// has a live receiver, no sweep goroutine survives (Close's Wait
+// covered every accounted Add), and Close remains idempotent. No
+// sleeps: barrier + Wait channels and the manual ticker seam only
+// (10 s arms are hang guards, never synchronization).
+func TestLivenessStartVsCloseRace(t *testing.T) {
+	const iters = 1000
+	for i := 0; i < iters; i++ {
+		lv, _, _, tf := closedLiveness(t)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			lv.Start()
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			lv.Close()
+		}()
+		close(start)
+		waited := make(chan struct{})
+		go func() {
+			defer close(waited)
+			wg.Wait()
+		}()
+		select {
+		case <-waited:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("iter %d: Start-vs-Close hung (WaitGroup Add raced Wait?)", i)
+		}
+		if !livenessIsClosed(lv) {
+			t.Fatalf("iter %d: liveness not closed after Start-vs-Close", i)
+		}
+		if got := tf.count(StaleSweepInterval); got > 1 {
+			t.Fatalf("iter %d: sweep tickers = %d, want at most 1", i, got)
+		}
+		assertNoSweepLive(t, tf)
+		before := tf.count(StaleSweepInterval)
+		lv.Start()
+		if got := tf.count(StaleSweepInterval); got != before {
+			t.Fatalf("iter %d: Start after Close created a sweep", i)
+		}
+		lv.Close() // idempotent, must not hang or panic
+		assertNoSweepLive(t, tf)
+	}
 }
