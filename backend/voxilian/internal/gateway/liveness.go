@@ -160,11 +160,27 @@ func ProdTickerFactory(period time.Duration) Ticker {
 	return &prodTicker{t: time.NewTicker(period)}
 }
 
+// pingLoop is one registered per-connection heartbeat ping loop
+// (spec §7.4.7, v0.3.24). shutdown is idempotent: the stop channel
+// closes exactly once no matter how the connection-local stop and
+// the global Close race; done closes when the goroutine exits.
+type pingLoop struct {
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
+}
+
+func (p *pingLoop) shutdown() {
+	p.stopOnce.Do(func() { close(p.stop) })
+}
+
 // TransportLiveness composes PresenceRegistry, SessionReaper, NowFunc,
 // and a ticker factory into the server-level liveness runtime (spec
 // §7.4.7): exactly one 30 s stale-sweep goroutine plus at most one
-// 15 s heartbeat ping loop per accepted WebSocket. Construct with
-// NewTransportLiveness; Start the sweep; Close is idempotent.
+// 15 s heartbeat ping loop per accepted WebSocket. The liveness owns
+// every started ping loop strongly enough that Close stops them all.
+// Construct with NewTransportLiveness; Start the sweep; Close is
+// idempotent.
 type TransportLiveness struct {
 	presence  *PresenceRegistry
 	registry  *session.Registry
@@ -175,6 +191,7 @@ type TransportLiveness struct {
 	mu        sync.Mutex
 	stopSweep chan struct{}
 	closed    bool
+	pingers   map[session.ID]*pingLoop
 	wg        sync.WaitGroup
 }
 
@@ -203,6 +220,7 @@ func NewTransportLiveness(presence *PresenceRegistry, registry *session.Registry
 		reaper:    reaper,
 		now:       now,
 		newTicker: newTicker,
+		pingers:   make(map[session.ID]*pingLoop),
 	}, nil
 }
 
@@ -225,9 +243,12 @@ func (l *TransportLiveness) Start() {
 	go l.sweepLoop(stop)
 }
 
-// Close stops the sweep goroutine and waits for its exit. Idempotent.
-// Per-connection ping loops are owned by their connections' teardown,
-// not by Close.
+// Close stops the stale-sweep loop and EVERY active registered ping
+// loop, prevents any future StartPinger from creating another loop,
+// and waits for the sweep + all ping loops to exit (spec §7.4.7,
+// v0.3.24). Idempotent. It does not require the WebSocket transport
+// itself to close first, and it reaps/closes no session merely to
+// stop liveness.
 func (l *TransportLiveness) Close() {
 	l.mu.Lock()
 	if l.closed {
@@ -236,9 +257,20 @@ func (l *TransportLiveness) Close() {
 	}
 	l.closed = true
 	stop := l.stopSweep
+	loops := make([]*pingLoop, 0, len(l.pingers))
+	for _, lp := range l.pingers {
+		loops = append(loops, lp)
+	}
+	// Clear the registry so exiting goroutines (and any in-flight
+	// superseded loop) find nothing to double-remove; each loop is
+	// stopped exactly once via its idempotent shutdown below.
+	l.pingers = make(map[session.ID]*pingLoop)
 	l.mu.Unlock()
 	if stop != nil {
 		close(stop)
+	}
+	for _, lp := range loops {
+		lp.shutdown()
 	}
 	l.wg.Wait()
 }
@@ -292,28 +324,55 @@ func (l *TransportLiveness) Sweep() []session.ID {
 // application frames never count. A ping failure CloseNows the
 // transport without touching the heartbeat — authoritative world
 // cleanup belongs to the reaper. The returned stop ends the loop; it
-// is idempotent and safe to call from teardown.
+// is idempotent and safe to call from teardown, and races safely
+// with the global Close (spec §7.4.7, v0.3.24).
+//
+// Lifecycle under the liveness mutex: a closed liveness starts no
+// ticker and no goroutine and returns a safe idempotent no-op stop.
+// Otherwise the loop is registered and WaitGroup-accounted BEFORE
+// the mutex is released, so no positive Add can race a zero-count
+// Wait after Close begins. A session never has two simultaneously
+// registered loops: re-starting supersedes (stops) the previous one.
+// A completed/stopped loop removes itself from the registry only if
+// it is still the registered one.
 func (l *TransportLiveness) StartPinger(sid session.ID, p Pinger) (stop func()) {
-	stopCh := make(chan struct{})
-	done := make(chan struct{})
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return func() {}
+	}
+	if old, ok := l.pingers[sid]; ok {
+		old.shutdown()
+		delete(l.pingers, sid)
+	}
+	loop := &pingLoop{stop: make(chan struct{}), done: make(chan struct{})}
+	l.pingers[sid] = loop
 	ticker := l.newTicker(HeartbeatPingInterval)
 	l.wg.Add(1)
 	go func() {
 		defer l.wg.Done()
-		defer close(done)
+		defer close(loop.done)
 		defer ticker.Stop()
+		defer func() {
+			l.mu.Lock()
+			if cur, ok := l.pingers[sid]; ok && cur == loop {
+				delete(l.pingers, sid)
+			}
+			l.mu.Unlock()
+		}()
 		for {
 			select {
-			case <-stopCh:
+			case <-loop.stop:
 				return
 			case <-ticker.Fire():
 				l.pingOnce(sid, p)
 			}
 		}
 	}()
+	l.mu.Unlock()
 	return sync.OnceFunc(func() {
-		close(stopCh)
-		<-done
+		loop.shutdown()
+		<-loop.done
 	})
 }
 

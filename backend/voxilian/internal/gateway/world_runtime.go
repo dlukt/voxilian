@@ -265,23 +265,41 @@ func (r *WorldSessionRuntime) ExitWorld(ctx context.Context, sid session.ID, acc
 	return nil
 }
 
+// fanoutSessionForgetter is the narrow emergency-invalidation seam
+// (spec §7.4.6, v0.3.24) the post-sim-remove fallback uses when the
+// reliable RemovePresence control cannot run. *FanoutRuntime
+// satisfies it; recording fakes that predate the correction do not,
+// and the fallback degrades to the legacy close/retire behavior for
+// those.
+type fanoutSessionForgetter interface {
+	ForgetSession(sid session.ID)
+}
+
 // removePresenceFallback runs when the reliable fanout removal
-// cannot complete after real sim removal (spec §7.4.6): every
-// currently indexed viewer of the entity is closed/resynced with
-// non-source visibility mappings retired, and local Presence
-// teardown continues afterwards. A stale fanout ready flag for the
-// source is harmless: Deactivate removes its subscriptions and
-// mappings, so no future fanout set can include it, and the pump
-// only targets live presence state.
+// cannot complete after real sim removal (spec §7.4.6, v0.3.24):
+// every currently indexed viewer of the entity — including the
+// source — is closed/resynced with its LOCAL fanout ready/throttle
+// bookkeeping emergency-invalidated, non-source visibility mappings
+// are retired, and local Presence teardown continues afterwards.
+// The removed sim entity is never resurrected.
 func (r *WorldSessionRuntime) removePresenceFallback(sid session.ID, entity sim.EntityID) {
 	for _, v := range r.presence.Viewers(entity) {
 		if s, ok := r.sessions.Get(v); ok && s.Conn != nil {
 			_ = s.Conn.CloseNow()
 		}
+		if fg, ok := r.fanout.(fanoutSessionForgetter); ok {
+			fg.ForgetSession(v)
+		}
 		if v == sid {
 			continue
 		}
 		_, _, _ = r.presence.HideVisible(v, entity)
+	}
+	// The source may already have left the viewer set: its local
+	// bookkeeping must still be invalidated, and ForgetSession is
+	// idempotent.
+	if fg, ok := r.fanout.(fanoutSessionForgetter); ok {
+		fg.ForgetSession(sid)
 	}
 }
 

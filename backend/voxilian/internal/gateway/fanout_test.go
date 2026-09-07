@@ -124,6 +124,15 @@ type methodRecordingProducer struct {
 	t     *testing.T
 	mu    sync.Mutex
 	calls []recordedProducerCall
+	// cancels records every CancelState call with its result (v0.3.24
+	// 206-ordering proof); empty for tests that never retire.
+	cancels []cancelRecord
+}
+
+// cancelRecord is one observed CancelState call.
+type cancelRecord struct {
+	key    StateKey
+	result StateCancelResult
 }
 
 func (m *methodRecordingProducer) TryCritical(sid session.ID, opcode uint16, ver uint16, encode func(*proto.Encoder) error) error {
@@ -144,6 +153,21 @@ func (m *methodRecordingProducer) snapshot() []recordedProducerCall {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]recordedProducerCall(nil), m.calls...)
+}
+
+// CancelState records the call and delegates to the real queue.
+func (m *methodRecordingProducer) CancelState(key StateKey) StateCancelResult {
+	res := m.OutboundProducer.CancelState(key)
+	m.mu.Lock()
+	m.cancels = append(m.cancels, cancelRecord{key: key, result: res})
+	m.mu.Unlock()
+	return res
+}
+
+func (m *methodRecordingProducer) cancelSnapshot() []cancelRecord {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]cancelRecord(nil), m.cancels...)
 }
 
 func (m *methodRecordingProducer) opcodes() []uint16 {
@@ -363,14 +387,21 @@ func TestFanoutControlCompletionAndClose(t *testing.T) {
 		defer close(closed)
 		f.fanout.Close()
 	}()
-	// Gate the release on Close having actually closed the runtime:
-	// once admission is rejected, the queued waiter deterministically
-	// completes through the drain path.
+	// Gate the release on Close having actually closed the runtime.
+	// The barrier observes close-state WITHOUT publishing another
+	// control: under exact-result semantics (v0.3.24) a second
+	// synchronously-waited control admitted before Close marks closed
+	// would legitimately wait for the drain — which needs this very
+	// release — so gating the release on such a waiter deadlocks.
+	// The queued waiter below still deterministically completes
+	// through the drain path with ErrFanoutClosed.
+	admissionClosed := func() bool {
+		f.fanout.adm.RLock()
+		defer f.fanout.adm.RUnlock()
+		return f.fanout.admClosed
+	}
 	deadline = time.Now().Add(10 * time.Second)
-	for {
-		if err := f.fanout.RemovePresence(context.Background(), session.ID(424242), sim.EntityID(1)); errors.Is(err, ErrFanoutClosed) {
-			break
-		}
+	for !admissionClosed() {
 		if time.Now().After(deadline) {
 			t.Fatalf("Close never closed admission")
 		}
@@ -1831,10 +1862,15 @@ func TestFanoutEpochWireOrder204205206(t *testing.T) {
 	}
 	base := len(f.trans[sid].recorded())
 	// Epoch: 2001 enters the AOI, moves, then leaves. Each event's
-	// frame is waited onto the wire before the next one: with the
-	// writer drained between events, physical order follows admission
-	// order exactly (critical-lane priority only reorders frames that
-	// pile up behind a stalled writer, which fails closed anyway).
+	// frame is waited onto the wire before the next one, so this
+	// drained epoch proves the basic 204 -> 205 -> 206 sequence and
+	// handle-retirement order. It does NOT prove backlog ordering:
+	// frames that pile up behind a stalled writer are reordered by
+	// critical-first scheduling, and the queued-205-before-206 case
+	// is proven separately by TestFanoutQueued205CanceledBefore206
+	// (cancellation) and TestFanoutInFlight205CompletesBefore206
+	// (in-flight completion). A temporarily stalled writer that
+	// recovers before WriteTimeout is healthy, not slow.
 	wantFrame := func(n int, why string) {
 		t.Helper()
 		for len(f.trans[sid].recorded()) < base+n {

@@ -153,6 +153,25 @@ func (r StateResult) String() string {
 	}
 }
 
+// StateCancelResult reports a CancelState outcome (spec §7.1.13,
+// v0.3.24): targeted invalidation of ONE queued coalescible state
+// frame before its terminal 206, so a stale queued 205 can never
+// physically appear after a later 206 for a retired handle.
+type StateCancelResult uint8
+
+const (
+	// StateCancelNotQueued marks no queued or writing match.
+	StateCancelNotQueued StateCancelResult = iota
+	// StateCancelCanceled marks a matching queued state item that was
+	// removed (no sequence, no ACK debt, never written).
+	StateCancelCanceled
+	// StateCancelInFlight marks a matching item that already owns the
+	// physical writer: it is NOT cancelled and finishes first.
+	StateCancelInFlight
+	// StateCancelClosed marks cancellation against a closed queue.
+	StateCancelClosed
+)
+
 // OutboundObserver is the narrow, no-op-by-default observation seam
 // (spec §7.1.12): M3-T5b attaches the Prometheus adapter here without
 // rewriting queue internals. The queue never calls an observer while
@@ -515,6 +534,42 @@ func (q *outboundQueue) TryState(
 	q.wakePump()
 	q.emit(rep)
 	return res, nil
+}
+
+// CancelState is the targeted outbound state-cancellation primitive
+// (spec §7.1.13, v0.3.24): it invalidates at most the ONE queued
+// state item with key, operating on the existing per-session queue
+// — never a second queue, never a coarse flush. It returns
+// immediately under only the queue's short mutex: it never waits
+// for writer ownership and never writes a socket. A canceled item
+// receives no S→C sequence and creates no ACK debt (sequence
+// allocation still occurs only at physical writer selection), and
+// the cancellation emits no state-drop/coalesce metric — it is
+// intentional semantic invalidation, not backpressure.
+func (q *outboundQueue) CancelState(key StateKey) StateCancelResult {
+	q.mu.Lock()
+	if q.closed {
+		q.mu.Unlock()
+		return StateCancelClosed
+	}
+	if q.writing != nil && q.writing.state && q.writing.key == key {
+		// The match already owns physical writer serialization: it
+		// MUST physically complete before any later 206 can write,
+		// so it is safe to let it finish.
+		q.mu.Unlock()
+		return StateCancelInFlight
+	}
+	elem, ok := q.state[key]
+	if !ok {
+		q.mu.Unlock()
+		return StateCancelNotQueued
+	}
+	q.removeStateElemLocked(elem)
+	q.broadcastCapacityLocked()
+	rep := q.depthReportLocked()
+	q.mu.Unlock()
+	q.emit(rep)
+	return StateCancelCanceled
 }
 
 // ---------------------------------------------------------------------------
@@ -940,6 +995,10 @@ type OutboundProducer interface {
 	// TryState coalesces/admits/drops immediately; it never waits and
 	// never disconnects on a state drop alone.
 	TryState(sid session.ID, key StateKey, opcode uint16, msgVersion uint16, encode func(*proto.Encoder) error) (StateResult, error)
+	// CancelState removes at most the ONE queued state item with key
+	// (spec §7.1.13); it never waits, never writes, and never emits a
+	// state-drop/coalesce metric.
+	CancelState(key StateKey) StateCancelResult
 	// StopOutbound shuts the queue down idempotently (teardown).
 	StopOutbound(reason string)
 }
@@ -1004,4 +1063,9 @@ func (c *outboundConn) TryState(
 // StopOutbound implements OutboundProducer.
 func (c *outboundConn) StopOutbound(reason string) {
 	c.q.Stop(reason)
+}
+
+// CancelState implements OutboundProducer.
+func (c *outboundConn) CancelState(key StateKey) StateCancelResult {
+	return c.q.CancelState(key)
 }

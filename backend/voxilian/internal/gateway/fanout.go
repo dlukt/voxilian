@@ -135,8 +135,21 @@ type FanoutRuntime struct {
 
 	dropped atomic.Uint64
 
-	// Pump-owned state below: touched only by the pump goroutine,
-	// never shared with producers.
+	// adm is the short admission-vs-close gate (spec §7.4.3,
+	// v0.3.24): control admission holds read ownership across queue
+	// publication only; Close holds write ownership to mark closed.
+	// It is never held across dispatch, Presence calls, outbound
+	// calls, or event completion waits.
+	adm       sync.RWMutex
+	admClosed bool
+
+	// meta is the ONE short fanout-local metadata mutex (spec
+	// §7.4.6, v0.3.24): it protects ready and throttle only, because
+	// the emergency ForgetSession path may run outside the pump. The
+	// pump remains the sole visibility DECISION executor; meta is
+	// never held across Presence calls, PresentationSource calls,
+	// TryCritical/TryState, socket close, or event admission waits.
+	meta     sync.Mutex
 	ready    map[session.ID]bool
 	throttle map[fanoutThrottleKey]fanoutThrottle
 }
@@ -182,17 +195,31 @@ func NewFanoutRuntime(presence *PresenceRegistry, sessions *session.Registry, so
 // non-blocking admission only. A full queue drops the NEWEST update
 // with a counted/sampled diagnostic; a closed runtime drops. It
 // never waits, sleeps, writes sockets, or touches Presence locks or
-// the presentation source from the sim owner goroutine.
+// the presentation source from the sim owner goroutine. The
+// admission gate is acquired only in immediate TryRLock mode, so a
+// concurrent Close can never make the sim producer wait.
 func (r *FanoutRuntime) OnMovement(u sim.MovementUpdate) {
+	if !r.adm.TryRLock() {
+		r.countDrop("closed")
+		return
+	}
+	if r.admClosed {
+		r.adm.RUnlock()
+		r.countDrop("closed")
+		return
+	}
 	select {
 	case <-r.done:
+		r.adm.RUnlock()
 		r.countDrop("closed")
 		return
 	default:
 	}
 	select {
 	case r.events <- fanoutEvent{kind: fanoutMovement, update: u}:
+		r.adm.RUnlock()
 	default:
+		r.adm.RUnlock()
 		r.countDrop("queue_full")
 	}
 }
@@ -209,6 +236,93 @@ func (r *FanoutRuntime) countDrop(reason string) {
 // of dropped movement fanout events (spec §7.4.3).
 func (r *FanoutRuntime) DroppedMovementUpdates() uint64 {
 	return r.dropped.Load()
+}
+
+// ForgetSession is the emergency fanout-local invalidation primitive
+// (spec §7.4.6, v0.3.24): idempotent, synchronous, no socket I/O, no
+// Presence operation, no PresentationSource call, no event enqueue.
+// It removes ready[sid] and every throttle entry whose recipient
+// sid == sid, and works even while the runtime is closing/closed.
+// The WorldSessionRuntime post-sim-remove fallback (not the normal
+// queued RemovePresence path) owns calling it.
+func (r *FanoutRuntime) ForgetSession(sid session.ID) {
+	r.meta.Lock()
+	defer r.meta.Unlock()
+	delete(r.ready, sid)
+	for k := range r.throttle {
+		if k.sid == sid {
+			delete(r.throttle, k)
+		}
+	}
+}
+
+// isReady reports fanout readiness under the metadata mutex.
+func (r *FanoutRuntime) isReady(sid session.ID) bool {
+	r.meta.Lock()
+	defer r.meta.Unlock()
+	return r.ready[sid]
+}
+
+// setReady marks sid fanout-ready under the metadata mutex.
+func (r *FanoutRuntime) setReady(sid session.ID) {
+	r.meta.Lock()
+	defer r.meta.Unlock()
+	r.ready[sid] = true
+}
+
+// clearReady removes sid readiness under the metadata mutex.
+func (r *FanoutRuntime) clearReady(sid session.ID) {
+	r.meta.Lock()
+	defer r.meta.Unlock()
+	delete(r.ready, sid)
+}
+
+// readySubset filters ids through the ready set under the metadata
+// mutex, returning a fresh slice.
+func (r *FanoutRuntime) readySubset(ids []session.ID) []session.ID {
+	r.meta.Lock()
+	defer r.meta.Unlock()
+	var out []session.ID
+	for _, sid := range ids {
+		if r.ready[sid] {
+			out = append(out, sid)
+		}
+	}
+	return out
+}
+
+// getThrottle loads one visibility-epoch throttle entry.
+func (r *FanoutRuntime) getThrottle(k fanoutThrottleKey) (fanoutThrottle, bool) {
+	r.meta.Lock()
+	defer r.meta.Unlock()
+	th, ok := r.throttle[k]
+	return th, ok
+}
+
+// setThrottle stores one visibility-epoch throttle entry.
+func (r *FanoutRuntime) setThrottle(k fanoutThrottleKey, th fanoutThrottle) {
+	r.meta.Lock()
+	defer r.meta.Unlock()
+	r.throttle[k] = th
+}
+
+// deleteThrottle removes one visibility-epoch throttle entry.
+func (r *FanoutRuntime) deleteThrottle(k fanoutThrottleKey) {
+	r.meta.Lock()
+	defer r.meta.Unlock()
+	delete(r.throttle, k)
+}
+
+// clearThrottleFor removes every throttle entry scoped to sid or to
+// entity (source/entity epoch teardown on remove).
+func (r *FanoutRuntime) clearThrottleFor(sid session.ID, entity sim.EntityID) {
+	r.meta.Lock()
+	defer r.meta.Unlock()
+	for k := range r.throttle {
+		if k.sid == sid || k.entity == entity {
+			delete(r.throttle, k)
+		}
+	}
 }
 
 // BootstrapSession enqueues the reliable post-219 bootstrap control
@@ -228,31 +342,50 @@ func (r *FanoutRuntime) submitControl(ctx context.Context, ev fanoutEvent) error
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Admission holds read ownership across queue publication only
+	// (spec §7.4.3, v0.3.24): concurrent admissions share it, while
+	// Close waits at most the bounded admission interval. Before
+	// successful publication the caller may still be rejected by
+	// context cancellation, admission timeout, or Close.
+	r.adm.RLock()
+	if r.admClosed {
+		r.adm.RUnlock()
+		return ErrFanoutClosed
+	}
 	timer := time.NewTimer(FanoutControlTimeout)
 	defer timer.Stop()
 	select {
 	case <-r.done:
+		r.adm.RUnlock()
 		return ErrFanoutClosed
 	case r.events <- ev:
 	case <-ctx.Done():
+		r.adm.RUnlock()
 		return ctx.Err()
 	case <-timer.C:
+		r.adm.RUnlock()
 		return ErrFanoutControlTimeout
 	}
-	select {
-	case err := <-ev.res:
-		return err
-	case <-r.done:
-		return ErrFanoutClosed
-	}
+	r.adm.RUnlock()
+	// After successful publication the event is authoritative: the
+	// caller waits ONLY for that event's definitive result. The
+	// pump/drain produces exactly one result for every admitted
+	// control, so a later Close never changes it (spec §7.4.3,
+	// v0.3.24).
+	return <-ev.res
 }
 
 // Close shuts the runtime down idempotently: queued movements are
-// discarded, queued control waiters receive ErrFanoutClosed, the
-// pump exits, and future movement drops / future control is
-// rejected. No send-on-closed panic; no restart.
+// discarded, queued-but-never-dispatched controls complete with
+// ErrFanoutClosed through the final drain, in-flight dispatches
+// complete with their exact result, the pump exits, and future
+// movement drops / future control is rejected. No send-on-closed
+// panic; no restart.
 func (r *FanoutRuntime) Close() {
+	r.adm.Lock()
+	r.admClosed = true
 	r.closeOnce.Do(func() { close(r.done) })
+	r.adm.Unlock()
 	r.wg.Wait()
 }
 
@@ -330,7 +463,7 @@ func (r *FanoutRuntime) producerFor(sid session.ID) (OutboundProducer, error) {
 // transport (spec §7.4.5/§7.4.6): reconnect/full-resync is recovery.
 // Presence mappings stay for the reaper/takeover paths to tear down.
 func (r *FanoutRuntime) failRecipient(sid session.ID, reason string, err error) {
-	delete(r.ready, sid)
+	r.clearReady(sid)
 	if snap, ok := r.sessions.Get(sid); ok && snap.Conn != nil {
 		_ = snap.Conn.CloseNow()
 	}
@@ -361,13 +494,13 @@ func (r *FanoutRuntime) handleMovement(u sim.MovementUpdate) {
 			// Same-cell movement causes no subscription churn:
 			// the full visible-set reconciliation runs only on a
 			// center-cell change (spec §7.4.5).
-			if r.ready[owner] {
+			if r.isReady(owner) {
 				r.reconcileVisibleSet(owner, nil)
 			}
 		}
 	}
-	desired := r.readyOnly(r.presence.Subscribers(cell))
-	current := r.readyOnly(r.presence.Viewers(u.EntityID))
+	desired := r.readySubset(r.presence.Subscribers(cell))
+	current := r.readySubset(r.presence.Viewers(u.EntityID))
 	desiredSet := toSessionSet(desired)
 	currentSet := toSessionSet(current)
 	for _, sid := range desired {
@@ -501,16 +634,26 @@ func (r *FanoutRuntime) emitCreate(sid session.ID, entity sim.EntityID, u *sim.M
 		r.failRecipient(sid, "create_critical", err)
 		return
 	}
-	delete(r.throttle, fanoutThrottleKey{sid: sid, entity: entity})
+	r.deleteThrottle(fanoutThrottleKey{sid: sid, entity: entity})
 }
 
 // removeViewerDestroy emits 206 with the OLD handle then retires the
-// mapping (spec §7.4.5). Critical failure still retires: the
-// recipient is already failed closed and reconnects/resyncs.
+// mapping (spec §7.4.5, v0.3.24): before admitting the critical 206
+// it cancels any still-queued 205 for the same recipient handle, so
+// a stale queued 205 can never physically appear after the 206.
+// Critical failure still retires: the recipient is already failed
+// closed and reconnects/resyncs.
 func (r *FanoutRuntime) removeViewerDestroy(sid session.ID, entity sim.EntityID) {
 	h, visible, err := r.presence.VisibleHandle(sid, entity)
 	if err != nil || !visible {
 		return
+	}
+	if p, perr := r.producerFor(sid); perr == nil {
+		// Canceled → stale queued 205 gone; InFlight → that 205
+		// owns the writer and completes before the 206; NotQueued
+		// → proceed; Closed → retire anyway (resync owns
+		// recovery). The result never blocks the 206.
+		_ = p.CancelState(StateKey{Kind: proto.OpcodeEntityMove, ID: uint64(h)})
 	}
 	if cerr := r.tryCritical(sid, proto.OpcodeEntityRemove,
 		func(e *proto.Encoder) error {
@@ -522,7 +665,7 @@ func (r *FanoutRuntime) removeViewerDestroy(sid session.ID, entity sim.EntityID)
 		r.failRecipient(sid, "remove_critical", cerr)
 	}
 	_, _, _ = r.presence.HideVisible(sid, entity)
-	delete(r.throttle, fanoutThrottleKey{sid: sid, entity: entity})
+	r.deleteThrottle(fanoutThrottleKey{sid: sid, entity: entity})
 }
 
 // sendMove emits one throttled 205 to an already-visible recipient
@@ -535,8 +678,7 @@ func (r *FanoutRuntime) sendMove(sid session.ID, u sim.MovementUpdate, isOwner b
 		return
 	}
 	key := fanoutThrottleKey{sid: sid, entity: u.EntityID}
-	th := r.throttle[key]
-	if th.sent && u.Tick-th.last < r.stride {
+	if th, ok := r.getThrottle(key); ok && th.sent && u.Tick-th.last < r.stride {
 		return
 	}
 	wire, err := WirePosition(u.Position)
@@ -573,12 +715,12 @@ func (r *FanoutRuntime) sendMove(sid session.ID, u sim.MovementUpdate, isOwner b
 	}
 	switch res {
 	case StateClosed:
-		delete(r.ready, sid)
+		r.clearReady(sid)
 	case StateDropped:
 		// Coalescing budget shed newest state only: mapping and
 		// throttle epoch are untouched; later movement corrects.
 	case StateQueued, StateCoalesced:
-		r.throttle[key] = fanoutThrottle{sent: true, last: u.Tick}
+		r.setThrottle(key, fanoutThrottle{sent: true, last: u.Tick})
 	}
 }
 
@@ -622,7 +764,7 @@ func (r *FanoutRuntime) handleBootstrap(sid session.ID) error {
 			return berr
 		}
 	}
-	r.ready[sid] = true
+	r.setReady(sid)
 	r.notifyExistingViewers(snap)
 	return nil
 }
@@ -668,7 +810,7 @@ func (r *FanoutRuntime) emitCreateBoot(sid session.ID, snap PresenceSnapshot, en
 		r.failRecipient(sid, "bootstrap_create_critical", err)
 		return err
 	}
-	delete(r.throttle, fanoutThrottleKey{sid: sid, entity: entity})
+	r.deleteThrottle(fanoutThrottleKey{sid: sid, entity: entity})
 	return nil
 }
 
@@ -684,7 +826,7 @@ func (r *FanoutRuntime) notifyExistingViewers(snap PresenceSnapshot) {
 	if err != nil {
 		return
 	}
-	for _, other := range r.readyOnly(r.presence.Subscribers(cell)) {
+	for _, other := range r.readySubset(r.presence.Subscribers(cell)) {
 		if other == snap.SessionID {
 			continue
 		}
@@ -697,18 +839,14 @@ func (r *FanoutRuntime) notifyExistingViewers(snap PresenceSnapshot) {
 // viewers get 206 with mapping retirement, the source gets no own
 // 206. Non-ready viewers retire silently (no wire debt).
 func (r *FanoutRuntime) handleRemove(sid session.ID, entity sim.EntityID) error {
-	delete(r.ready, sid)
-	for k := range r.throttle {
-		if k.sid == sid || k.entity == entity {
-			delete(r.throttle, k)
-		}
-	}
+	r.clearReady(sid)
+	r.clearThrottleFor(sid, entity)
 	viewers := r.presence.Viewers(entity)
 	for _, v := range viewers {
 		if v == sid {
 			continue
 		}
-		if r.ready[v] {
+		if r.isReady(v) {
 			r.removeViewerDestroy(v, entity)
 		} else if _, _, err := r.presence.HideVisible(v, entity); err != nil {
 			slog.Warn("gateway: fanout silent retire failed",
@@ -716,18 +854,6 @@ func (r *FanoutRuntime) handleRemove(sid session.ID, entity sim.EntityID) error 
 		}
 	}
 	return nil
-}
-
-// readyOnly filters session IDs through the pump ready set,
-// returning a fresh slice.
-func (r *FanoutRuntime) readyOnly(ids []session.ID) []session.ID {
-	var out []session.ID
-	for _, sid := range ids {
-		if r.ready[sid] {
-			out = append(out, sid)
-		}
-	}
-	return out
 }
 
 func toSessionSet(ids []session.ID) map[session.ID]bool {
