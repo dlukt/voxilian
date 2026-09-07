@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.7)
+# Voxilian Backend — Implementation Plan (v1.9)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.24).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.25).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -166,7 +166,7 @@ Exit: 20 Hz tick loop, cells, server-authoritative movement with reconciliation 
 
 Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested.
 
-- [ ] **M5-T1** Offense/defense/hit + weapon tables: `(Off*55)/Def` 10–95%, weapon type/quality, 1 swing/s, vigor costs, 30/hit + ⅓-HP caps, severity text hooks. Golden vectors from `meridian59.md` §7. Spec: §9, meridian59 §7.
+- [ ] **M5-T1** Offense/defense/hit + weapon tables: `(Off*55)/Def` 10–95%, weapon type/quality, 1 swing/s, vigor costs, 30/hit + ⅓-HP caps, severity text hooks. Golden vectors from `meridian59.md` §7. Spec: §9.1, meridian59 §7. Pure sim-domain math only: NO gateway/opcode-103 wiring (103..120 stay rate-gate-then-delegate), NO armor/resist/spell/vitals/death work, NO `entity.go` fields.
 - [ ] **M5-T2** Armor/shields/resists: `ModifyDefensePower/Damage`, block/parry/dodge rolls, ±100 resist clip, spell-vs-weapon reduction rules. Golden vectors. Spec: §9.
 - [ ] **M5-T3** Spell damage + touch/walls/AoE: `rand*(50+power/2)/99`, wall ticks, touch scaling, Illusionary-Wounds rules, quake falloff; mana/vigor/reagent/karma gates; cast/post-cast timing. Spec: §9.
 - [ ] **M5-T4** Vitals/regen/hunger: HP=level caps, mana+nodes, exertion/rest/thresholds, regen tick formulas, stomach decay. Golden vectors + timer tests (fake clock). Spec: §9, meridian59 §4.
@@ -294,7 +294,7 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 |---|---|---|
 | 100/101 hello/reauth | M3-T2 (+M11-T2 hardening) | auth plane |
 | 102 move | M4-T2 | M4-T2 owns authoritative move semantics; M4-T5b1 owns wire decode/rate/owner-mailbox routing; M4-T5b2 owns 205 AOI transport fanout; none reimplement movement rules. |
-| 103/104 attack/cast | M5-T1…T3 | combat plane |
+| 103/104 attack/cast | M5-T1…T3 | combat plane (T1 = pure math only, no gateway wiring; transport integration when M5 runtime state exists) |
 | 105 use, 115 rest, 116 eat, 119 safety, 117/118 chat | M5-T6 | personal intents |
 | 106/107/108/109 get/drop/put/give | M7-T4 | world items |
 | 110–113 offer/counter/accept/cancel | M8-T1 | trade machine |
@@ -306,6 +306,13 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 
 ## Plan history
 
+- v1.9: freeze M5-T1 weapon-combat semantics (spec v0.3.25 §9.1: T1/T2/T3/
+  T4/T5 ownership boundaries, exact offense/defense/monster-rating/hit/
+  weapon-table/damage-stage/cap/severity/cooldown/vigor contracts, no
+  opcode-103 gateway wiring in T1, no `entity.go` fields) + verified
+  `meridian59.md` corrections (ceil ⅓-cap on BaseMax both sides, buffed-Max
+  `>=` forced severity, no-double-count damage order, strokeless vigor
+  gate, optimistic cooldown arming). M5-T1 stays `[ ]`, M5 exit stays `[ ]`.
 - v1.8: correct M4-T5b2 fanout closure semantics (spec v0.3.24) and
   REOPEN M4-T5b2 `[ ]` — targeted outbound state cancellation before
   206, exact post-admission control completion, race-free

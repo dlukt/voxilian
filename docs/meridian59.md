@@ -137,8 +137,16 @@ gives ceiling — newbies with 40 Aim still hit sometimes with 20% sword.
 - 10000 exertion = 1 vigor. Positive exertion spends; negative (rest/food/
   Relay/Invigorate) recovers. Rest ticks only up to threshold; threshold
   10–100 settable, forced 10 under Second Wind.
-- Gates: `HasVigor(amount)` required to swing/cast. Fail still costs half.
-- Typical costs: melee swing ~0.2, punch 0.5, unarmed 1.0, Disarm 1.0,
+- Gates: `HasVigor(amount)` is strict `piVigor > amount`. Standard weapon
+  strokes (slash/fire) set `vbCheck_exertion=FALSE`, so they have NO pre-gate
+  and always pay the full cost on execution (stroke `SuccessChance` is
+  unconditionally TRUE, so the half-cost `SkillFailed` path never fires for
+  strokes). The "fail still costs half" (`(1000*exertion)/2`) applies only to
+  non-stroke skills via `SkillFailed`.
+- Typical costs (charged as `1000*viSkillExertion` exertion): standard melee/
+  bow swing (slash/fire, `viSkillExertion=2`) = 2000 = 0.2 vigor; punch
+  (`viskillExertion=5`) = 5000 = 0.5 vigor; unarmed base
+  (`viskillExertion=10`) = 10000 = 1.0 vigor; Disarm 1.0,
   spells default 2 vigor + mana, walls/nodeburst up to 30.
 - Rest tick `1000+30*(51-Stam)` ms (≈1.0–2.5 s); full 0→80 ≈ 200 s. Room
   `SANCTUARY` ×2, `TRIPLE_HEAL` ×3. Faction vigor discount exists.
@@ -352,7 +360,10 @@ chance = (Offense * 55) / Defense, bound 10–95; hit if chance >= d100
 - Player **Offense** = `Stroke*3 + Prof*2 + Aim*4 + BaseMaxHP*3/2`,
   `+ weapon.ModifyHitRoll + faction + attack_mods + flag%`, bound 1–1000.
   Ranged without line-of-sight halved. 1 swing/sec for all weapons
-  (`IsOkayAttackTime 1000 ms`); spells use `PostCast 2 s`.
+  (`IsOkayAttackTime 1000 ms`, which both CHECKS and ARMS the timer and is
+  called FIRST in `TryAttack` — so a later failure (range/legality/vigor/
+  costs) still consumes the swing, while a too-early attempt returns before
+  arming and mutates nothing); spells use `PostCast 2 s`.
 - Player **Defense** = `Parry*2 + Block + Dodge*3 + Agi*4 + BaseMaxHP*3/2`,
   `+ armor ModifyDefensePower + faction + flag%`, bound 1–1000. Zero components
   if no weapon/shield or `NO_FIGHT/NO_MOVE`, or `CanParry/Block/Dodge` false.
@@ -370,15 +381,27 @@ hit 0 / dmg 5–11 / disarm 0 / spell −15 / range 2. Quality: Low +0/−1/−5
 High +50/+1/+5/−5, Nerudite +25/+1/+0/+5, plus `HitBonus/DamageBonus`
 (enchant). `GetDamage` + attribute mods; 75% chance −1 weapon HP per hit.
 
-Stroke: `dmg = weapon.GetDamage() * DamageFactor/100` (Slash 80, Fire/bow 90),
-`+ (Prof+1)*5/100 + ((100+bound(Might−25,0,40))*dmg)/100` (Fire uses Aim).
-Unarmed `d4 + factors (Brawling)`. Then `+ attack_mods + faction SoldierShield
-dmg` (above caps).
+Stroke: `w = weapon.GetDamage()` (base roll + quality + `DamageBonus`);
+` s = (w*DamageFactor)/100` (Slash 80, Fire/bow 90, default 100);
+`profFlat = ((Prof+1)*5)/100` (flat, `viMaxProficiencyDamage=5`);
+`m = ((100+bound(Might−25,0,40))*s)/100` (Fire substitutes Aim for Might);
+`raw = profFlat + m`, `bound(raw,1,$)` — i.e. the Might term re-includes
+the full scaled damage, so the base is counted exactly once, plus the
+small flat proficiency bonus. Unarmed `d4 + factors (Brawling)`. Then
+`+ attack_mods + faction SoldierShield dmg` (above caps).
 
-**Caps** (`player.kod`): min 1; `≤ BaseMaxHP/3` if victim `HP < 2×Max` and not
-outlaw/murderer (anti-one-shot); **≤ 30/hit** (faction +15% above caps).
-Monsters: `bound(dmg,1,..)`, no cap. Severity text: 1–5 nick, 6–15 wound,
->15 damage, `$` slay; 1/3 maxHP forces “damage”.
+**Caps** (`player.kod AssessDamage`, non-absolute path; verified against source):
+min 1 first (`damage <= 0 → 1`); then `damage <= ceil(BaseMaxHP/3)` with
+`ceil = (BaseMaxHP+2)/3` iff victim `HP < 2*BaseMaxHP` (strict `<`, BOTH
+sides use BaseMax — not buffed Max) and not outlaw/murderer (default:
+`DamageCapProtectionMurderersEnable=FALSE`, so outlaws/murderers are exempt
+from the ⅓ cap only); then **≤ 30/hit** (`MAX_DAMAGE_PER_HIT`, after the ⅓
+cap; no exemptions). Faction +15% (`*115/100`) applies above both caps.
+Monsters: `bound(dmg,1,$)`, no caps. Severity (`battler.kod GetDamageDesc` +
+`AssessHit`): 1–5 nick, 6–15 wound, >15 damage, lethal (`$`) slay; a
+non-lethal hit on a player victim dealing `>= floor(buffed MaxHP/3)`
+(buffed `GetMaxHealth`, `>=`, post-cap applied damage) is forced to
+“damage” severity.
 
 Order: armor `ModifyDefenseDamage` → `ResistanceCheck` → bonuses → caps →
 `LoseHealth`.

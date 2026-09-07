@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.24 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.25 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -4557,6 +4557,374 @@ pgx/generated sqlc; tests may use pgx/raw SQL for fixtures only.
 - Phase 2 (reserved, not MVP): guilds, factions/territory, justice, assassin
   game, Jala hinder matrix — schema MUST NOT preclude them (flags/ledger/kills
   already carry what they need).
+
+### 9.1 M5-T1 weapon-combat math/domain core (frozen, v0.3.25)
+
+M5-T1 builds the deterministic weapon-combat math/domain core as pure
+sim-domain functions over immutable input structs/value objects. Normative
+source: this section. Research reference: `docs/meridian59.md` §3, §4.3,
+§7.1–§7.4 (corrected where the vendored-source audit required it; all
+corrections are noted inline below). No GPL KOD/C text is copied: mechanics
+only are reimplemented. All combat integer division truncates toward zero
+(C semantics); every T1 combat operand is non-negative, so truncation equals
+floor. Intermediate products use 64-bit widths; comparisons that could
+overflow a doubled operand use the safe order form stated below.
+
+#### 9.1.1 Ownership: T1 owns vs defers
+
+T1 OWNS: combat rating arithmetic; player offense; player defense base
+arithmetic; the generic monster Off/Def rating primitive; hit chance; hit
+roll; generic weapon-family tables; generic weapon-quality tables;
+pre-mitigation physical weapon damage math; the one-swing-per-second timing
+primitive (simulation time); the weapon-attack vigor/exertion cost contract;
+the final player-hit cap primitive; the damage severity classification hook;
+deterministic RNG use; golden/property tests.
+
+T1 does NOT own (and MUST NOT implement): armor damage reduction (M5-T2);
+shield block implementation (M5-T2); resistance implementation (M5-T2);
+spell damage/casting (M5-T3); real HP/mana/vigor entity storage (M5-T4);
+regen/rest/hunger (M5-T4); `LoseHealth`/HP mutation (M5-T4/T5 composition);
+death/corpse/respawn (M5-T5); actual weapon/item inventory lookup (M7/M9);
+named weapon prototype catalog content (M9-T13); mob AI (M7); trade (M8);
+gateway opcode-103 runtime wiring (NOT in T1 — see §9.1.2); protocol
+changes (NONE); PG/store/persist (NONE).
+
+The live sim entity gains NO new fields in T1 (`entity.go` untouched): no
+HP/MaxHP/mana/vigor/stats/inventory/characterID/PG-revision/weapon-pointer.
+Formula inputs that need such numbers receive them as immutable calculation
+inputs, never as authoritative live vitals.
+
+#### 9.1.2 No opcode-103 gateway wiring in T1
+
+T1 does NOT modify `internal/gateway`. Existing behavior stands: opcodes
+`103..120` are rate-gated, then delegated unchanged to `Next`. T1 defines
+no `DecodeAttack`, resolves no `NetEntityID`, adds no gateway→sim attack
+mailbox command, and sends no `202/207/208/210/etc.` Transport integration
+waits until the M5 runtime vitals/mutation state exists; no half-functional
+wire attack is created.
+
+#### 9.1.3 Player offense
+
+```text
+Offense = Stroke*3 + Proficiency*2 + Aim*4 + (BaseMaxHP*3)/2
+        + weaponHitMod + extraScalarMods
+Offense = bound(Offense, 1, 1000)
+```
+
+- `Stroke`/`Proficiency` are the already-resolved ability values for the
+  wielded weapon (`GetStroke`/`GetProf`; unarmed: Punch/Brawling abilities).
+  `Aim` is the effective attribute (`bound(base+mod,1,70)`).
+- `(BaseMaxHP*3)/2` evaluates left-to-right with one truncation
+  (`((BaseMaxHP*3)/2)`), i.e. `floor(BaseMaxHP*1.5)`.
+- `weaponHitMod` is the resolved family+quality hit modifier (§9.1.7–§9.1.8)
+  plus any already-resolved numeric enchant `HitBonus`.
+- `extraScalarMods` carries already-resolved additive attack modifiers
+  (future attack-modifier/buff sources compose here without changing the
+  core formula). Faction hit-roll bonus, ranged line-of-sight halving, and
+  the universal `piFlags3` percent modifier are phase-2/future systems and
+  contribute 0 in T1 (LOS needs room topology owned by later work).
+- Negative impossible inputs (negative Stroke/Proficiency/Aim/BaseMaxHP)
+  are deterministic domain errors, never silent clamps. Zero values are
+  legal arithmetic inputs (the 1..1000 bound still applies).
+
+#### 9.1.4 Player defense (arithmetic only)
+
+```text
+Defense = Parry*2 + Block + Dodge*3 + Agility*4 + (BaseMaxHP*3)/2
+        + extraDefensePowerMods
+Defense = bound(Defense, 1, 1000)
+```
+
+- T1 owns the arithmetic ONLY. Armor/shield sources belong to M5-T2.
+- Unavailable components are already-zeroed numeric inputs (source
+  behavior: Parry is 0 with no weapon, Block is 0 with no shield, Dodge is
+  0 when its cost check fails). T1 takes plain numbers — no capability
+  flags, no armor/shield objects, no duplicate of the future T2 decision
+  layer. `Agility` is the effective attribute (`bound(base+mod,1,70)`).
+- `(BaseMaxHP*3)/2` truncates exactly as in §9.1.3. `extraDefensePowerMods`
+  carries already-resolved scalar terms only (future T2 armor
+  `ModifyDefensePower`/faction/flag sources compose here later).
+- Negative impossible inputs are deterministic domain errors.
+
+#### 9.1.5 Monster combat rating primitive
+
+```text
+rating = 3*Level + 60*Difficulty
+rating = bound(rating, 1, 1500)
+```
+
+- One primitive serves both monster Offense and Defense (source
+  `monster.kod` uses the identical expression for both; per-mob
+  `piOffense`/`piDefense` overrides and the Palsy ×3/4 effect are
+  status/prototype systems owned by later work, not T1).
+- Golden: Orc (Level 45, Difficulty 6) → `135+360` = 495. Yeti (Level 170,
+  Difficulty 9) → `510+540` = 1050.
+- Negative Level/Difficulty are deterministic domain errors. Zero is a
+  legal arithmetic input (the 1..1500 bound still applies).
+
+#### 9.1.6 Hit chance and hit roll
+
+```text
+chance = (Offense*55) / Defense        (integer truncation)
+chance = bound(chance, 10, 95)
+hit iff chance >= d100,  d100 in 1..100 inclusive
+```
+
+- `55` is source `EQUAL_CHANCE_HIT`. The product uses a 64-bit
+  intermediate; ratings are bounded by their constructors so the normal
+  formula cannot overflow, and the bound is enforced, never assumed.
+- `HitChance` rejects `Defense <= 0` and `Offense <= 0` with stable domain
+  errors (never divide-by-zero, never panic). Upper inputs need no
+  rejection: the 10..95 clamp is total.
+- The roll consumes the existing sim `RNG` interface (`Uint64() uint64`)
+  through a private inclusive bounded helper. No global `math/rand`, no
+  `crypto/rand`, no wall clock, no panic on a valid range. The helper is
+  deterministic under an injected scripted RNG.
+- Boundaries (frozen): chance 10 hits on rolls 1..10 and misses on 11;
+  chance 95 hits on roll 95 and misses on 96..100.
+
+#### 9.1.7 Generic weapon-family table
+
+Verified against source `weapon.kod` tuning constants (the source
+Low/Mid/High labels are confusing — Bludgeon uses the MID hit constant,
+Slash the LOW one, etc. — so T1 freezes resolved numbers, not labels):
+
+```text
+Family    HitMod  Damage(incl)  Disarm  SpellMod  Range
+Bludgeon  +75     4..8          -5      +0        2
+Thrust    +125    3..8          +10     -10       3
+Slash     +0      5..11         0       -15       2
+```
+
+- Typed enum/domain values only; unknown family is a deterministic domain
+  error. No stringly-typed switch, no stable catalog IDs, no named
+  prototypes (M9-T13 owns content IDs).
+
+#### 9.1.8 Generic weapon-quality table
+
+Verified against source `weapon.kod` quality constants; values compose
+additively with the family row. `Normal` (the source default
+`WEAPON_QUALITY_NORMAL`, which has no modifier branch) is frozen as
+explicit zeros, never as accidental enum-zero:
+
+```text
+Quality   HitMod  DamageMod  DisarmMod  SpellMod  RangeMod
+Low       +0      -1         -5         +5        +0
+Normal    +0      +0         +0         +0        +0
+High      +50     +1         +5         -5        +0
+Nerudite  +25     +1         +0         +5        +0
+```
+
+- Unknown quality is a deterministic domain error. No named prototypes.
+- `DamageBonus` (generic enchant/item numeric bonus) adds after the
+  quality modifier: `w = roll + qualityDmgMod + damageBonus`, where the
+  API receives the already-resolved numeric bonus (no inventory/enchant
+  storage in T1).
+
+#### 9.1.9 Base weapon damage roll
+
+Family damage ranges are inclusive: `random(min,max)` in source is
+`low + rand28 % (high-low+1)` (verified in `blakserv/ccode.c C_Random`),
+so both endpoints are reachable. Boundary tests force min and max rolls.
+
+#### 9.1.10 Pre-mitigation physical weapon damage (source-audited)
+
+Source order (`stroke.kod FindDamage` → `DamageFactors`; `weapon.kod
+GetDamage`) is frozen exactly — note the trap: `DamageFactors` starts its
+accumulator at ZERO and the Might term re-includes the full scaled damage
+at `(100+bonus)%`, so the base is counted exactly ONCE (inside the Might
+term), plus a small flat proficiency bonus. There is no doubling:
+
+```text
+w      = baseRoll + qualityDmgMod + damageBonus   (all integers; §9.1.8)
+s      = (w * damageFactor) / 100                  (truncation)
+         damageFactor: Slash 80, Fire/bow 90, default 100
+profFlat = ((proficiency + 1) * maxProfDamage) / 100   (truncation)
+         maxProfDamage: 5 (source viMaxProficiencyDamage default)
+attrBonus = bound(attr - 25, 0, 40)               (attr = Might melee, Aim Fire)
+m      = ((100 + attrBonus) * s) / 100            (truncation)
+raw    = profFlat + m
+preMit = bound(raw, 1, $)                         ($ = no upper cap)
+```
+
+- Might effect: +0% at Might ≤ 25, up to +40% at Might ≥ 65. Fire/ranged
+  substitutes Aim for Might with the identical bound (source `fire.kod`
+  `DamageFactors`); the T1 API takes one already-resolved `attr` value and
+  documents which attribute the caller passes — no weapon-content lookup.
+- `generic attack modifier placement` (`ModifyDamage` bonuses, faction
+  damage) applies AFTER this stage (source `player.kod GetDamage` adds
+  `iDamageBonus` after `FindDamage`); those sources are future systems and
+  enter through resolved numeric inputs, not T1 objects.
+- Unarmed (`d4` + factors, Brawling as proficiency) is NOT a T1 weapon
+  path; T1 freezes weapon paths only.
+
+#### 9.1.11 Damage-stage boundary with M5-T2
+
+T1 produces pre-mitigation physical weapon damage (§9.1.10). Normative
+conceptual order (source `AssessDamage`):
+
+```text
+T1 raw physical weapon damage
+  -> T2 armor damage modification (ModifyDefenseDamage)
+  -> T2 resistance (ResistanceCheck/GetDamageFromResistance)
+  -> future already-resolved post-mitigation bonuses (attmods AFTER resist)
+  -> T1 final player damage caps (§9.1.12)
+  -> later vitals LoseHealth (M5-T4/T5 composition)
+```
+
+T1 MUST NOT expose a single `ResolveAttack` that applies caps before the
+T2 stage. Caps and raw damage are separately testable stage functions.
+
+#### 9.1.12 Minimum damage and final player caps (source-audited)
+
+Source `player.kod AssessDamage` order is frozen (non-absolute path; the
+absolute/Illusionary-Wounds path skips all of this and belongs to M5-T3):
+
+```text
+1. if damage <= 0 -> damage = 1
+2. one-third cap (below), then 3. 30 cap (below)
+```
+
+- Minimum 1 is guaranteed by step 1 at the cap stage; T2 armor/resistance
+  work MUST NOT invent a contradictory minimum (an intermediate zero from
+  mitigation still becomes at least 1 here).
+- One-third cap (CORRECTED from the research summary, verified in source):
+  the victim quantity on BOTH sides is `BaseMaxHP`, compared STRICTLY:
+
+```text
+if victimHP < 2*BaseMaxHP (strict <, overflow-safe compare)
+   AND (NOT outlaw AND NOT murderer
+        OR murdererProtectionSettingEnabled)
+then damage = min(damage, ceil(BaseMaxHP/3))
+where ceil(BaseMaxHP/3) = (BaseMaxHP + 2) / 3   (source: (base + (F-1)) / F, F=3)
+```
+
+  The default `murdererProtectionSettingEnabled` is FALSE (source
+  `settings.kod pbDamageCapProtectionMurderersEnable = FALSE`), so by
+  default outlaws/murderers are exempt from the one-third cap ONLY. The T1
+  API takes the setting as an already-resolved boolean input.
+- 30-per-hit cap: `damage = min(damage, 30)` (`MAX_DAMAGE_PER_HIT`),
+  applied AFTER the one-third cap. Ordinary player weapon damage therefore
+  satisfies `1 <= final <= 30`, and when the one-third cap applies also
+  `final <= ceil(BaseMaxHP/3)`. The outlaw/murderer exemption affects ONLY
+  the one-third cap, never the 30 cap. Monsters use NO player caps
+  (source `monster.kod AssessDamage` floors at 1 only).
+- Phase-2 faction +15% (`damage*115/100`) applies ABOVE these caps (source
+  order) and is NOT implemented in T1; no faction system exists.
+- Cap inputs use an immutable victim snapshot `{HP, BaseMaxHP, outlaw,
+  murderer}` (no live vitals). Invalid snapshots (`BaseMaxHP < 1`,
+  `HP < 0`) are deterministic domain errors. All comparisons use
+  overflow-safe order operations (no raw `2*maxHP` / `damage*3` products);
+  property tests cover large legal integers with no panic, wrap, or
+  bypass.
+
+#### 9.1.13 Severity classification hook (source-audited)
+
+T1 owns a domain enum, NOT UI text (source `GetDamageDesc` returns per-type
+prose; T1 returns the classification and future presentation maps it):
+
+```text
+Nick | Wound | Damage | Slay
+```
+
+- Non-lethal thresholds (source `DAMAGE_THRESHOLD_WOUND = 5`,
+  `DAMAGE_THRESHOLD_DAMAGE = 15`): `damage > 15` → Damage; `damage > 5` →
+  Wound; `damage > 0` → Nick.
+- Lethal (source `damage = $` kill path) → Slay, always (overrides all).
+- One-third forced-Damage (CORRECTED from the research summary, verified
+  in source `battler.kod AssessHit`): applies ONLY to player victims, ONLY
+  when non-lethal, uses the BUFFED `MaxHP` (source `GetMaxHealth`, NOT
+  `BaseMaxHP`), with `>=` against FLOOR division, and classifies the
+  POST-cap actually-applied damage:
+
+```text
+if victimIsPlayer AND NOT killed
+   AND appliedDamage >= floor(victimMaxHP / 3)
+then severity = Damage   (source forces iDmg = 16, i.e. just over the Damage line)
+```
+
+- The T1 API takes `(appliedDamage, killed, victimIsPlayer, victimMaxHP)`;
+  non-lethal `appliedDamage < 1` and player-victim `victimMaxHP < 1` are
+  deterministic domain errors.
+
+#### 9.1.14 One swing per second (simulation time)
+
+Source `IsOkayAttackTime` (default 1000 ms) both CHECKS and ARMS an
+attack timer, and `TryAttack` calls it FIRST — so a later failure
+(range, legality, vigor gate, costs) still consumes the swing, while a
+too-early attempt returns before arming and mutates nothing. Frozen
+tick-domain equivalent (`TickHz = H`, `cooldownTicks = H`):
+
+```text
+20 Hz  -> 20 ticks     60 Hz -> 60 ticks     120 Hz -> 120 ticks
+```
+
+- No wall clock, no timers, no goroutines, no per-entity ticker: pure
+  function over `(hasSwung, lastSwingTick, nowTick, tickHz)` in the u32
+  serial domain. First swing (`hasSwung = false`) is always allowed.
+  Allowed iff unsigned mod-2³² `elapsed = nowTick - lastSwingTick` satisfies
+  `elapsed >= cooldownTicks` (exact boundary allowed, one tick early
+  rejected). Correct across `MaxUint32 -> 0` wrap by unsigned arithmetic;
+  the exact half-range distance needs no special case (the `>=` on the
+  unsigned distance is total).
+- Recording rule (caller's storage, owned by later tasks): record
+  `lastSwingTick = nowTick` when the readiness check passes (attempt-time
+  arming, mirroring source); rejected too-early attempts MUST NOT update
+  it. `tickHz` outside the configured `1..120` range is a domain error.
+
+#### 9.1.15 Vigor/exertion cost contract (source-audited)
+
+10000 exertion = 1 vigor (source `AddExertion` converts at `/10000`).
+T1 owns ONLY the cost contract in integer exertion (M5-T4 owns the mutable
+vigor model; T1 adds no vigor state to the entity):
+
+- Standard weapon swing cost is 2000 exertion (source: slash/fire
+  `viSkillExertion = 2`, charged as `1000*viSkillExertion` in `PayCosts`).
+- CORRECTED from the research summary: slash and fire set
+  `vbCheck_exertion = FALSE`, so standard weapon swings have NO pre-gate —
+  the full 2000 is always charged on execution (stroke `SuccessChance` is
+  unconditionally TRUE, so the half-cost `SkillFailed` path never fires
+  for strokes). The "failed gate costs half" (`(1000*exertion)/2`) belongs
+  to non-stroke skills and is out of T1 scope.
+- The generic gate helper (for future gated strokes) mirrors source
+  `HasVigor`: strict `vigor > required` (equality DENIES). A denied gate
+  charges 0 at this stage for the stroke path; it still consumes the swing
+  cooldown via the §9.1.14 attempt-time arming.
+- No float vigor amounts, no regen, no mutation of player vigor. A future
+  T4 composition consumes the integer result without changing T1
+  arithmetic.
+
+#### 9.1.16 Content, durability, range, and error boundaries
+
+- Named weapons (Mace/Axe/Hammer/Longsword/…, bows/ammo) are M9-T13
+  content: no proto IDs, no names, no durability counters in T1. Weapon HP
+  degradation (75% −1 per hit) is OUT of T1; T1 result data lets a later
+  item system observe that a successful weapon hit occurred.
+- Family range values (§9.1.7) are frozen data. T1 implements NO
+  range-check helper, NO lag-compensation rewind (the 2-second history
+  ring stays reserved), NO line-of-sight/world-raycast (ranged content is
+  later); all checks are server-authoritative by construction when they
+  arrive.
+- Public combat-domain functions fail deterministically on impossible
+  domain inputs via stable `errors.Is` sentinels (never string parsing,
+  never panic): unknown weapon family/quality, invalid damage range
+  (`min > max`, negative), invalid `tickHz`, non-positive
+  offense/defense rating inputs to `HitChance`, negative impossible
+  stat/ability values, invalid HP snapshots. Plain already-resolved
+  numeric modifiers (enchant bonuses, future buff scalars) are trusted
+  inputs owned by future content systems and are not over-validated.
+
+#### 9.1.17 Frozen property invariants
+
+`HitChance` is always 10..95 for valid ratings; player Offense/Defense
+always 1..1000; monster rating always 1..1500; successful table lookups are
+immutable/value-only; rolled weapon damage stays inside the frozen
+inclusive range before documented modifiers; ordinary player final damage
+is `>= 1` and `<= 30`; when the one-third cap applies, final is `<=
+ceil(BaseMaxHP/3)` subject to the minimum-one rule; outlaw/murderer
+exemption affects only the one-third cap; cooldown never allows more than
+one accepted swing per simulated second and stays correct across u32 wrap;
+identical scripted RNG + identical inputs yield identical results.
 
 ## 10. Config / deployment / ops
 
