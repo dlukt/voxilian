@@ -973,6 +973,182 @@ func TestRestInputTiming(t *testing.T) {
 	})
 }
 
+// ---------------------------------------------------------------- adjust max HP scheduling
+
+// TestAdjustMaxHPNewHealthReconciliation pins all three NewHealth
+// transitions caused specifically by PlayerAdjustMaxHP (spec §9.4b.11,
+// §9.4b.22): a MaxHP change can CREATE the slot (equality broken with
+// HP > 0), CANCEL it (equality reached), or KEEP the exact existing
+// due; the changed MaxHP affects only the NEXT create/re-arm.
+func TestAdjustMaxHPNewHealthReconciliation(t *testing.T) {
+	t.Run("absent creates after max increase and later heals", func(t *testing.T) {
+		e := newPlayerEngine(t, nil)
+		id := addDamagedPlayer(t, e, world.Vec3{X: 1, Y: 0, Z: 1})
+		// Return to full 20/20 so the slot is absent at equality.
+		if _, _, err := e.PlayerGainHealthNormal(id, 10); err != nil {
+			t.Fatalf("heal to full: %v", err)
+		}
+		rt, _, _ := e.PlayerVitalsRuntimeOf(id)
+		if rt.HealthArmed {
+			t.Fatalf("slot armed at equality before adjust")
+		}
+		out, delta, err := e.PlayerAdjustMaxHP(id, 5)
+		if err != nil || delta != 5 || out.HP != 20 || out.MaxHP != 25 {
+			t.Fatalf("adjust +5 = %+v,%d,%v", out, delta, err)
+		}
+		rt, _, _ = e.PlayerVitalsRuntimeOf(id)
+		if !rt.HealthArmed {
+			t.Fatalf("equality broken did not CREATE the slot")
+		}
+		v, _, _ := e.PlayerVitalsOf(id)
+		ms, err := HealthRegenIntervalMs(v.Vigor, 25, v.MaxHP, 0, 0)
+		if err != nil {
+			t.Fatalf("health interval: %v", err)
+		}
+		delay, err := CastTicks(ms, e.TickHz())
+		if err != nil {
+			t.Fatalf("cast ticks: %v", err)
+		}
+		if rt.HealthDue != e.CurrentTick()+uint32(delay) {
+			t.Fatalf("created due = %d, want %d", rt.HealthDue, e.CurrentTick()+uint32(delay))
+		}
+		// The resulting timer really heals 20 -> 21 when acted.
+		if err := e.PlayerMarkActedSinceEntry(id); err != nil {
+			t.Fatalf("mark: %v", err)
+		}
+		forceHealthDue(t, e, id, e.CurrentTick()+1)
+		e.Step()
+		got, _, _ := e.PlayerVitalsOf(id)
+		if got.HP != 21 {
+			t.Fatalf("HP = %d, want 21 (created timer heals)", got.HP)
+		}
+	})
+
+	t.Run("present cancels when max becomes hp", func(t *testing.T) {
+		e := newPlayerEngine(t, nil)
+		v := testVitals()
+		v.HP = 25 // legal over-max: attach arms the health slot
+		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		if err != nil {
+			t.Fatalf("AddPlayerEntity: %v", err)
+		}
+		rt, _, _ := e.PlayerVitalsRuntimeOf(snap.ID)
+		if !rt.HealthArmed {
+			t.Fatalf("over-max player has no deadline at attach")
+		}
+		out, delta, err := e.PlayerAdjustMaxHP(snap.ID, 5)
+		if err != nil || delta != 5 || out.HP != 25 || out.MaxHP != 25 {
+			t.Fatalf("adjust +5 = %+v,%d,%v", out, delta, err)
+		}
+		rt, _, _ = e.PlayerVitalsRuntimeOf(snap.ID)
+		if rt.HealthArmed {
+			t.Fatalf("equality reached did not CANCEL the slot")
+		}
+		// No stale deadline may later mutate HP.
+		steps(t, e, 5)
+		got, _, _ := e.PlayerVitalsOf(snap.ID)
+		if got.HP != 25 {
+			t.Fatalf("stale deadline mutated HP: %d", got.HP)
+		}
+		rt, _, _ = e.PlayerVitalsRuntimeOf(snap.ID)
+		if rt.HealthArmed {
+			t.Fatalf("stale deadline re-armed at equality")
+		}
+	})
+
+	t.Run("present keeps exact deadline", func(t *testing.T) {
+		e := newPlayerEngine(t, nil)
+		v := testVitals()
+		v.HP = 10
+		v.MaxHP = 30 // damaged under a raised max: attach arms the slot
+		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		if err != nil {
+			t.Fatalf("AddPlayerEntity: %v", err)
+		}
+		rt, _, _ := e.PlayerVitalsRuntimeOf(snap.ID)
+		if !rt.HealthArmed {
+			t.Fatalf("damaged player has no deadline at attach")
+		}
+		due := rt.HealthDue
+		out, delta, err := e.PlayerAdjustMaxHP(snap.ID, -5) // MaxHP 25, HP 10 != 25
+		if err != nil || delta != -5 || out.MaxHP != 25 || out.HP != 10 {
+			t.Fatalf("adjust -5 = %+v,%d,%v", out, delta, err)
+		}
+		rt, _, _ = e.PlayerVitalsRuntimeOf(snap.ID)
+		if !rt.HealthArmed || rt.HealthDue != due {
+			t.Fatalf("nonzero adjust restarted deadline: armed %v due %d, want true/%d",
+				rt.HealthArmed, rt.HealthDue, due)
+		}
+		// The changed MaxHP affects only the NEXT create/re-arm: fire
+		// and verify the re-arm interval uses MaxHP 25.
+		if err := e.PlayerMarkActedSinceEntry(snap.ID); err != nil {
+			t.Fatalf("mark: %v", err)
+		}
+		forceHealthDue(t, e, snap.ID, e.CurrentTick()+1)
+		e.Step()
+		got, _, _ := e.PlayerVitalsOf(snap.ID)
+		if got.HP != 11 {
+			t.Fatalf("HP = %d, want 11", got.HP)
+		}
+		rt, _, _ = e.PlayerVitalsRuntimeOf(snap.ID)
+		ms, _ := HealthRegenIntervalMs(got.Vigor, 25, 25, 0, 0)
+		delay, _ := CastTicks(ms, 20)
+		if !rt.HealthArmed || rt.HealthDue != e.CurrentTick()+uint32(delay) {
+			t.Fatalf("re-arm did not use the new MaxHP: %+v", rt)
+		}
+	})
+
+	t.Run("zero adjust never moves a deadline", func(t *testing.T) {
+		e := newPlayerEngine(t, nil)
+		id := addDamagedPlayer(t, e, world.Vec3{X: 1, Y: 0, Z: 1})
+		rt, _, _ := e.PlayerVitalsRuntimeOf(id)
+		due := rt.HealthDue
+		if _, delta, err := e.PlayerAdjustMaxHP(id, 0); err != nil || delta != 0 {
+			t.Fatalf("adjust 0 = %d,%v", delta, err)
+		}
+		rt, _, _ = e.PlayerVitalsRuntimeOf(id)
+		if !rt.HealthArmed || rt.HealthDue != due {
+			t.Fatalf("no-op adjust moved the deadline: %+v", rt)
+		}
+		// Absent at equality stays absent.
+		full, err := e.AddPlayerEntity(world.Vec3{X: 2, Y: 0, Z: 2}, testVitals(), testRuntimeInputs())
+		if err != nil {
+			t.Fatalf("AddPlayerEntity: %v", err)
+		}
+		if _, _, err := e.PlayerAdjustMaxHP(full.ID, 0); err != nil {
+			t.Fatalf("adjust 0 at equality: %v", err)
+		}
+		rtFull, _, _ := e.PlayerVitalsRuntimeOf(full.ID)
+		if rtFull.HealthArmed {
+			t.Fatalf("no-op adjust armed a slot at equality")
+		}
+	})
+
+	t.Run("helper failure is atomic", func(t *testing.T) {
+		rec := &vitalsRecorder{}
+		e := newPlayerEngine(t, rec)
+		id := addDamagedPlayer(t, e, world.Vec3{X: 1, Y: 0, Z: 1})
+		vBefore, _, _ := e.PlayerVitalsOf(id)
+		rtBefore, _, _ := e.PlayerVitalsRuntimeOf(id)
+		// MaxHP + MaxInt overflows int64: the T4a helper rejects it
+		// before any commit is attempted.
+		if _, _, err := e.PlayerAdjustMaxHP(id, math.MaxInt); !errors.Is(err, ErrInvalidHealthAmount) {
+			t.Fatalf("hostile adjust err = %v, want ErrInvalidHealthAmount", err)
+		}
+		vAfter, _, _ := e.PlayerVitalsOf(id)
+		if vAfter != vBefore {
+			t.Fatalf("failed adjust mutated vitals: %+v vs %+v", vAfter, vBefore)
+		}
+		rtAfter, _, _ := e.PlayerVitalsRuntimeOf(id)
+		if rtAfter != rtBefore {
+			t.Fatalf("failed adjust mutated runtime deadline state")
+		}
+		if rec.count() != 0 {
+			t.Fatalf("failed adjust fired %d events", rec.count())
+		}
+	})
+}
+
 // ---------------------------------------------------------------- ordering / at-most-once
 
 func TestSlotOrderHealthManaRest(t *testing.T) {

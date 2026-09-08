@@ -267,7 +267,10 @@ func (e *Engine) PlayerGainHealthOvercap(id EntityID, amount int) (PlayerVitals,
 // PlayerAdjustBaseMaxHP applies the §9.4.4 two-step base-max primitive
 // (the follow-on MaxHP adjustment is caller composition, exactly as in
 // T4a; the follow-on PlayerAdjustMaxHP call performs its own health
-// reconciliation). Owner-local.
+// reconciliation — BaseMaxHP alone does not change HP or MaxHP, so it
+// does not alter the NewHealth state relation). The guarded commit is
+// checked explicitly like every other wrapper even though the bounded
+// result is always Validate-valid. Owner-local.
 func (e *Engine) PlayerAdjustBaseMaxHP(id EntityID, amount, effectiveStamina int) (PlayerVitals, int, error) {
 	ent, err := e.resolvePlayer(id)
 	if err != nil {
@@ -277,12 +280,18 @@ func (e *Engine) PlayerAdjustBaseMaxHP(id EntityID, amount, effectiveStamina int
 	if err != nil {
 		return ent.vitals, 0, err
 	}
-	e.commitVitals(ent, after)
+	if err := e.commitVitals(ent, after); err != nil {
+		return ent.vitals, 0, err
+	}
 	return after, delta, nil
 }
 
 // PlayerAdjustMaxHP applies the §9.4.5 non-clamping MaxHP modifier;
-// current HP is untouched. Owner-local.
+// current HP is untouched. After a successful commit the health
+// deadline reconciles per NewHealth from the current tick (spec
+// §9.4b.11): a MaxHP change can create the slot (equality broken),
+// cancel it (equality reached), or keep the exact existing due.
+// Owner-local.
 func (e *Engine) PlayerAdjustMaxHP(id EntityID, amount int) (PlayerVitals, int, error) {
 	ent, err := e.resolvePlayer(id)
 	if err != nil {
@@ -292,7 +301,10 @@ func (e *Engine) PlayerAdjustMaxHP(id EntityID, amount int) (PlayerVitals, int, 
 	if err != nil {
 		return ent.vitals, 0, err
 	}
-	e.commitVitals(ent, after)
+	if err := e.commitVitals(ent, after); err != nil {
+		return ent.vitals, 0, err
+	}
+	e.reconcileHealth(ent, e.tick.Load())
 	return after, delta, nil
 }
 
