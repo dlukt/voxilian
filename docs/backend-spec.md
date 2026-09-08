@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.28 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.29 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -6787,6 +6787,554 @@ ownership: 103/104 attack/cast → M5-T7; T1/T2/T3a/T3b own
 pure mechanics only and MUST NOT implement 103/104
 handlers. The M5 exit gate sits after T7.
 
+#### 9.4 M5-T4a authoritative player-vitals state/mutation core (normative, v0.3.29)
+
+T4a OWNS: the canonical sim-domain player-vitals value; HP/BaseMaxHP/MaxHP
+mutation primitives; ordinary and over-max/vamp healing semantics; mana/
+max-mana mutation primitives; initial-mana and node-mana arithmetic;
+Vigor/rest-threshold/exertion accumulator semantics; pure health/mana/rest
+interval calculations; pure lazy stomach-decay calculation; validation and
+stable errors; the durable-vitals JSON compatibility contract; golden/
+property/fuzz tests. T4a is pure/value: no timers, no goroutines, no clock,
+no wall-clock timestamps, no entity fields, no gateway, no Store.
+
+T4a does NOT own (M5-T4b owns ALL of the following, deferred): attaching
+vitals to live sim entities; owner-local entity mutation APIs; health/mana
+timer scheduling; rest start/stop scheduling; moved-since-entry regen
+gating; runtime timer/due-tick metadata; handoff preservation;
+deterministic tick/manual-clock integration; dirty/snapshot notification;
+inspection/event hooks required by later T7. T4a MUST leave
+`internal/sim/entity.go`, `internal/sim/engine.go`, `internal/sim/ingress.go`
+and `internal/sim/saver.go` (plus `internal/persist`, `internal/store`,
+migrations, queries, generated sqlc) byte-identical. No death/corpse/
+respawn (M5-T5); no rest/eat opcodes, no Second Wind execution (M5-T6);
+no 103/104 runtime (M5-T7).
+
+Normative source: `kod/object/active/holder/nomoveon/battler/player.kod`
+(`NewVigor`, `SetVigorRestThreshold`, `AddExertion`, `RestAddExertion`,
+`UpdateStomach`, `HasVigor`, `HealthTimer`, `ManaTimer`,
+`CalculateHealthTime`, `CalculateManaTime`, `ReqEatSomething`,
+`EatSomething`, `LoseHealth`, `GainHealth`, `GainHealthNormal`,
+`NewHealth`, `GainBaseMaxHealth`, `GainMaxHealth`, `GetInitialMaxMana`,
+`NewMaxMana`, `ComputeMaxMana`, `LoseMana`, `GainMana`, `NewMana`,
+`StartResting`, `StopResting`, `GetRestTime`, `RestTimer`,
+`GetStamina`/`GetMysticism`, creation reset),
+`kod/object/passive/mananode.kod` (`GetManaAdjust`),
+`kod/object/passive/mananode/feynode.kod` (double override),
+`kod/object/passive/mananode/avarnode.kod` (no override — standard),
+`kod/object/active/portal/corpnode.kod` (standard formula),
+`kod/object/passive/spell/jala/restorat.kod` (`AdjustHealthTime`),
+`kod/object/passive/spell/jala/rejuven.kod` (`AdjustManaTime`),
+`kod/object/passive/spell/jala/invigor.kod` (`AdjustVigorTime`),
+`kod/object/passive/spell/focus.kod` (`AdjustManaTime`),
+`blakserv/ccode.c` (`C_GetTime`) + `blakserv/btime.h` (`time_t GetTime()`).
+Research reference: `docs/meridian59.md` §3–§4 as corrected by the v0.3.29
+audit. No GPL KOD/C text is copied: mechanics only are reimplemented. All
+integer division truncates toward zero (C semantics); intermediates use
+64-bit widths and MUST be overflow-safe; no floats anywhere.
+
+##### 9.4.1 Canonical state and units (frozen)
+
+Conceptually (exact Go types are an implementation choice, but the
+constraints are normative):
+
+```text
+HP            signed int     current health, >= 0, NO upper invariant
+BaseMaxHP     signed int     unbuffed base, 20..150
+MaxHP         signed int     buffed max, >= 20, NO upper invariant
+Mana          signed int     current mana, >= 0, NO upper invariant
+MaxMana       signed int     mana max, >= 1 (T4a validation; source has no
+                              explicit bound — see §9.4.3)
+Vigor         signed int     visible whole points, 1..200
+RestThreshold signed int     10..100
+Exertion      signed int64   1/10000-vigor residual, -20000..20000
+Stomach       signed int     0..100 at rest (1..100 after any update)
+```
+
+- `10000` exertion = 1 vigor. Vigor is whole points only, never
+  float/fixed-point. Copying the value MUST produce an independent
+  snapshot: no pointers/maps/slices required.
+- FORBIDDEN in the vitals value: CharacterID, PG revision, EntityID,
+  NetEntityID, session ID, timer handles, `time.Time`, wall-clock
+  timestamps, persisted timer deadlines, `last_stomach_update`.
+- Effective Stamina/Mysticism arrive as already-resolved immutable inputs
+  valid in `1..70` (source `bound(base+mod,1,70)`, `MAXIMUM_STAT=70`);
+  outside is a domain error. T4a performs NO attribute lookup and owns NO
+  attribute buffs.
+
+##### 9.4.2 Durable JSON compatibility (frozen)
+
+Creation (`internal/character.NewVitals`) persists exactly:
+
+```text
+hp, base_max, max, mana, max_mana, vigor, threshold, stomach
+```
+
+T4a MUST preserve those exact semantic field names. The authoritative
+residual `piExertion` freezes the one canonical extension field:
+
+```text
+exertion
+```
+
+with `missing exertion -> semantic zero`, so every character already
+created decodes without migration (`characters.vitals` is already JSON;
+NO Store/schema/query changes in T4a). T4a MUST NOT change the creation
+package to force an explicit zero field; omission stays
+backward-compatible. JSON tags live on the sim-domain value or a narrow
+`internal/sim` codec. No new persisted fields.
+
+##### 9.4.3 Validation domain and REJECTED false invariants (frozen)
+
+Source behavior is intentionally asymmetric. The following are NOT global
+invariants and T4a MUST NOT assert them: `HP <= MaxHP`; `HP <= 2*MaxHP`
+at all times; `MaxHP >= BaseMaxHP` at all times; `Mana <= MaxMana`.
+Vamp/over-max health may exceed MaxHP; changing MaxHP never auto-clamps
+HP; uncapped mana gains may exceed MaxMana; MaxHP modifiers move
+independently of BaseMaxHP.
+
+`Validate` (or equivalent) rejects impossible/corrupt values:
+
+```text
+HP >= 0                        (no upper bound)
+BaseMaxHP 20..150
+MaxHP >= 20                    (no upper bound; HP untouched by checks)
+Mana >= 0                      (no upper bound)
+MaxMana >= 1                   (T4a corrupt-reject: source states no bound,
+                               but GetInitialMaxMana yields >= 15 and no
+                               source path legitimately reaches <= 0;
+                               no upper bound imposed)
+Vigor 1..200
+RestThreshold 10..100
+Exertion -20000..20000         (canonical post-mutation residual range)
+Stomach 0..100                 (0 only pre-first-update; §9.4.14)
+```
+
+##### 9.4.4 Base max HP (frozen)
+
+Source `GainBaseMaxHealth` exactly (`effectiveStamina` already resolved):
+
+```text
+newBase = bound(oldBase + amount, 20, 100 + effectiveStamina)
+newBase = bound(newBase, <no lower bound>, 150)
+```
+
+Returns the new state plus the ACTUAL delta (`newBase - oldBase`); the
+delta may be 0 at a floor/ceiling. No advancement decision lives here
+(M6 decides when to request +1). The source follow-on
+(`GainMaxHealth(amount=actualDelta)`) is runtime composition, NOT part of
+this primitive: callers apply `AdjustMaxHP(actualDelta)` separately, and
+T4a tests prove that composition. Goldens: `+1` ordinary; negative change;
+`20` floor; `100+Stamina` ceiling (Stamina edge values, e.g. 1 → 101);
+`150` hard ceiling (e.g. high Stamina); delta-0 cases.
+
+##### 9.4.5 Max HP modifier (frozen)
+
+Source `GainMaxHealth` exactly: `MaxHP = bound(MaxHP + amount, 20, $)`
+(lower bound 20 only, no upper). Changing MaxHP does NOT clamp, shift, or
+otherwise touch current HP — this preserves existing over-max health (the
+commented-out alternatives in source were deliberately rejected upstream).
+Returns the actual delta. No enchantment/content lookup. Goldens: increase;
+decrease to floor 20 (delta clips); decrease that leaves HP above the new
+MaxHP (e.g. HP 25, Max 30 → −15 → Max 20, HP still 25).
+
+##### 9.4.6 Lose health (frozen)
+
+Source `LoseHealth` exactly, minus the trance break (T7 owns "damage
+breaks trance"; T4a owns NO live trance state). Requested loss MUST be
+non-negative (`ErrInvalidHealthAmount` otherwise):
+
+```text
+after = max(before - amount, 0)
+applied = before - after
+ZeroHP = (after == 0)
+```
+
+Returns before/after/applied/ZeroHP (exact API flexible). No death
+transition, no corpse, no inventory, no ledger (M5-T5). Decay-vs-damage
+classification is a value only where needed (§9.4.7): the timer decay path
+MUST be distinguishable from combat damage because it must never break
+trance later.
+
+##### 9.4.7 Normal healing (frozen)
+
+Source `GainHealthNormal` exactly. Negative amount is a domain error
+(`ErrInvalidHealthAmount`; source merely returns, but T4a validates
+explicitly):
+
+```text
+if HP > MaxHP: gain = 0, HP unchanged
+else: HP += amount, capped at MaxHP
+```
+
+Returns the actual gained amount. Goldens: `10/20 +5 → 15 (5)`;
+`18/20 +5 → 20 (2)`; `20/20 +5 → 20 (0)`; `25/20 +5 → unchanged (0)`.
+
+##### 9.4.8 Over-max / vamp healing (frozen)
+
+Source `GainHealth` exactly, NEVER merged with §9.4.7. Ceiling `2*MaxHP`
+(overflow-safe doubling):
+
+```text
+if 2*MaxHP < HP + amount: HP = 2*MaxHP
+else: HP += amount
+```
+
+Negative amount is `ErrInvalidHealthAmount`. The already-above-`2*Max`
+corner (possible after a MaxHP reduction) resolves per source even though
+unintuitive: the condition is true, so HP is SET DOWN to `2*MaxHP`; the
+reported actual delta (`after - before`) is then negative. Pin it in a
+test. No Vampiric Drain formula here (T3b already returns the requested
+heal number; T4a only applies it). Goldens: `20/20 +10 → 30`;
+`30/20 +20 → 40 (cap)`; the above-corner reduction.
+
+##### 9.4.9 Health timer one-step value (frozen)
+
+Pure one-event decision, NO scheduling (moved-since-entry gating is T4b;
+source `HealthTimer` also gates on `PFLAG_MOVED_SINCE_ENTRY`, and
+`NewHealth` deletes the timer at exact equality):
+
+```text
+HP < MaxHP  -> ordinary +1 (via §9.4.7 GainHealthNormal path)
+HP == MaxHP -> no change (timer deleted in source)
+HP > MaxHP  -> decay -1 (via §9.4.6 decay path, NOT combat damage)
+```
+
+Over-max decay MUST be distinguishable from damage (decay flag/value).
+
+##### 9.4.10 Health regen interval (frozen)
+
+Source `CalculateHealthTime` exactly, operation order and truncation
+preserved. Inputs already resolved (`effectiveStamina`,
+`factionRegenBonus`, optional Restorate power — see below):
+
+```text
+time = ((200 - Vigor)^2 / 6) + 1000
+time = ((125 - effectiveStamina) * time) / 100
+maxForRate = bound(MaxHP, 40, 100)
+time = (time * 100) / maxForRate
+time = time - factionRegenBonus
+```
+
+ faction bonus is phase 2: T4a accepts it as an already-resolved scalar
+(default 0 in tests) and MUST NOT implement factions. Then source room/Jala
+handling: iff a Restorate song is active, return
+`AdjustHealthTime(time, power)` (source `restorat.kod`:
+`time = bound(time,1000,60000)`,
+`out = (time * (400 - (40 + power))) / 400`, return
+`bound(out,670,60000)`; power is the already-resolved `iSpellPower`).
+With no Restorate, return `bound(time,1000,60000)`. RESTORATE constants
+`SPELL_POWER_INTERCEPT = 40`, `SPELL_POWER_SLOPE = 400` are frozen as pure
+helper inputs, NOT named-spell lookups: T4a exposes e.g.
+`ApplyRestorateAdjust(timeMs, spellPower)` with power validated `1..99`
+(T3a domain). AUDIT CONCLUSION (frozen): there is NO over-max HP branch in
+`CalculateHealthTime` — over-max decay reuses this same interval;
+`BOOST_DECAY_TIME = 30000` ms is mana-only (§9.4.12 of this spec — the mana
+interval section). No timer creation. Goldens (faction 0, no Jala):
+`V100/S25/Max40 → 6665`; low vigor `V1 → 19000`; high vigor `V200 → 2500`;
+`Max20 → 6665` (uses 40); `Max150 → 2666` (uses 100); final min
+(`V200/S70/Max100 → 550 → 1000`); over-max (`HP30/Max20/... → 6665`,
+same interval).
+
+##### 9.4.11 Initial mana (frozen)
+
+Source `GetInitialMaxMana` exactly, no lookup:
+
+```text
+InitialMaxMana = 15 + effectiveMysticism / 5     (integer truncation)
+```
+
+`effectiveMysticism` already resolved, `1..70`. Goldens: Myst `1 → 15`,
+`5 → 16`, `25 → 20`, `50 → 25`.
+
+##### 9.4.12 Node mana (frozen)
+
+Source `mananode.kod GetManaAdjust` exactly:
+
+```text
+StandardNodeMana(mysticism) = ((5 + mysticism) / 10) + 3
+```
+
+Source `feynode.kod` override exactly (the ONLY double):
+
+```text
+DoubleNodeMana = 2 * StandardNodeMana
+```
+
+AUDIT CONCLUSION (frozen): `avarnode.kod` does NOT override
+`GetManaAdjust` (karma gating only), and `corpnode.kod` repeats the
+standard formula — there is NO second independent multiplier. Research
+wording that said "Fey/Vale double" is corrected: the special variant is
+Fey-only. T4a encodes at most a small mechanics enum
+(`Standard`/`Double`); NO node IDs, room IDs, karma rules, ownership, or
+meld state (M9/content owns the catalog). Mysticism is the already-resolved
+effective value at meld time. Goldens: Myst 25 → standard `+6`, double
+`+12`.
+
+##### 9.4.13 Compute max mana (frozen)
+
+Source `ComputeMaxMana` value semantics exactly, over already-resolved
+inputs (NO inventory/enchantment/node-list lookups in T4a):
+
+```text
+MaxMana = InitialMaxMana(mysticism) + sum(nodeBonuses) + otherResolvedBonus
+```
+
+AUDIT CONCLUSION (frozen): source states NO bound on the result
+(`NewMaxMana` adds blindly; `ComputeMaxMana` recomputes blindly) — T4a
+imposes none on the pure calculation (overflow-safe 64-bit sum). A
+separate `AdjustMaxMana(amount)` primitive (signed amount, no bound,
+returns actual delta) covers the `NewMaxMana` add path. The node-list
+bitmask is EXCLUDED from T4a (M9/content owns node identity; T4b owns
+runtime attachment).
+
+##### 9.4.14 Lose mana (frozen)
+
+Source `LoseMana` value semantics exactly: for non-negative requested loss
+(negative is `ErrInvalidManaAmount`), `Mana -= amount`, clamped at 0
+(source clamps in `NewMana`; T4a clamps in the primitive so the returned
+value is always valid). Returns the ACTUAL mana lost
+(`amount - max(-(before-amount),0)`; source's uninitialized-nil path when
+nothing clamps is NOT reproduced — T4a always returns a number). No spell
+gate here: T7 first decides legality, then routes the T3a payment plan
+through this primitive.
+
+##### 9.4.15 Gain mana (frozen)
+
+Source `GainMana(amount, bCapped)` exactly, both modes. Negative amount is
+`ErrInvalidManaAmount`:
+
+```text
+capped=false:   Mana += amount              (may exceed MaxMana; no upper
+                                            bound unless source proves one —
+                                            audit finds none)
+capped=true:    Mana += amount, clamp to MaxMana
+```
+
+Returns the actual gained amount (capped path: `amount - (Mana - MaxMana)`
+overflow-safe). Goldens: loss `10 -3 → 7 (3)`; `2 -5 → 0 (2)`; capped gain
+near max (`18/20 +5 → 20 (2)`); uncapped above max (`18/20 +5 → 23 (5)`).
+
+##### 9.4.16 Mana timer one-step value (frozen)
+
+Pure one-event behavior (source `ManaTimer`; `NewMana` deletes the timer
+at exact equality), NO scheduling:
+
+```text
+Mana < MaxMana  -> +1 (uncapped §9.4.15 path)
+Mana == MaxMana -> no change
+Mana > MaxMana  -> -1 (NOT spending)
+```
+
+##### 9.4.17 Mana regen interval (frozen)
+
+Source `CalculateManaTime` exactly, order preserved. Over-max first:
+
+```text
+if Mana > MaxMana: return BOOST_DECAY_TIME (30000 ms; no modifiers, no bounds)
+```
+
+else, over already-resolved inputs (`effectiveMysticism`,
+`factionRegenBonus`, optional Rejuvenate/ManaFocus powers):
+
+```text
+time = BASE_REGEN_TIME + (25 - effectiveMysticism) * 1000     (BASE = 150000)
+time = time * 200 / bound(Vigor, 1, $)        (lower bound ONLY — no upper)
+time = time / bound(MaxMana, 1, $)            (lower bound ONLY — no upper)
+time = time - factionRegenBonus               (phase 2; resolved scalar, 0 in tests)
+time = bound(time, 1000, 60000)
+iff Rejuvenate active: time = (time * (200 - power)) / 200    (no clamp in helper)
+time = bound(time, 500, 60000)                (only when a room owner exists;
+                                              T4a always applies this bound —
+                                              frozen simplification: the
+                                              poOwner<>$ path is the only one
+                                              with content, and the bound is
+                                              idempotent on the no-Jala path)
+iff Mana Focus active: time = bound((time * (200 - power)) / 200, 500, 60000)
+return time
+```
+
+Pure helpers with validated `1..99` powers, no spell lookup:
+`ApplyRejuvenateAdjust`, `ApplyManaFocusAdjust` (with its `500..60000`
+bound), matching `rejuven.kod`/`focus.kod`. Goldens (faction 0, no
+enchantments): `Myst25/V100/MM20 → 15000`; low vigor `V1 → 60000`
+(clamped from 1500000); high vigor `V200 → 7500`; divisor edge `MM1 →
+60000`, `MM200 → 1500`; min edge (`Myst70/V200/MM200 → 525 → 1000`);
+over-max → `30000` exactly. Every expected number independently
+hand-computed (see §9.4.10/§9.4.17 vectors above).
+
+##### 9.4.18 Has vigor (frozen)
+
+Source exactly: `Vigor > required` — STRICT `>`, never `>=`
+(`Vigor10 required9 → true`; `Vigor10 required10 → false`). This is the
+authoritative-state counterpart for later T7/T6; T1/T3a cost-plan
+arithmetic is NOT duplicated.
+
+##### 9.4.19 General exertion (frozen)
+
+Source `AddExertion` accumulator semantics exactly, AFTER already-resolved
+external reductions/blocks. T4a consumes an already-resolved signed amount
+plus a generic policy flag; faction percentage reduction, Second Wind
+blocking/auto-invocation, and skill lookup are EXCLUDED (M5-T6 owns Second
+Wind; factions are phase 2). `MIN_VIGOR_CHANGE = 20000` frozen:
+
+```text
+Exertion += amount
+if abs(Exertion) > 20000 OR SetToThreshold:
+    if SetToThreshold AND Vigor < RestThreshold:
+        Vigor = RestThreshold; Exertion = 0
+    else:
+        vigorLost = Exertion / 10000        (signed, trunc toward zero)
+        Vigor -= vigorLost
+        Exertion -= vigorLost * 10000       (sub-10000 residual PRESERVED)
+    Vigor = bound(Vigor, 1, 200)
+```
+
+Critical: `abs(exertion) == 20000` does NOT trigger conversion (strict
+`>`). If a `RecoveryAllowed=false`-style generic block is needed it stays
+a value-only boolean; no skill lookup. Test `±19999/±20000/±20001`,
+residual preservation both signs, large multi-point debits, recovery,
+`1`/`200` clamps, and both `SetToThreshold` cases (below threshold snaps
+to threshold with residual cleared; already `>=` threshold takes the
+ordinary conversion path — e.g. vigor 100, exertion 5000,
+SetToThreshold → `vigorLost = 0`, unchanged). Go/C signed truncation
+toward zero is explicit in tests.
+
+##### 9.4.20 Rest threshold (frozen)
+
+Source default `80`; source setter `Bound(value,10,100)` with a Second
+Wind force-to-10 path (T6 owns the skill; NOT implemented here). T4a
+validates explicitly: raw input outside `10..100` is
+`ErrInvalidRestThreshold` (no silent clamp — source fidelity does not
+require clamping at this value layer; T6 may clamp-then-set at its own
+layer if source parity demands it). Goldens pin `10`, `80`, `100`.
+
+##### 9.4.21 Rest-specific exertion (frozen)
+
+Source `RestAddExertion` exactly — a SEPARATE path from §9.4.19 with three
+frozen distinctions: (a) no-op while `Vigor > RestThreshold`; (b) a
+RESOLVED room multiplier on negative (recovery) amounts — sanctuary `2x`,
+triple-heal `3x`, with source assignment order (sanctuary first, then
+triple-heal overwrites) so BOTH flags set means `3x`; T4a receives the
+multiplier as an already-resolved value (`1`/`2`/`3`; room lookup is OUT);
+(c) conversion CLEARS the residual (`Exertion = 0`) instead of preserving
+it, and overshoot clamps UP to the threshold:
+
+```text
+if Vigor > RestThreshold: no-op (state untouched)
+Exertion += amount * resolvedMultiplier   (multiplier applies to the amount;
+                                          positive amounts are unmultiplied
+                                          per source — flags require amount<0)
+if abs(Exertion) > MIN_VIGOR_CHANGE:       (strict >, same constant)
+    Vigor -= Exertion / 10000              (signed, trunc toward zero)
+    if Vigor > RestThreshold: Vigor = RestThreshold
+    Exertion = 0
+    Vigor = bound(Vigor, 1, 200)           (via NewVigor)
+```
+
+Goldens: above-threshold no-op; ordinary `1x`; sanctuary `2x`; triple `3x`;
+strict `20000` boundary (two `-10000` ticks convert nothing; the third
+converts); overshoot clamps to threshold; conversion clears residual.
+
+##### 9.4.22 Rest interval (frozen)
+
+Source `GetRestTime` base exactly, from resolved inputs:
+
+```text
+timeMs = 1000 + 30 * (51 - effectiveStamina)
+```
+
+Source Jala Invigorate handling becomes a pure resolved seam:
+`ApplyInvigorateAdjust(timeMs, spellPower) = (time * (200 - power)) / 200`
+(`invigor.kod`; no clamp in helper; power validated `1..99`). AUDIT
+CONCLUSION (frozen): source states NO final bound on the rest interval —
+T4a adds none. No timer, no resting boolean, no Start/Stop runtime state
+(T4b owns scheduling; T6 owns opcode 115). Goldens over effective Stamina:
+`1 → 2500`, `25 → 1780`, `50 → 1030`, `70 → 430`.
+
+##### 9.4.23 Lazy stomach decay + food preflight (frozen)
+
+Source `UpdateStomach` as a pure function over `(currentStomach,
+elapsedWholeSeconds)` — NO clock, NO stored timestamp in T4a (T4b/T6
+supply elapsed time deterministically). `FOOD_USE_RATE = 12` frozen.
+`GetTime()` is seconds-based server time (`time_t`; the KOD-visible
+constant offset cancels in differences), hence whole-second inputs:
+
+```text
+decayed = stomach - (elapsedSeconds * 12) / 100    (multiply BEFORE divide)
+result = bound(decayed, 1, 100)
+```
+
+Negative elapsed is `ErrInvalidElapsedTime`; multiplication is
+overflow-safe (64-bit). `stomach=0, elapsed=0` on update yields `1` —
+pinned as a regression test (initial-zero vs post-update distinction).
+Goldens: `(0,0) → 1`; `(100,0) → 100`; `(100,8) → 100`; `(100,9) → 99`;
+`(100,100) → 88`; `(100,833) → 1`; `(1,long) → 1`. Monotonicity
+properties: decay never increases; greater elapsed never increases result;
+result always `1..100`.
+
+T6 owns eat intent; T4a exposes ONLY the pure capacity check over the
+post-update stomach (source `ReqEatSomething` value rule):
+
+```text
+allow iff stomach + filling <= 100     (100 passes, 101 fails)
+```
+
+No inventory/item/message logic; nutrition→exertion composition is T6.
+
+##### 9.4.24 Creation compatibility (frozen)
+
+`internal/character.NewVitals` emits `HP/BaseMax/Max 20`,
+`Mana/MaxMana 15+Myst/5`, `Vigor 100`, `Threshold 80`, `Stomach 0`, no
+exertion field. T4a MUST prove (fixture or external-package test, NO
+import cycle) that this shape decodes into a valid canonical vitals with
+`Exertion = 0`, and that a new encode/decode round-trip preserves a
+non-zero residual. The creation package itself is UNTOUCHED.
+
+##### 9.4.25 Damage/heal composition boundary (frozen)
+
+T1/T2/T3b produce values; T4a applies final requested numbers. Future T7
+order: attack/spell raw → T2 mitigation/resistance → T1 caps where
+applicable → T4 health loss → T5 death iff HP reached zero. Illusionary
+Wounds: T3b computes the absolute non-lethal loss → T4 applies it
+(non-lethality preserved and proven in a composition test). Vampiric
+Drain: T4 applies target loss → actual applied returned → T3b
+`VampiricDrainHeal(applied, ...)` → T4 applies caster over-max heal (real
+T3b helper in tests). Spell payment: T3a `ResolveSpellPayment` → T4a
+`LoseMana` + exertion application, as a TEST composition only — no cast
+runtime is implemented.
+
+##### 9.4.26 Stable errors (frozen)
+
+Narrow `errors.Is` sentinels (exact Go names flexible; reuse existing sim
+sentinels where semantically exact — `ErrInvalidExertion` is reused for
+exertion-amount domain errors): `ErrInvalidVitals`, `ErrInvalidHealthAmount`,
+`ErrInvalidManaAmount`, `ErrInvalidExertion` (reuse), `ErrInvalidRestThreshold`,
+`ErrInvalidElapsedTime`, `ErrInvalidNodeKind` (only if the enum needs it).
+No string parsing.
+
+##### 9.4.27 Test minimums (frozen)
+
+Pure value tests only: no sleep, no goroutine, no timer, no fake clock
+(the old M5-T4 "timer tests" wording moves to T4b). Required goldens:
+§9.4.3 creation/validation vectors (Myst `1 → 15`, `5 → 16`, `25 → 20`,
+`50 → 25`; `HP/BaseMax/Max 20`, `Vigor 100`, `Threshold 80`, `Exertion 0`,
+`Stomach 0`; old-JSON-missing-exertion and round-trip); §9.4.4–§9.4.5
+base/max vectors; §9.4.6–§9.4.8 loss/heal vectors incl. the
+already-above-`2*Max` corner; §9.4.11–§9.4.16 mana vectors; §9.4.18–§9.4.19
+`HasVigor` strictness and `±19999/±20000/±20001` boundaries with residual
+proofs; §9.4.20–§9.4.22 threshold/rest vectors incl. `1x/2x/3x` and
+Stamina `1/25/50/70`; §9.4.10/§9.4.17 regen-time vectors (every number
+hand-computed above); §9.4.23 stomach vectors + capacity `100/101`.
+Property invariants: loss never yields `HP < 0`; normal heal from
+`<= Max` never exceeds Max and never lowers over-max HP; base stays
+`20..min(100+Stamina,150)`; vigor mutations end `1..200`; threshold
+`10..100`; residual in range; mana never negative; stomach update
+`1..100` and monotone; intervals positive and bounded; determinism
+(same input → same result). NO false-invariant assertions (`HP<=MaxHP`
+etc.). Fuzz SEEDS (no long campaign) for the cheap primitives with
+no-panic/no-overflow/stable-error/bounds properties.
+
 ## 10. Config / deployment / ops
 
 - Config: env + file (`config.yaml` default, env override `VOX_*`); MUST
@@ -6942,6 +7490,27 @@ handlers. The M5 exit gate sits after T7.
    survives it.
 
 ## 14. Version history
+
+- v0.3.29: freeze M5-T4a authoritative vitals state/mutation core
+  (normative §9.4: canonical PlayerVitals value with 1/10000 exertion
+  units, hp/base_max/max/mana/max_mana/vigor/threshold/stomach JSON
+  names plus exertion with missing-means-zero, explicit validation
+  domain with false invariants rejected, two-step base-max formula
+  with actual delta, unclamping MaxHP modifier, loss/normal/over-max
+  heal trio with the already-above-2xMax corner, pure timer one-steps,
+  health/mana/rest interval formulas with Restorate/Rejuvenate/
+  ManaFocus/Invigorate resolved seams, initial/node/double-node/compute
+  mana arithmetic, strict HasVigor, strict >20000 exertion conversion
+  with residual preservation vs rest clearing, 10..100 threshold with
+  explicit errors, seconds-based lazy stomach decay with 1..100 post
+  bound and <=100 eat-capacity seam, creation compatibility, T1/T2/T3
+  composition boundary, stable errors, golden/property/fuzz minimums;
+  T4b deferred: entity attachment, scheduling, moved-gating, handoff,
+  tick integration, saver) + verified `meridian59.md` corrections
+  (Fey-only double — AvarNode inherits standard, no Vale multiplier;
+  stomach 1..100 post-update bound with seconds-based decay and
+  +nutrition vigor points; HP over-max decay reuses the normal health
+  interval, BOOST_DECAY is mana-only).
 
 - v0.3.28: freeze M5-T3b special spell semantics (normative §9.3b:
   touch proficiency max(Punch,(Myst*3)/2) with dead viHit_Factor

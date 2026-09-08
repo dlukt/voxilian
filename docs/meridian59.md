@@ -99,7 +99,7 @@ via spells (Boons), items, disease. Design: `doc/design/Mechanics/stats.htm`,
 | **Intellect** | Learning: initial improve chance `+= ChanceToIncrease * Int/100` (up to +50% at 50). Lowers total-learn-point cost (~20 pts at 50 Int ≈ 2 extra schools). Protects vs atrophy, Illusionary Wounds (`17+(50-Int)/10` dmg), scroll use, Seduce. Requisite for **Jala + Riija**. |
 | **Stamina** | HP ceiling `100 + Stamina` (hard cap 150). HP regen time `((125-Stam)*t)/100` (±25%). HP-gain roll difficulty (see §6). % immunity per death skill-loss check (`random > Stam` to lose). Rest tick `1000+30*(51-Stam)` ms. Requisite for **Kraanan**. |
 | **Agility** | ~1/5 of defense: `Defense += Agi*4`. Default requisite for **all weapon skills**; Disarm value = Agility. |
-| **Mysticism** | Mana pool start `15 + Myst/5` (15–25). Mana regen `150000 + (25-Myst)*1000` ms base. Node meld `((5+Myst)/10)+3` per node (3–8; Fey/Vale double 6–16). ~4/5 of spell attack power; touch-attack `Myst*3/2`; wand hit `bound(Myst+Aim,10,90)`. Default requisite for **spells**; specifically **Qor/Shalille/Faren**. |
+| **Mysticism** | Mana pool start `15 + Myst/5` (15–25). Mana regen `150000 + (25-Myst)*1000` ms base. Node meld `((5+Myst)/10)+3` per node (3–8; Fey double 6–16). ~4/5 of spell attack power; touch-attack `Myst*3/2`; wand hit `bound(Myst+Aim,10,90)`. Default requisite for **spells**; specifically **Qor/Shalille/Faren**. |
 | **Aim** | ~1/2 of attack: `Offense += Aim*4`. Requisite + start % for archery/sword/shortsword/fire(bow). Wand hit as above. |
 
 Success formula (all skills/spells), `skill.kod` / `spell.kod` / `stats.htm`:
@@ -128,7 +128,9 @@ gives ceiling — newbies with 40 Aim still hit sometimes with 20% sword.
 ### 4.2 Mana
 
 - Start `15 + Myst/5`. Recomputed (`ComputeMaxMana`): base + melded nodes +
-  items + enchantments. Standard node `((5+Myst)/10)+3`; Fey/Vale double.
+  items + enchantments. Standard node `((5+Myst)/10)+3`; Fey double
+  (AvarNode inherits the standard formula with no override — there is no
+  second independent multiplier; CorpseNode uses the standard formula too).
   Myst 25: start 20, +6 per normal node.
 - Over-max (boosts) decays at 30 s/tick.
 
@@ -158,7 +160,9 @@ Constants: `BASE_REGEN_TIME=150000`, `REST_TIME=2500`, `BOOST_DECAY=30000`.
 - **HP/tick:** `t = ((200-Vigor)²/6+1000)`, `× (125-Stam)/100`,
   `× 100/bound(MaxHP,40,100)`, minus faction bonus, ±Jala Restorate,
   clamp 1–60 s. Example Vigor 100 / Stam 25 / MaxHP 40 → ~6.7 s per HP;
-  20→40 ≈ 133 s (matches “~150 s” comment).
+  20→40 ≈ 133 s (matches “~150 s” comment). `CalculateHealthTime` has NO
+  over-max branch: over-max HP decay ticks reuse this same interval
+  (`BOOST_DECAY_TIME = 30000` ms is mana-only, used when `Mana > MaxMana`).
 - **Mana/tick:** `t = (150000+(25-Myst)*1000) * 200/bound(Vigor,1,..) /
   bound(MaxMana,1,..)`, minus faction, ±Rejuvenate/ManaFocus, clamp 1–60 s
   (0.5 s min in-room). Example Myst 25 / Vigor 100 / MaxMana 20 → 15 s per mana.
@@ -166,9 +170,14 @@ Constants: `BASE_REGEN_TIME=150000`, `REST_TIME=2500`, `BOOST_DECAY=30000`.
 
 ### 4.5 Hunger
 
-`Stomach` 0–100. Decays `12/1000 ticks` → full→empty ≈ 833 s (~14 min).
+`Stomach` 0–100 at rest, but `UpdateStomach` bounds the result to 1–100
+(initial 0 becomes 1 on the first update even with zero elapsed time).
+Decay is wall-clock seconds-based (`GetTime()` returns `time_t` seconds;
+KOD `GetTime` subtracts a constant offset that cancels in differences):
+`stomach - (elapsedSeconds*12)/100`, multiply before divide, then bound
+1–100. Full→empty ≈ 10000/12 ≈ 833 s (~14 min).
 Checked only on eat: reject if `stomach+filling > 100` (“too full”).
-`EatSomething(nutrition, filling)`: vigor `+= nutrition/10`-ish
+`EatSomething(nutrition, filling)`: vigor `+= nutrition` whole points
 (`AddExertion(-10000*nutrition)`), stomach `+= filling`. Foods e.g. Apple
 10/24, Bread 20/40, MeatPie 30/50, InkyCap 50/25 (best vigor), Drumstick 9/30,
 ChaosFood 200/0 (frenzy ignores stomach). HP-gain path force-feeds 200.

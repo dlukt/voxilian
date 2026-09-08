@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.12)
+# Voxilian Backend — Implementation Plan (v1.13)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.28).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.29).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -183,7 +183,27 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   hooks, other special spell-damage formulas needed by the MVP. Still no
   authoritative HP mutation, no room/world-object scheduler, no gateway, no
   real inventory/reagent mutation. Spec: §9.3b (frozen v0.3.28).
-- [ ] **M5-T4** Vitals/regen/hunger: HP=level caps, mana+nodes, exertion/rest/thresholds, regen tick formulas, stomach decay. Golden vectors + timer tests (fake clock). Spec: §9, meridian59 §4.
+- [ ] **M5-T4a** Authoritative vitals state/mutation/math core (pure/value
+  sim-domain only): canonical `PlayerVitals` (HP/BaseMaxHP/MaxHP/Mana/
+  MaxMana/Vigor/RestThreshold/Exertion-accumulator/Stomach), HP mutation
+  trio (loss, normal heal, over-max heal), base-max/max-HP primitives,
+  mana loss/capped/uncapped gain, initial/node/double-node/compute mana,
+  strict HasVigor, general vs rest exertion accumulators, 10..100
+  threshold, health/mana/rest pure intervals with resolved Jala/Focus
+  seams, lazy seconds-based stomach decay + eat-capacity seam, durable
+  JSON (`hp/base_max/max/mana/max_mana/vigor/threshold/stomach` +
+  `exertion`, missing-means-zero) with creation-compatibility proof.
+  Golden/property/fuzz-seed tests; NO timers/scheduling, NO entity.go/
+  engine.go/ingress.go/saver.go changes, NO death. Spec: §9.4 (frozen
+  v0.3.29), meridian59 §4.
+- [ ] **M5-T4b** Vitals entity integration + deterministic regen/rest
+  scheduling: attach vitals to live sim entities under the single-writer
+  ownership model; owner-local mutation APIs; health/mana timer
+  scheduling; rest start/stop scheduling; moved-since-entry regen gating;
+  runtime timer/due-tick metadata; handoff preservation; deterministic
+  tick/manual-clock integration incl. old "timer tests (fake clock)";
+  dirty/snapshot notification seam; inspection/event hooks for T7.
+  Spec: §9.4 (T4b half).
 - [ ] **M5-T5** Death pipeline: corpse + full droppable drop (PK tags), advancement wipe/halve, Underworld-region respawn, leaving penalties (Stam saves), Portal-of-Life hook; single-txn state+ledger. Crash-during-death test. Spec: §9, §8.1.
 - [ ] **M5-T6** Personal/world-light intents: `115 rest`, `116 eat` (hunger/vigor effects), `105 use` (skill/item dispatch incl. Second Wind), `119 safety_toggle`, `117/118 → 209` chat (+channel rules, length caps, rate limits). Owner of these opcodes: this task, no other. Spec: §6.3, §9.
 - [ ] **M5-T7** Authoritative attack/cast runtime integration (depends on
@@ -300,9 +320,11 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M4-T5b2 | M4-T5b1 | `backend/voxilian/internal/gateway` (existing observe metrics only, no new family; no sim production change beyond a compile-time assertion if needed) |
 | M4-T3a…c, T4a, T4b | M1-T7a…c (CAS), M3-T1 | `backend/voxilian/internal/sim`, `internal/store` |
 | M5-T1/T2/T3a/T3b | M4-T1, M4-T2 | `backend/voxilian/internal/sim` (pure mechanics only: no live vitals, no gateway) |
-| M5-T4/T5 | M5-T1, M5-T2, M5-T3a, M5-T3b | `backend/voxilian/internal/sim` (authoritative gameplay state) |
+| M5-T4a | M4-T1, M4-T2 | `backend/voxilian/internal/sim` (pure vitals state/math only: no entity fields, no timers, no gateway) |
+| M5-T4b | M5-T4a | `backend/voxilian/internal/sim` (entity attachment + deterministic scheduling) |
+| M5-T5 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a | `backend/voxilian/internal/sim` (authoritative gameplay state) |
 | M5-T6 | M4-T1, M4-T2 | `backend/voxilian/internal/sim` + gateway only for its own listed personal intents |
-| M5-T7 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4, M5-T5, M5-T6 | `backend/voxilian/internal/{sim,gateway}` (authoritative 103/104 runtime integration) |
+| M5-T7 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b, M5-T5, M5-T6 | `backend/voxilian/internal/{sim,gateway}` (authoritative 103/104 runtime integration) |
 | M6-T1…T3 | M5-T1…T5 | `backend/voxilian/internal/sim` (progression) |
 | M7-T1 | M9-T1 (seed pipeline) + M1-T6b | `backend/voxilian/internal/sim`, `seed/` fixtures |
 | M7-T2a…c, T3, T4 | M4-T1…T3a, M1-T7b | `backend/voxilian/internal/sim` |
@@ -332,6 +354,18 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.13: split M5-T4 into pure core T4a + entity/scheduling T4b and
+  freeze M5-T4a vitals semantics (spec v0.3.29 §9.4: canonical vitals
+  value, HP/mana mutation trios, node arithmetic with Fey-only double,
+  strict HasVigor/>20000 exertion rules, 10..100 threshold, pure
+  health/mana/rest intervals with resolved seams, seconds-based lazy
+  stomach decay with 1..100 post bound, durable JSON with
+  missing-exertion-means-zero, T1/T2/T3 composition boundary; T4b owns
+  entity attachment/scheduling/moved-gating/handoff/tick integration;
+  old "timer tests" wording moves to T4b) + verified `meridian59.md`
+  corrections (no Vale multiplier, stomach bound/units/vigor points,
+  mana-only BOOST_DECAY). M5-T4a/T4b/T5/T6/T7 and M5 exit stay `[ ]`.
 
 - v1.12: freeze M5-T3b special spell semantics (spec v0.3.28 §9.3b:
   touch proficiency/damage/duration/Holy Touch with dead viHit_Factor
