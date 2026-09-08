@@ -79,9 +79,28 @@ type entity struct {
 	// (spec §9.4b.2); vitals is meaningful only when isPlayer holds.
 	// The value copy rules of §9.4b.3 apply: attach stores a copy and
 	// inspection returns copies, so no caller can alias live state.
-	// T4b1 adds NO timer/rest/acted-since-entry state (that is T4b2).
 	isPlayer bool
 	vitals   PlayerVitals
+
+	// Player-owned ephemeral vitals runtime metadata (spec §9.4b.10,
+	// v0.3.31): installed atomically with the vitals at attach/add
+	// (§9.4b.3a), never persisted (§9.4b.9), and riding this SAME
+	// entity object through cell handoff (§9.4b.8). runtimeInputs is
+	// the authoritative current resolved regen-input snapshot
+	// (§9.4b.14a). Each deadline slot is an explicit armed bit plus a
+	// u32 due tick: due 0 is a VALID wrapped deadline, so absence is
+	// NEVER encoded as due == 0. restArmed IS the resting state — no
+	// redundant independent resting boolean exists. No time.Time, no
+	// timer handle, no goroutine.
+	runtimeInputs     PlayerVitalsRuntimeInputs
+	healthArmed       bool
+	healthDue         uint32
+	manaArmed         bool
+	manaDue           uint32
+	restArmed         bool
+	restDue           uint32
+	actedSinceEntry   bool
+	stomachAnchorTick uint32
 
 	// recentOps is the bounded cross-cell dedupe cache
 	// (spec §5.5.15): the most recent RecentOpIDCapacity

@@ -210,7 +210,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   handoff-preservation proof. NO regen/rest timers, NO acted-since-entry,
   NO stomach anchor, NO death, NO gateway, NO Store/persist imports.
   Spec: §9.4b.2–§9.4b.9, §9.4b.18–§9.4b.20.
-- [ ] **M5-T4b2** Deterministic vitals scheduling/runtime: health/mana
+- [x] **M5-T4b2** Deterministic vitals scheduling/runtime: health/mana
   due scheduling with NewHealth/NewMana create/cancel/keep semantics and
   acted-since-entry gating; rest lifecycle/deadlines (always re-arm,
   below-threshold recovery only); actedSinceEntry gate + owner-local

@@ -159,7 +159,7 @@ func (e *Engine) HistoryCapacity() int { return e.registry.historyCapacity }
 func (e *Engine) RandUint64() uint64 { return e.rng.Uint64() }
 
 // Step executes exactly one fixed simulation step (spec
-// §5.2.8/§5.3.7/§5.4.3):
+// §5.2.8/§5.3.7/§5.4.3 + §9.4b.17 v0.3.31 phase order):
 //
 //  1. allocate/increment tick (0 -> 1 for the first step; u32 wrap is normal)
 //  2. capture the tick-start resident ownership worklist in canonical
@@ -172,7 +172,15 @@ func (e *Engine) RandUint64() uint64 { return e.rng.Uint64() }
 //     cross-cell final position (or hold on generation exhaustion)
 //  7. sample final volume flags
 //  8. emit MovementUpdate through the sink when applicable
-//  9. append each processed entity's post-step position-history sample
+//  9. process the T4b2 player vitals runtime for THIS SAME entity:
+//     health due, then mana due, then rest due (fixed slot order)
+//
+// 10. append each processed entity's post-step position-history sample
+//
+// Movement output therefore happens before any vitals event of the
+// same Step (the frozen movement-before-vitals ordering, §9.4b.17),
+// and an accepted pending player input marks actedSinceEntry when it
+// is consumed in step 4 — before the same Step's due processing.
 //
 // A migrated-in entity is absent from the tick-start worklist, so it
 // can never be processed twice in one tick; it becomes eligible on
@@ -189,6 +197,9 @@ func (e *Engine) Step() {
 		}
 		if update, emit := e.stepEntity(ent, tick); emit && e.movement != nil {
 			e.movement.OnMovement(update)
+		}
+		if ent.isPlayer {
+			e.stepPlayerVitalsRuntime(ent, tick)
 		}
 		ent.history.Append(PositionSample{Tick: tick, Position: ent.position})
 	}
@@ -211,6 +222,16 @@ func (e *Engine) stepEntity(ent *entity, tick uint32) (MovementUpdate, bool) {
 		ent.hasProcessed = true
 		ent.hasPending = false
 		processedNew = true
+		// An ACCEPTED processed player input is the first-action
+		// trigger (spec §9.4b.16): marked here, at consumption and
+		// BEFORE held-direction translation is resolved, so a
+		// zero-translation/turn-like accepted input still counts as
+		// the first action and the same Step's due processing sees
+		// actedSinceEntry == true. Generic entities carry no such
+		// flag; merely submitted-but-unprocessed inputs never mark.
+		if ent.isPlayer {
+			ent.actedSinceEntry = true
+		}
 	}
 
 	dx, dz, active := heldDirectionVector(ent.activeHeldDirs, ent.yaw)

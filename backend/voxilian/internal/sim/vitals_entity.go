@@ -60,20 +60,27 @@ type PlayerVitalsObserverFunc func(PlayerVitalsEvent)
 func (f PlayerVitalsObserverFunc) OnPlayerVitalsChange(ev PlayerVitalsEvent) { f(ev) }
 
 // AddPlayerEntity inserts a player entity carrying authoritative vitals
-// (spec §9.4b.3): validates the vitals FIRST (an invalid value consumes
-// no EntityID and mutates nothing), then performs the ordinary generic
-// add (same all-or-nothing position/ID-exhaustion semantics) and
-// installs a VALUE COPY of the vitals plus the player classification,
-// sampling VolumeFlagsAt at the initial position like AddEntity. The
-// caller's vitals are never aliased. T4b1 starts no timers and no rest
-// state; a player added here regenerates nothing until T4b2.
+// (spec §9.4b.3 + §9.4b.3a): validates the vitals AND the T4b2 runtime
+// inputs FIRST (an invalid value of either consumes no EntityID and
+// mutates nothing), then performs the ordinary generic add (same
+// all-or-nothing position/ID-exhaustion semantics) and installs a VALUE
+// COPY of the vitals plus the player classification plus the ATOMIC
+// §9.4b.9 initial runtime state (fresh acted flag, no rest deadline,
+// stomach anchored at the current tick, health armed iff HP != MaxHP &&
+// HP > 0, mana armed iff Mana != MaxMana — from the current tick using
+// the supplied inputs), sampling VolumeFlagsAt at the initial position
+// like AddEntity. The caller's vitals/inputs are never aliased; no
+// default Stamina/Mysticism is invented.
 //
 // Owner-local: call only from the sim owner goroutine (Run/Step) or in
 // Step-driven tests. Concurrent gateway callers keep using
 // EnqueueAddEntity (generic); the typed concurrent player-add command is
 // deferred to the gateway world-entry composition task (spec §9.4b.3).
-func (e *Engine) AddPlayerEntity(pos world.Vec3, vitals PlayerVitals) (EntitySnapshot, error) {
+func (e *Engine) AddPlayerEntity(pos world.Vec3, vitals PlayerVitals, runtimeInputs PlayerVitalsRuntimeInputs) (EntitySnapshot, error) {
 	if err := vitals.Validate(); err != nil {
+		return EntitySnapshot{}, err
+	}
+	if err := runtimeInputs.Validate(); err != nil {
 		return EntitySnapshot{}, err
 	}
 	snap, err := e.registry.AddEntity(pos)
@@ -87,12 +94,14 @@ func (e *Engine) AddPlayerEntity(pos world.Vec3, vitals PlayerVitals) (EntitySna
 	ent.isPlayer = true
 	ent.vitals = vitals
 	ent.volumeFlags = e.collision.VolumeFlagsAt(pos)
+	e.initPlayerRuntime(ent, runtimeInputs)
 	return ent.snapshot(), nil
 }
 
 // AttachPlayerVitals converts an existing generic entity into a player
-// entity carrying a validated VALUE COPY of vitals (spec §9.4b.3).
-// Unknown IDs report ErrEntityNotFound, already-player entities
+// entity carrying a validated VALUE COPY of vitals plus the atomic
+// §9.4b.9/§9.4b.3a initial runtime state over the validated runtime
+// inputs. Unknown IDs report ErrEntityNotFound, already-player entities
 // ErrEntityAlreadyPlayer, and MIGRATING ownership fails with zero
 // mutation (the quiesced entity accepts no source-side gameplay
 // mutation, §5.4.2). No event fires: classification is not a vitals
@@ -100,8 +109,11 @@ func (e *Engine) AddPlayerEntity(pos world.Vec3, vitals PlayerVitals) (EntitySna
 //
 // Owner-local: call only from the sim owner goroutine (Run/Step) or in
 // Step-driven tests.
-func (e *Engine) AttachPlayerVitals(id EntityID, vitals PlayerVitals) error {
+func (e *Engine) AttachPlayerVitals(id EntityID, vitals PlayerVitals, runtimeInputs PlayerVitalsRuntimeInputs) error {
 	if err := vitals.Validate(); err != nil {
+		return err
+	}
+	if err := runtimeInputs.Validate(); err != nil {
 		return err
 	}
 	if _, migrating := e.registry.migrations[id]; migrating {
@@ -116,6 +128,7 @@ func (e *Engine) AttachPlayerVitals(id EntityID, vitals PlayerVitals) error {
 	}
 	ent.isPlayer = true
 	ent.vitals = vitals
+	e.initPlayerRuntime(ent, runtimeInputs)
 	return nil
 }
 
@@ -165,9 +178,17 @@ func (e *Engine) resolvePlayer(id EntityID) (*entity, error) {
 
 // commitVitals stores a successful mutation's result and fires the
 // dirty/event seam exactly once iff the value really changed
-// (spec §9.4b.5–§9.4b.6). Callers MUST have produced after through a
-// T4a production helper.
-func (e *Engine) commitVitals(ent *entity, after PlayerVitals) {
+// (spec §9.4b.5–§9.4b.6, §9.4b.22 v0.3.31). It is the ONE narrow live
+// post-commit validity guard: a value whose Validate() fails is NOT
+// committed — live state stays bit-identical, no event fires, and the
+// caller receives the validation error (hardening the source-
+// unreachable hostile corner where a signed AdjustMaxMana would make
+// MaxMana < 1; the T4a pures stay unbounded/source-faithful). Callers
+// MUST have produced after through a T4a production helper.
+func (e *Engine) commitVitals(ent *entity, after PlayerVitals) error {
+	if err := after.Validate(); err != nil {
+		return err
+	}
 	before := ent.vitals
 	ent.vitals = after
 	if after != before && e.vitalsObs != nil {
@@ -177,13 +198,16 @@ func (e *Engine) commitVitals(ent *entity, after PlayerVitals) {
 			After:    after,
 		})
 	}
+	return nil
 }
 
 // PlayerLoseHealth applies the §9.4.6 loss primitive to a player
 // entity's authoritative vitals (spec §9.4b.5). The result is the REAL
 // T4a triple (before/after/applied plus ZeroHP and the Decay
 // classification); no death transition happens here (T5 composes the
-// ZeroHP handoff later). Owner-local.
+// ZeroHP handoff later). After a successful commit the health deadline
+// reconciles per NewHealth from the current tick (spec §9.4b.11).
+// Owner-local.
 func (e *Engine) PlayerLoseHealth(id EntityID, amount int, decay bool) (PlayerVitals, HealthLossResult, error) {
 	ent, err := e.resolvePlayer(id)
 	if err != nil {
@@ -193,13 +217,17 @@ func (e *Engine) PlayerLoseHealth(id EntityID, amount int, decay bool) (PlayerVi
 	if err != nil {
 		return ent.vitals, HealthLossResult{}, err
 	}
-	e.commitVitals(ent, after)
+	if err := e.commitVitals(ent, after); err != nil {
+		return ent.vitals, HealthLossResult{}, err
+	}
+	e.reconcileHealth(ent, e.tick.Load())
 	return after, res, nil
 }
 
 // PlayerGainHealthNormal applies the §9.4.7 capped heal. A no-op result
 // (gain 0) leaves the stored value bit-identical and fires no event.
-// Owner-local.
+// After a successful commit the health deadline reconciles per
+// NewHealth (spec §9.4b.11). Owner-local.
 func (e *Engine) PlayerGainHealthNormal(id EntityID, amount int) (PlayerVitals, int, error) {
 	ent, err := e.resolvePlayer(id)
 	if err != nil {
@@ -209,13 +237,17 @@ func (e *Engine) PlayerGainHealthNormal(id EntityID, amount int) (PlayerVitals, 
 	if err != nil {
 		return ent.vitals, 0, err
 	}
-	e.commitVitals(ent, after)
+	if err := e.commitVitals(ent, after); err != nil {
+		return ent.vitals, 0, err
+	}
+	e.reconcileHealth(ent, e.tick.Load())
 	return after, gained, nil
 }
 
 // PlayerGainHealthOvercap applies the §9.4.8 over-max/vamp heal,
 // including the source-faithful already-above-2*Max corner whose actual
-// delta is negative. Owner-local.
+// delta is negative. After a successful commit the health deadline
+// reconciles per NewHealth (spec §9.4b.11). Owner-local.
 func (e *Engine) PlayerGainHealthOvercap(id EntityID, amount int) (PlayerVitals, int, error) {
 	ent, err := e.resolvePlayer(id)
 	if err != nil {
@@ -225,13 +257,17 @@ func (e *Engine) PlayerGainHealthOvercap(id EntityID, amount int) (PlayerVitals,
 	if err != nil {
 		return ent.vitals, 0, err
 	}
-	e.commitVitals(ent, after)
+	if err := e.commitVitals(ent, after); err != nil {
+		return ent.vitals, 0, err
+	}
+	e.reconcileHealth(ent, e.tick.Load())
 	return after, delta, nil
 }
 
 // PlayerAdjustBaseMaxHP applies the §9.4.4 two-step base-max primitive
 // (the follow-on MaxHP adjustment is caller composition, exactly as in
-// T4a). Owner-local.
+// T4a; the follow-on PlayerAdjustMaxHP call performs its own health
+// reconciliation). Owner-local.
 func (e *Engine) PlayerAdjustBaseMaxHP(id EntityID, amount, effectiveStamina int) (PlayerVitals, int, error) {
 	ent, err := e.resolvePlayer(id)
 	if err != nil {
@@ -261,7 +297,9 @@ func (e *Engine) PlayerAdjustMaxHP(id EntityID, amount int) (PlayerVitals, int, 
 }
 
 // PlayerLoseMana applies the §9.4.14 loss primitive; the returned value
-// is the ACTUAL mana lost after the zero clamp. Owner-local.
+// is the ACTUAL mana lost after the zero clamp. After a successful
+// commit the mana deadline reconciles per NewMana (spec §9.4b.12).
+// Owner-local.
 func (e *Engine) PlayerLoseMana(id EntityID, amount int) (PlayerVitals, int, error) {
 	ent, err := e.resolvePlayer(id)
 	if err != nil {
@@ -271,13 +309,17 @@ func (e *Engine) PlayerLoseMana(id EntityID, amount int) (PlayerVitals, int, err
 	if err != nil {
 		return ent.vitals, 0, err
 	}
-	e.commitVitals(ent, after)
+	if err := e.commitVitals(ent, after); err != nil {
+		return ent.vitals, 0, err
+	}
+	e.reconcileMana(ent, e.tick.Load())
 	return after, lost, nil
 }
 
 // PlayerGainMana applies the §9.4.15 gain primitive in both modes; the
 // capped mode preserves the source-faithful negative-delta corner
-// (Mana above MaxMana). Owner-local.
+// (Mana above MaxMana). After a successful commit the mana deadline
+// reconciles per NewMana (spec §9.4b.12). Owner-local.
 func (e *Engine) PlayerGainMana(id EntityID, amount int, capped bool) (PlayerVitals, int, error) {
 	ent, err := e.resolvePlayer(id)
 	if err != nil {
@@ -287,12 +329,18 @@ func (e *Engine) PlayerGainMana(id EntityID, amount int, capped bool) (PlayerVit
 	if err != nil {
 		return ent.vitals, 0, err
 	}
-	e.commitVitals(ent, after)
+	if err := e.commitVitals(ent, after); err != nil {
+		return ent.vitals, 0, err
+	}
+	e.reconcileMana(ent, e.tick.Load())
 	return after, gained, nil
 }
 
-// PlayerAdjustMaxMana applies the §9.4.13 unbounded MaxMana add path.
-// Owner-local.
+// PlayerAdjustMaxMana applies the §9.4.13 unbounded MaxMana add path
+// (the T4a pure stays source-faithful); the §9.4b.22 commit guard
+// rejects a result whose Validate() fails (e.g. MaxMana below 1) with
+// bit-identical live state and no event. After a successful commit the
+// mana deadline reconciles per NewMana (spec §9.4b.12). Owner-local.
 func (e *Engine) PlayerAdjustMaxMana(id EntityID, amount int) (PlayerVitals, int, error) {
 	ent, err := e.resolvePlayer(id)
 	if err != nil {
@@ -302,7 +350,10 @@ func (e *Engine) PlayerAdjustMaxMana(id EntityID, amount int) (PlayerVitals, int
 	if err != nil {
 		return ent.vitals, 0, err
 	}
-	e.commitVitals(ent, after)
+	if err := e.commitVitals(ent, after); err != nil {
+		return ent.vitals, 0, err
+	}
+	e.reconcileMana(ent, e.tick.Load())
 	return after, delta, nil
 }
 
@@ -317,7 +368,9 @@ func (e *Engine) PlayerApplyExertion(id EntityID, amount int64, setToThreshold b
 	if err != nil {
 		return ent.vitals, err
 	}
-	e.commitVitals(ent, after)
+	if err := e.commitVitals(ent, after); err != nil {
+		return ent.vitals, err
+	}
 	return after, nil
 }
 
@@ -335,7 +388,9 @@ func (e *Engine) PlayerApplyRestExertion(id EntityID, amount int64, roomMultipli
 	if err != nil {
 		return ent.vitals, err
 	}
-	e.commitVitals(ent, after)
+	if err := e.commitVitals(ent, after); err != nil {
+		return ent.vitals, err
+	}
 	return after, nil
 }
 
@@ -350,7 +405,9 @@ func (e *Engine) PlayerSetRestThreshold(id EntityID, threshold int) (PlayerVital
 	if err != nil {
 		return ent.vitals, err
 	}
-	e.commitVitals(ent, after)
+	if err := e.commitVitals(ent, after); err != nil {
+		return ent.vitals, err
+	}
 	return after, nil
 }
 
