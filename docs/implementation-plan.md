@@ -231,7 +231,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   before EntityID consumption, no default stats); §9.4b.10 explicit
   armed/present deadline bit.
   Spec: §9.4b.1, §9.4b.3a, §9.4b.10–§9.4b.17, §9.4b.19, §9.4b.21–§9.4b.22.
-- [ ] **M5-T5a** Pure/source-faithful death mechanics and immutable
+- [x] **M5-T5a** Pure/source-faithful death mechanics and immutable
   planning: disposition decision (avoided/cheap/normal from RESOLVED
   inputs), double-death guard decision, corpse policy constants, ordered
   drop plan from resolved per-item policy + PK-protection metadata,
