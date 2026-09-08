@@ -145,6 +145,11 @@ gives ceiling — newbies with 40 Aim still hit sometimes with 20% sword.
   unconditionally TRUE, so the half-cost `SkillFailed` path never fires for
   strokes). The "fail still costs half" (`(1000*exertion)/2`) applies only to
   non-stroke skills via `SkillFailed`.
+- Running: `user.kod VIGOR_RUN_THRESHOLD = 10`; a run-speed request is
+  denied (treated as illegal/cheating in source, walk fallback in Voxilian)
+  iff `GetVigor() < 10`, so the run gate is `Vigor >= 10` — deliberately
+  NOT `HasVigor(10)`, which is strict `>` and would wrongly deny vigor
+  exactly 10.
 - Typical costs (charged as `1000*viSkillExertion` exertion): standard melee/
   bow swing (slash/fire, `viSkillExertion=2`) = 2000 = 0.2 vigor; punch
   (`viskillExertion=5`) = 5000 = 0.5 vigor; unarmed base
@@ -167,6 +172,23 @@ Constants: `BASE_REGEN_TIME=150000`, `REST_TIME=2500`, `BOOST_DECAY=30000`.
   bound(MaxMana,1,..)`, minus faction, ±Rejuvenate/ManaFocus, clamp 1–60 s
   (0.5 s min in-room). Example Myst 25 / Vigor 100 / MaxMana 20 → 15 s per mana.
 - **Vigor:** rest tick above, +1 vigor/tick while resting.
+
+Timer runtime facts (audited `player.kod` + `blakserv/timer.c`, frozen for
+the Voxilian port in spec §9.4b): HP regen is gated on
+`PFLAG_MOVED_SINCE_ENTRY` — the player's FIRST ACTION since room entry
+(turning alone qualifies via `UserTurn`; many non-movement actions call
+`NotifyMonstersOfPresence`) — while MANA regen is NOT action-gated. An
+idle player's health timer keeps re-arming (fresh interval each fire)
+without healing. The flag resets false at logon and at room entry
+(`NewOwner`) EXCEPT into rooms flagged NO_COMBAT/SANCTUARY/SAFE_DEATH
+(or chaos night), which preserve it. `NewHealth`/`NewMana` create a timer
+only if none exists (HP/Mana != max, and HP > 0 — dead players never
+schedule healing), cancel it at exact equality with max, and otherwise
+KEEP the existing deadline (input changes affect the next create, never a
+running timer). `RestTimer` always re-arms itself after each event; only
+`StopResting` cancels it. `timer.c` fires deadline-ascending with equal
+deadlines in creation order, one timer per activation, removing the timer
+before its handler runs.
 
 ### 4.5 Hunger
 

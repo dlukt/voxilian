@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.29 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.30 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -7335,6 +7335,422 @@ Property invariants: loss never yields `HP < 0`; normal heal from
 etc.). Fuzz SEEDS (no long campaign) for the cheap primitives with
 no-panic/no-overflow/stable-error/bounds properties.
 
+### 9.4b M5-T4b runtime vitals integration + scheduling (normative, v0.3.30)
+
+This section freezes the T4b runtime: attaching the §9.4 vitals value to
+live sim entities, owner-local mutation composition over the T4a
+primitives, and the deterministic health/mana/rest/stomach runtime. It
+splits the old single broad T4b row into TWO tasks (v1.14):
+
+```text
+M5-T4b1 — live player-vitals entity integration (§9.4b.2–§9.4b.9,
+          §9.4b.18–§9.4b.20; §9.4b.8/§9.4b.9 are the T4b1 proof base
+          that T4b2 extends)
+M5-T4b2 — deterministic vitals scheduling/runtime (§9.4b.1, §9.4b.10–
+          §9.4b.17, §9.4b.19, §9.4b.21)
+```
+
+Normative source audited for this freeze (mechanics only, no GPL text
+copied): `player.kod` (`HealthTimer`, `NewHealth`, `CalculateHealthTime`,
+`ManaTimer`, `NewMana`, `CalculateManaTime`, `StartResting`, `StopResting`,
+`IsResting`, `RestTimer`, `GetRestTime`, `RestAddExertion`, `UpdateStomach`,
+`NewOwner`, logon flag reset), `player/user.kod` (`UserMove`, `UserTurn`,
+`NotifyMonstersOfPresence`, `VIGOR_RUN_THRESHOLD`), `blakserv/timer.c`
+(`CreateTimer`, `AddTimerNode`, `TimerActivate`),
+`blakserv/ccode.c` (`C_GetTime`).
+
+#### 9.4b.1 Runtime architecture (frozen)
+
+T4b stays inside the existing single-writer simulation architecture
+(§5.2/§5.2.10): one Run goroutine owns ALL mutation; health/mana/rest
+progress is sim-owned deterministic runtime metadata processed by
+`Engine.Step`. FORBIDDEN in T4b: goroutine per player, ticker per player,
+`time.Timer` per player, wall-clock gameplay deadlines, background regen
+worker, lock per entity. The existing engine policy is authoritative: one
+delivered engine tick executes exactly one `Step`; no wall-clock catch-up
+burst (§5.2.1). Gameplay timer progress follows simulation ticks, never
+elapsed production wall time. `Run`/`Step` remain the ONLY step cores; no
+second timer-driven simulation path may exist.
+
+#### 9.4b.2 Player-entity classification [T4b1]
+
+- The internal entity gains player-owned state ONLY: a player
+  classification flag plus (for players) one authoritative `PlayerVitals`
+  VALUE (§9.4.1). A generic entity created through the existing M4 path
+  (registry `AddEntity`/`EnqueueAddEntity`) remains byte-for-byte generic:
+  no vitals, no classification, unchanged behavior. No timer, rest, or
+  acted-since-entry state exists yet in T4b1 (T4b2 adds the §9.4b.10
+  deadline slots, §9.4b.15 stomach anchor, and §9.4b.16 acted flag as
+  further player-owned fields on the SAME entity object).
+- `EntityID` remains the opaque §5.2.5 domain: T4b1 MUST NOT reinterpret it
+  as a CharacterID, and MUST NOT add CharacterID, PG revision, session ID,
+  NetEntityID, or persistence ownership to `PlayerVitals` or the entity.
+- `EntitySnapshot` gains an `IsPlayer` classification boolean (additive;
+  default false preserves every existing construction site). Immutable
+  vitals inspection is a separate value-returning API (§9.4b.4).
+
+#### 9.4b.3 Player attach/add/load path [T4b1]
+
+- T4b1 provides an explicit owner-local player-entity creation path,
+  conceptually `AddPlayerEntity(pos, vitals) (EntitySnapshot, error)`:
+  validates the vitals (`Validate`), computes the cell, allocates a fresh
+  EntityID exactly like the generic add (same all-or-nothing semantics,
+  same invalid-position/ID-exhaustion errors), and installs a VALUE COPY of
+  the vitals plus the player classification. The caller's copy is never
+  aliased: later caller mutation cannot affect live state, and live
+  mutation cannot leak through returned values. T4b1 creates NO timers,
+  NO rest state, NO acted-since-entry state.
+- T4b1 also provides owner-local attachment to an existing generic entity,
+  conceptually `AttachPlayerVitals(id, vitals) error`: same validation and
+  value-copy rules; unknown IDs return the existing `ErrEntityNotFound`;
+  attaching to an entity that is already a player returns a stable
+  `ErrEntityAlreadyPlayer` with zero mutation (re-load/re-attach is NOT a
+  T4b1 concept; respawn composes remove+add later). Attaching during
+  MIGRATING ownership fails with zero mutation (the migration record owns
+  the quiesced entity; §5.4.2 forbids source-side gameplay mutation).
+- Ingress boundary: T4b1 adds NO new ingress command kind. The mailbox
+  keeps exactly add/remove/move (§5.2.10). A typed concurrent
+  player-add/attach command is deferred to the later gateway world-entry
+  composition task that actually holds durable vitals (M5-T6/T7 era);
+  when added it MUST be a typed command carrying a `PlayerVitals` value,
+  never a `func(*Engine)` escape hatch.
+
+#### 9.4b.4 Immutable inspection [T4b1]
+
+- Conceptually `PlayerVitalsOf(id) (PlayerVitals, bool, error)`: unknown
+  ID -> (`ErrEntityNotFound`); known generic entity -> (zero value, false,
+  nil); known player -> (value COPY, true, nil). The bool distinguishes
+  "not a player" from a VALID player whose vitals legitimately contain
+  zero-valued fields (e.g. creation `Stomach 0`, `Exertion 0`): zero
+  fields MUST NOT be treated as absent vitals. No mutable pointer into
+  the registry escapes.
+
+#### 9.4b.5 Owner-local mutation surface [T4b1]
+
+T4b1 exposes the minimum coherent owner-local mutation families later
+T5/T6/T7/T4b2 compose over; exact Go grouping may differ but the families
+are frozen. EVERY mutation: (a) executes only on the sim owner goroutine
+(owner-local, same contract as `SubmitMove`); (b) resolves the entity,
+requiring a player — a generic entity returns stable `ErrEntityNotPlayer`,
+an unknown ID `ErrEntityNotFound`, zero mutation in both cases; (c) calls
+the EXISTING T4a production helper — formulas are never reimplemented or
+shadowed; (d) writes the resulting value back ONLY on success — a failed
+validation/domain error leaves the entity unchanged; (e) returns the real
+T4a result values (applied/delta/result structs) plus the post-mutation
+immutable vitals copy; (f) emits at most one §9.4b.6 event.
+
+```text
+HP:            PlayerLoseHealth(id, amount, decay)  -> LoseHealth result
+               PlayerGainHealthNormal(id, amount)   -> actual gained
+               PlayerGainHealthOvercap(id, amount)  -> actual delta
+               PlayerAdjustBaseMaxHP(id, amount, effectiveStamina) -> delta
+               PlayerAdjustMaxHP(id, amount)        -> actual delta
+Mana:          PlayerLoseMana(id, amount)           -> actual lost
+               PlayerGainMana(id, amount, capped)   -> actual gained
+               PlayerAdjustMaxMana(id, amount)      -> actual delta
+Exertion:      PlayerApplyExertion(id, amount, setToThreshold)
+               PlayerApplyRestExertion(id, amount, roomMultiplier)
+Threshold:     PlayerSetRestThreshold(id, threshold)
+```
+
+T4a error sentinels propagate predictably (wrapped `%w`, matched with
+`errors.Is`). T4b1 owns NO death transition, NO timer scheduling, NO rest
+runtime, NO spell/weapon resolver, NO gateway.
+
+#### 9.4b.6 Dirty/event seam [T4b1]
+
+- One narrow observer seam, conceptually
+  `PlayerVitalsObserver{ OnPlayerVitalsChange(PlayerVitalsEvent) }`,
+  an OPTIONAL `EngineDeps` member (nil = no-op, mirroring
+  Movement/Anomaly). The event carries ONLY immutable values:
+  `EntityID`, `Before`, `After` (two `PlayerVitals` copies).
+- Fired iff the mutation produced a REAL state change (`Before !=
+  After` — the struct is a comparable plain value). A T4a no-op result
+  (e.g. `GainHealthNormal` gain 0, over-cap heal delta 0,
+  `AdjustMaxHP` delta 0) MUST NOT fire. A failed mutation MUST NOT fire.
+- The observer owns NO persistence and MUST be non-blocking/bounded on
+  the sim owner (same contract class as `MovementSink`). Durable
+  CharacterID/revision mapping happens OUTSIDE the vitals value in later
+  composition (T7/saver); T4b1 imports NO `store`/`persist`/pgx/sqlc and
+  adds NO Prometheus metrics.
+
+#### 9.4b.7 Player run gate [T4b1]
+
+- Source `VIGOR_RUN_THRESHOLD = 10`: running is denied iff
+  `GetVigor() < 10`, i.e. `CanRun := Vigor >= 10`. This is NOT
+  `HasVigor(10)` (§9.4.18 is strict `>` and would wrongly deny vigor
+  exactly 10). The constant is frozen once in the sim package (e.g.
+  `VigorRunThreshold = 10`) and reused; no second copy.
+- Movement selection consults, per entity: player entity -> its
+  authoritative current Vigor via the frozen rule; generic entity -> the
+  injected M4 `RunGate` UNCHANGED. Run denial still only falls back to
+  walk (§5.3.3); no rejection, no vigor mutation in the gate.
+
+#### 9.4b.8 Handoff preservation [T4b1 proof base, T4b2 extension]
+
+- M4 handoff transfers the SAME entity object (§5.4.5), so all
+  player-owned state rides along by construction. T4b1 proves for a
+  player crossing a cell boundary: identical `PlayerVitals` (deep value
+  equality), retained player classification, no copy/reset/alias of
+  vitals, single ownership generation bump. T4b2 additionally proves the
+  §9.4b.10/§9.4b.16 runtime metadata survives with no timer duplication
+  and no same-tick double firing (a migrated-in entity is outside the
+  tick-start worklist, §5.4.3, and due processing is per-tick-per-slot).
+
+#### 9.4b.9 Attach/logon initial state [T4b1 for fields, T4b2 for timers]
+
+At attach/logon of a loaded player the runtime state initializes to:
+
+```text
+PlayerVitals       loaded value, Validate()d (attach rejects invalid)
+resting            false           [T4b2]
+actedSinceEntry    false           [T4b2] (source: logon flag reset)
+health deadline    per NewHealth from loaded HP/MaxHP   [T4b2]
+mana deadline      per NewMana from loaded Mana/MaxMana [T4b2]
+stomach anchor     current simulation time             [T4b2]
+```
+
+Rest/timer/acted/stomach-anchor metadata is NEVER persisted merely to
+simplify runtime code; only the §9.4.2 durable JSON fields exist.
+
+#### 9.4b.10 Runtime timer metadata model [T4b2]
+
+- Health/mana/rest progress is represented as sim-owned per-player
+  deadline slots on the entity, conceptually three optional due-tick
+  fields (healthDue, manaDue, restDue) in the `uint32` tick domain. No
+  goroutine, no heap, no global timer list, no wall-clock timestamp.
+- ONE canonical ms->tick conversion exists, the §9.3a.13 `CastTicks`
+  semantics: `delayTicks = ceil(intervalMs * tickHz / 1000)` with
+  integer-only arithmetic, `tickHz` domain `1..120`, overflow and
+  `> MaxInt32` rejected, never firing earlier than the source interval.
+  T4b2 reuses this ONE conversion (calling the existing helper or
+  promoting it to a shared name) and MUST NOT introduce a second
+  subtly-different ms->tick conversion anywhere.
+- When a slot is newly created or re-armed from an absent/cancelled
+  state: `due = currentSimTick + delayTicks` (`uint32` addition; wrap is
+  normal §5.2.2 behavior). The new deadline is based on the tick at
+  which creation/re-arm occurs — NOT the previous deadline and NOT wall
+  clock. Due comparison uses the existing canonical `serial32`
+  arithmetic (`After(due, currentTick)`), unambiguous because
+  `CastTicks` bounds every delay to `< 2^31` ticks; no second comparator
+  may be invented.
+- At most ONE event per slot per Step: processing clears the slot FIRST
+  (the source timer.c removes the timer node before dispatching, and the
+  KOD handlers null their handles on entry), applies at most one §9.4b
+  step, then applies create/cancel/keep semantics. NO catch-up loop may
+  execute multiple missed regen events in one Step; if Steps were not
+  delivered, the deadline simply compares as due on the next executed
+  Step (single event).
+
+#### 9.4b.11 Health timer lifecycle [T4b2]
+
+`NewHealth` semantics frozen exactly (source):
+
+```text
+no deadline AND HP != MaxHP AND HP > 0 -> create (CalculateHealthTime inputs)
+existing deadline AND HP == MaxHP      -> cancel
+existing deadline AND HP != MaxHP      -> KEEP the existing deadline
+```
+
+Changing Vigor, effective stats, MaxHP/BaseMaxHP, faction/Jala/Focus
+inputs, etc. MUST NOT silently restart a running deadline: changed
+inputs affect the NEXT create. At a health deadline (after clearing the
+slot):
+
+```text
+if actedSinceEntry:
+    HP < MaxHP  -> +1 health via the source-faithful heal path
+                   (§9.4.7 normal heal; +1 below max is identical to the
+                   source GainHealth(1) call site)
+    HP > MaxHP  -> decay -1 via §9.4.6, Decay = true (never breaks
+                   trance later; distinct from combat damage)
+    HP == MaxHP -> no mutation
+else:
+    no health mutation
+```
+
+Then apply NewHealth create/cancel/keep. Source-faithful consequence: an
+idle (not-acted) player's health deadline KEEPS re-arming without healing
+while HP != MaxHP and HP > 0. Health at zero MUST NOT spontaneously
+schedule healing (`HP > 0` create guard); the zero-HP/death boundary is
+M5-T5 — T4b2 only guarantees no self-scheduling from zero.
+
+#### 9.4b.12 Mana timer lifecycle [T4b2]
+
+`NewMana` semantics frozen exactly (source; note NO acted-since-entry
+gate — mana regen is not action-gated in source):
+
+```text
+no deadline AND Mana != MaxMana -> create (CalculateManaTime inputs)
+existing deadline AND Mana == MaxMana -> cancel
+existing deadline AND Mana != MaxMana -> KEEP existing deadline
+```
+
+At a mana deadline (after clearing the slot): `Mana < MaxMana -> +1`
+(uncapped gain), `Mana > MaxMana -> -1 decay`, `Mana == MaxMana -> no
+mutation` (§9.4.16 one-step). Then apply NewMana create/cancel/keep. The
+over-max branch of `CalculateManaTime` (BOOST_DECAY_TIME) naturally
+governs the decay re-arm.
+
+#### 9.4b.13 Rest lifecycle [T4b2]
+
+Frozen exactly (source):
+
+```text
+Start:  already resting -> no-op (plus source trance break owned by T6/T7)
+        not resting    -> create first rest deadline (GetRestTime inputs)
+Stop:   cancel deadline if present; resting becomes false
+Firing: clear deadline
+        if Vigor < RestThreshold: apply ONE RestAddExertion recovery
+                                  event (resolved room multiplier)
+        ALWAYS create the next deadline from then-current resolved inputs
+```
+
+Reaching the threshold does NOT stop resting; the deadline continues and
+produces no recovery while `Vigor >= RestThreshold` until explicitly
+stopped. `IsResting` == rest deadline present. Opcode 115 start/stop
+semantics, messages/animation, trance breaking, Second Wind
+execution/recovery blocking remain M5-T6; T4b2 only exposes the
+authoritative owner-local lifecycle hooks.
+
+#### 9.4b.14 Resolved runtime regen inputs [T4b2]
+
+Health/mana/rest interval calculations consume ONLY already-resolved
+numeric runtime values (§9.4): effective Stamina, effective Mysticism,
+faction regen scalar (phase 2, default 0), Restorate power / absent,
+Rejuvenate power / absent, Mana Focus power / absent, Invigorate power /
+absent, rest recovery multiplier 1/2/3. T4b2 implements NO live faction,
+item, Jala song, enchantment, node, or spell-catalog lookup. The resolved
+values are supplied as explicit owner-local inputs at each create/re-arm
+(computed by the caller of the timer hook — initially T4b2's own
+scheduling code with static/config-level defaults, later enriched by
+T6/T7/world tasks); no caching layer may serve stale values across a
+create. Room policy remains resolved OUTSIDE the sim vitals layer:
+sanctuary -> 2x, triple-heal -> 3x, both -> 3x (not 6x) — the caller
+resolves the multiplier; T4b2 invents NO `ROOM_*` flag IDs or
+`world.VolumeFlags` bit assignments (content/world mapping belongs to its
+own later task).
+
+#### 9.4b.15 Stomach sim-time anchor [T4b2]
+
+- T4a owns only `DecayStomach(current, elapsedWholeSeconds)`. T4b2 adds
+  ONE ephemeral deterministic per-player anchor: the sim tick of the last
+  stomach update (conceptually `uint32 stomachAnchorTick`), initialized
+  at attach/logon to the current simulation tick. No wall-clock
+  timestamp in `PlayerVitals`, no persisted timer deadline, no DB
+  migration, no background stomach timer.
+- Lazy update (owner-local, explicit): derive elapsed whole seconds from
+  the fixed-step tick domain — `elapsedTicks = currentTick - anchorTick`
+  (`uint32` modular subtraction; unambiguous while `< 2^31`, guarded),
+  `wholeSeconds = elapsedTicks / tickHz` (floor, exact for fixed steps) —
+  then call T4a `DecayStomach`, write the result, and advance the anchor
+  by EXACTLY the consumed whole seconds of ticks
+  (`anchorTick += wholeSeconds * tickHz`), so repeated updates within
+  one simulated second accumulate fractional-tick progress instead of
+  discarding it. Wrap behavior is deterministic `uint32` arithmetic in
+  the §5.2.2 modulo domain.
+- MVP offline behavior (explicit, matches source `Load()`): the anchor
+  is NOT durably persisted; unload/restart/offline periods simply
+  re-anchor at re-attach, so NO offline digestion is invented or
+  applied. Actual opcode 116 eat flow remains M5-T6.
+
+#### 9.4b.16 actedSinceEntry [T4b2]
+
+- The source `PFLAG_MOVED_SINCE_ENTRY` + `NotifyMonstersOfPresence`
+  mechanism means FIRST ACTION since room entry — including turning
+  (`UserTurn` fires it with zero translation) and many non-movement
+  actions (attacks, casts, etc.) — NOT "physical displacement occurred".
+  Voxilian names the runtime concept truthfully: `actedSinceEntry`
+  (player-owned bool on the entity). T4b2 invents NO wire/room flag bit
+  numbers.
+- Frozen architecture: fresh player attach/logon starts false; a
+  qualifying owner-local player action sets it true through one narrow
+  owner-local hook (conceptually `MarkActedSinceEntry(id)`); movement
+  integration sets/routes it at the source-faithful point (an ACCEPTED
+  processed player movement input — including a zero-translation/
+  turn-like accepted input — qualifies, per `UserMove`/`UserTurn`);
+  future T6/T7 actions call the same narrow hook; ordinary technical
+  32 m CELL handoff PRESERVES it (CELL handoff is NOT Meridian room
+  entry); future actual world/room/portal entry may reset it ONLY
+  through an explicit hook consuming an ALREADY-RESOLVED reset policy.
+- Safe-room boundary (source `NewOwner`): the source resets the flag on
+  room entry only when the destination room is NOT no-combat / sanctuary
+  / safe-death (and not chaos night). Voxilian `world.VolumeFlags` is
+  intentionally opaque with no assigned sanctuary/safe bits, so T4b2
+  MUST consume an already-resolved boolean reset decision (or expose the
+  narrow hook for the later content-owning task) and MUST NOT assign
+  ROOM_SANCTUARY / ROOM_TRIPLE_HEAL / ROOM_NO_COMBAT / ROOM_SAFE_DEATH
+  to arbitrary Voxilian bits. `NotifyMonstersOfPresence`'s monster-aggro
+  side effect is M7 scope; only the vitals gate is consumed here.
+
+#### 9.4b.17 Deterministic ordering [T4b2]
+
+Source audit (`timer.c`): timers are deadline-ascending; equal
+millisecond deadlines fire in creation order (insertion after existing
+`<=` nodes, monotonic timer IDs); one timer per activation. Voxilian
+freezes the deterministic equivalent: due processing runs as its own
+Step phase in canonical engine order (tick-start worklist order: CellCoord
+X/Z then EntityID ascending — the same canonical order as movement), and
+WITHIN one player the slot order is fixed: health, then mana, then rest.
+DOCUMENTED DIVERGENCE: tick quantization collapses distinct millisecond
+deadlines onto one sim tick and does not reproduce global cross-entity
+creation order; the frozen replacement (canonical entity order + fixed
+intra-entity slot order) is deterministic, depends on NO map iteration /
+memory address / scheduler order, and is the smallest representation
+preserving per-entity source ordering (health-before-mana creation
+precedence at attach matches the per-entity slot order). Each slot fires
+at most once per Step (§9.4b.10), so equal-tick processing cannot
+cascade.
+
+#### 9.4b.18 Run-gate wiring in Step [T4b1]
+
+The per-entity run decision in movement integration consults the player
+authoritative gate for players and the injected `RunGate` for generic
+entities (§9.4b.7). The gate is consulted ONLY for genuinely moving
+controls (existing behavior preserved); no movement code path may call
+`HasVigor`.
+
+#### 9.4b.19 Snapshot/inspection boundary (frozen)
+
+`internal/sim` continues to import NO `internal/store`, `internal/persist`,
+pgx, or sqlc output. The §9.4b.6 event is the ONLY vitals notification
+seam; it carries immutable values and performs no blocking work on the
+sim owner. Durable identity/revision mapping and saver composition
+remain outside `PlayerVitals` (T7/M4-T4 composition).
+
+#### 9.4b.20 T4b1 test minimums (frozen)
+
+No sleeps, no wall clock, manual clock only where tick delivery is
+needed. At minimum: generic entity remains generic (behavior + snapshot);
+player attach accepts valid vitals; attach rejects invalid vitals with
+zero mutation (no ID consumed for the add form); caller mutation after
+attach cannot alias live state; snapshot/inspection copies cannot alias
+live state; zero-valued Stomach/Exertion are player vitals, not
+"no vitals"; every §9.4b.5 family returns the REAL T4a results
+(composition against the production helpers, no formula re-derivation in
+tests) including the over-cap negative-delta corners and strict `>20000`
+exertion boundary; failed mutation leaves the entity unchanged; generic
+entity passed to a player mutation -> `ErrEntityNotPlayer`; unknown
+entity -> `ErrEntityNotFound`; vigor 9 walks on a run request / vigor 10
+and 11 run / generic entity still delegates to the injected M4 gate;
+cross-cell handoff preserves exact vitals and classification; ordinary
+generic handoff regression stays green; dirty seam: real change -> exactly
+one immutable event, T4a no-op -> no event, failure -> no event.
+
+#### 9.4b.21 T4b2 test minimums (frozen, for the later task)
+
+Manual-tick/manual-clock tests: deadline creation/cancel/keep per
+NewHealth/NewMana (including input changes NOT restarting a running
+deadline); acted/idle health gating (idle re-arm without healing);
+health-at-zero never schedules; mana ungated; rest lifecycle (start
+no-op, stop cancel, always re-arm, below-threshold-only recovery,
+threshold does not stop rest); due-tick arithmetic incl. u32 wrap and
+`< 2^31` delay bounds via the ONE conversion; deterministic ordering
+(canonical entity order, fixed slot order, at-most-once per Step);
+stomach anchor (fractional-second preservation across repeated lazy
+updates, wrap, re-attach re-anchor); handoff preserves all runtime
+metadata with no double firing; logon initialization snapshot.
+
 ## 10. Config / deployment / ops
 
 - Config: env + file (`config.yaml` default, env override `VOX_*`); MUST
@@ -7490,6 +7906,28 @@ no-panic/no-overflow/stable-error/bounds properties.
    survives it.
 
 ## 14. Version history
+
+- v0.3.30: freeze M5-T4b runtime semantics and split the broad row into
+  T4b1 entity integration + T4b2 deterministic scheduling (normative
+  §9.4b: single-writer deadline-slot model with one canonical
+  CastTicks-equivalent ceil ms->tick conversion and serial32 due
+  comparison bounded < 2^31, currentSimTick-based create/re-arm,
+  at-most-one event per slot per Step with clear-first ordering,
+  NewHealth/NewMana create/cancel/KEEP-existing-deadline semantics with
+  HP>0 create guard and idle-player re-arm-without-healing, ungated mana,
+  rest lifecycle with always-re-arm and below-threshold-only recovery,
+  resolved-inputs-only regen supply with no live lookups and resolved
+  1/2/3 room multiplier, tick-based stomach anchor with fractional-second
+  preservation and documented no-offline-digestion MVP, actedSinceEntry
+  first-action concept with movement/turn routing, cell-handoff
+  preservation, resolved room-entry reset policy boundary with no ROOM_*
+  bit assignment, deterministic canonical-order + fixed-slot-order tie
+  break with documented quantization divergence, player Vigor>=10 run
+  gate distinct from strict HasVigor, immutable dirty/event seam firing
+  only on real change, owner-local mutation surface composing the T4a
+  helpers, player/generic classification without EntityID overloading,
+  and T4b1/T4b2 test minimums) + audit corrections recorded in
+  `meridian59.md` (timer runtime facts, run gate, regen action gating).
 
 - v0.3.29: freeze M5-T4a authoritative vitals state/mutation core
   (normative §9.4: canonical PlayerVitals value with 1/10000 exertion

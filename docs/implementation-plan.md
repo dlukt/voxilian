@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.13)
+# Voxilian Backend — Implementation Plan (v1.14)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.29).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.30).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -196,18 +196,38 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   Golden/property/fuzz-seed tests; NO timers/scheduling, NO entity.go/
   engine.go/ingress.go/saver.go changes, NO death. Spec: §9.4 (frozen
   v0.3.29), meridian59 §4.
-- [ ] **M5-T4b** Vitals entity integration + deterministic regen/rest
-  scheduling: attach vitals to live sim entities under the single-writer
-  ownership model; owner-local mutation APIs; health/mana timer
-  scheduling; rest start/stop scheduling; moved-since-entry regen gating;
-  runtime timer/due-tick metadata; handoff preservation; deterministic
-  tick/manual-clock integration incl. old "timer tests (fake clock)";
-  dirty/snapshot notification seam; inspection/event hooks for T7.
-  Spec: §9.4 (T4b half).
+- [ ] **M5-T4b1** Live player-vitals entity integration (NO scheduling):
+  attach/load validated `PlayerVitals` values to player entities under
+  the single-writer model (value copies, no caller aliasing); player vs
+  generic entity classification without overloading EntityID; immutable
+  inspection distinguishing not-a-player from zero-valued vitals;
+  owner-local mutation APIs composing the T4a production helpers (HP
+  loss/normal/over-max heal, base/max HP adjust, mana loss/capped/
+  uncapped gain, max-mana adjust, exertion + rest exertion, threshold);
+  narrow non-blocking immutable dirty/event seam firing only on real
+  state change; authoritative player vigor run gate (Vigor >= 10, not
+  strict HasVigor) with generic entities keeping the injected M4 gate;
+  handoff-preservation proof. NO regen/rest timers, NO acted-since-entry,
+  NO stomach anchor, NO death, NO gateway, NO Store/persist imports.
+  Spec: §9.4b.2–§9.4b.9, §9.4b.18–§9.4b.20.
+- [ ] **M5-T4b2** Deterministic vitals scheduling/runtime: health/mana
+  due scheduling with NewHealth/NewMana create/cancel/keep semantics and
+  acted-since-entry gating; rest lifecycle/deadlines (always re-arm,
+  below-threshold recovery only); actedSinceEntry gate + owner-local
+  hooks incl. movement/turn routing and resolved room-entry reset policy
+  boundary; deterministic timer ordering (canonical entity order, fixed
+  health->mana->rest slot order, at-most-one event per slot per Step)
+  over the ONE CastTicks-equivalent ms->tick conversion with serial32
+  due comparison; runtime resolved regen inputs (no live lookups);
+  stomach sim-time anchor with fractional-second preservation and
+  documented no-offline-digestion MVP; handoff/no-double-fire scheduling
+  proof; manual-tick/manual-clock timer tests.
+  Spec: §9.4b.1, §9.4b.10–§9.4b.17, §9.4b.19, §9.4b.21.
 - [ ] **M5-T5** Death pipeline: corpse + full droppable drop (PK tags), advancement wipe/halve, Underworld-region respawn, leaving penalties (Stam saves), Portal-of-Life hook; single-txn state+ledger. Crash-during-death test. Spec: §9, §8.1.
 - [ ] **M5-T6** Personal/world-light intents: `115 rest`, `116 eat` (hunger/vigor effects), `105 use` (skill/item dispatch incl. Second Wind), `119 safety_toggle`, `117/118 → 209` chat (+channel rules, length caps, rate limits). Owner of these opcodes: this task, no other. Spec: §6.3, §9.
 - [ ] **M5-T7** Authoritative attack/cast runtime integration (depends on
-  M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4, M5-T5, M5-T6). Owns real C→S 103
+  M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2, M5-T5,
+  M5-T6). Owns real C→S 103
   attack routing, real C→S 104 cast routing, typed sim-owner combat
   commands, composition of T1/T2/T3a/T3b mechanics, authoritative T4
   HP/mana/vigor mutation, T5 death handoff, T6 safety/personal-state
@@ -321,10 +341,11 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M4-T3a…c, T4a, T4b | M1-T7a…c (CAS), M3-T1 | `backend/voxilian/internal/sim`, `internal/store` |
 | M5-T1/T2/T3a/T3b | M4-T1, M4-T2 | `backend/voxilian/internal/sim` (pure mechanics only: no live vitals, no gateway) |
 | M5-T4a | M4-T1, M4-T2 | `backend/voxilian/internal/sim` (pure vitals state/math only: no entity fields, no timers, no gateway) |
-| M5-T4b | M5-T4a | `backend/voxilian/internal/sim` (entity attachment + deterministic scheduling) |
-| M5-T5 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a | `backend/voxilian/internal/sim` (authoritative gameplay state) |
+| M5-T4b1 | M5-T4a, M4-T1, M4-T2 | `backend/voxilian/internal/sim` (player-entity vitals attachment/inspection/mutation/dirty seam/run gate; no scheduling) |
+| M5-T4b2 | M5-T4b1 | `backend/voxilian/internal/sim` (deterministic vitals scheduling: deadlines, rest, acted-since-entry, stomach anchor) |
+| M5-T5 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2 | `backend/voxilian/internal/sim` (authoritative gameplay state; death composes owner-local vitals mutation and interacts with the rest lifecycle, so T4b must be complete) |
 | M5-T6 | M4-T1, M4-T2 | `backend/voxilian/internal/sim` + gateway only for its own listed personal intents |
-| M5-T7 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b, M5-T5, M5-T6 | `backend/voxilian/internal/{sim,gateway}` (authoritative 103/104 runtime integration) |
+| M5-T7 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2, M5-T5, M5-T6 | `backend/voxilian/internal/{sim,gateway}` (authoritative 103/104 runtime integration) |
 | M6-T1…T3 | M5-T1…T5 | `backend/voxilian/internal/sim` (progression) |
 | M7-T1 | M9-T1 (seed pipeline) + M1-T6b | `backend/voxilian/internal/sim`, `seed/` fixtures |
 | M7-T2a…c, T3, T4 | M4-T1…T3a, M1-T7b | `backend/voxilian/internal/sim` |
@@ -354,6 +375,23 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.14: split M5-T4b into live entity integration T4b1 (player-vitals
+  attach/classification/inspection, owner-local T4a-composing mutation
+  surface, immutable dirty/event seam, Vigor>=10 player run gate,
+  handoff proof; no scheduling) plus deterministic scheduling T4b2
+  (deadline-slot runtime with one canonical ms->tick conversion,
+  NewHealth/NewMana keep-deadline semantics, actedSinceEntry first-action
+  gate, rest always-re-arm lifecycle, resolved regen inputs, stomach
+  sim-time anchor, no-double-fire handoff proof, manual-clock tests) and
+  freeze the runtime semantics (spec v0.3.30 §9.4b); M5-T5's formal
+  dependency corrected from M5-T4a to T4b-complete (death composes
+  owner-local vitals mutation and interacts with the rest lifecycle);
+  M5-T7 deps updated to name T4b1/T4b2 explicitly; recorded
+  `meridian59.md` timer-runtime audit facts (regen action gating is
+  HP-only, flag reset exceptions, create/cancel/keep timer semantics,
+  timer.c ordering, Vigor>=10 run threshold). M5-T4b1/T4b2/T5/T6/T7 and
+  M5 exit stay `[ ]`.
 
 - v1.13: split M5-T4 into pure core T4a + entity/scheduling T4b and
   freeze M5-T4a vitals semantics (spec v0.3.29 §9.4: canonical vitals
