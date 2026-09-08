@@ -24,7 +24,11 @@ const InvalidEntityID EntityID = 0
 // of live sim state: it carries values only, no pointers into the
 // registry. Movement-owned authoritative state (yaw, speed, volume
 // flags, reconciliation anchor) is exposed for later M4-T5/baseline
-// inspection; pending-control internals stay private.
+// inspection; pending-control internals stay private. IsPlayer is the
+// M5-T4b1 classification flag (spec §9.4b.2): false for every generic
+// M4 entity. The vitals VALUE itself is inspected separately
+// (PlayerVitalsOf) so a valid player with zero-valued vitals fields is
+// never confused with a non-player.
 type EntitySnapshot struct {
 	ID                    EntityID
 	Position              world.Vec3
@@ -36,13 +40,16 @@ type EntitySnapshot struct {
 	// OwnershipGeneration is the current {cell,generation} epoch's
 	// generation (spec §5.4.1): 1 at creation, +1 per handoff.
 	OwnershipGeneration uint64
+	// IsPlayer reports the player-entity classification (spec §9.4b.2).
+	IsPlayer bool
 }
 
 // entity is the M4-T1 base entity (identity, authoritative position,
 // current cell, position history) extended with ONLY movement-owned
-// state (spec §5.3.7). No HP, stats, combat, inventory, velocity, or
-// other gameplay fields before their owning tasks. Only the single
-// sim writer mutates it: no per-entity lock.
+// state (spec §5.3.7) and player-owned vitals state (spec §9.4b.2).
+// No combat, inventory, velocity, or other gameplay fields before their
+// owning tasks. Only the single sim writer mutates it: no per-entity
+// lock.
 type entity struct {
 	id       EntityID
 	position world.Vec3
@@ -68,6 +75,14 @@ type entity struct {
 	hasProcessed     bool
 	lastProcessedSeq uint32
 
+	// isPlayer marks a player entity carrying authoritative vitals
+	// (spec §9.4b.2); vitals is meaningful only when isPlayer holds.
+	// The value copy rules of §9.4b.3 apply: attach stores a copy and
+	// inspection returns copies, so no caller can alias live state.
+	// T4b1 adds NO timer/rest/acted-since-entry state (that is T4b2).
+	isPlayer bool
+	vitals   PlayerVitals
+
 	// recentOps is the bounded cross-cell dedupe cache
 	// (spec §5.5.15): the most recent RecentOpIDCapacity
 	// SUCCESSFULLY APPLIED OpIDs for this entity. Nil until the
@@ -91,5 +106,6 @@ func (e *entity) snapshot() EntitySnapshot {
 		VolumeFlags:           e.volumeFlags,
 		LastProcessedInputSeq: e.lastProcessedSeq,
 		OwnershipGeneration:   e.generation,
+		IsPlayer:              e.isPlayer,
 	}
 }

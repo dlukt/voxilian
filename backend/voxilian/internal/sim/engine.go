@@ -41,8 +41,8 @@ type EngineConfig struct {
 
 // EngineDeps carries the engine's external seams. Clock, RNG,
 // Collision, and RunGate are REQUIRED and fail fast when missing;
-// Movement and Anomaly MAY be nil, which selects an internal no-op
-// (output observers must never stall the sim owner).
+// Movement, Anomaly, and Vitals MAY be nil, which selects an internal
+// no-op (output observers must never stall the sim owner).
 type EngineDeps struct {
 	Clock     Clock
 	RNG       RNG
@@ -50,6 +50,10 @@ type EngineDeps struct {
 	RunGate   RunGate
 	Movement  MovementSink
 	Anomaly   MovementObserver
+	// Vitals is the optional player-vitals dirty/event observer
+	// (spec §9.4b.6): immutable before/after values, non-blocking,
+	// no persistence ownership.
+	Vitals PlayerVitalsObserver
 }
 
 // Engine is the M4-T1 deterministic sim skeleton (spec §5.2): one
@@ -80,6 +84,7 @@ type Engine struct {
 	runGate   RunGate
 	movement  MovementSink
 	anomaly   MovementObserver
+	vitalsObs PlayerVitalsObserver
 	tick      atomic.Uint32
 	registry  *registry
 	// ingress is the bounded owner-command mailbox (spec §5.2.10):
@@ -120,6 +125,7 @@ func NewEngine(cfg EngineConfig, deps EngineDeps) (*Engine, error) {
 		runGate:   deps.RunGate,
 		movement:  deps.Movement,
 		anomaly:   deps.Anomaly,
+		vitalsObs: deps.Vitals,
 		registry:  newRegistry(HistoryHorizonSeconds * cfg.TickHz),
 		ingress:   make(chan ingressCommand, SimIngressCapacity),
 	}, nil
@@ -230,10 +236,13 @@ func (e *Engine) stepEntity(ent *entity, tick uint32) (MovementUpdate, bool) {
 	}
 
 	// Select walk/run. The run gate is consulted only for genuinely
-	// moving controls, never for stationary ones.
+	// moving controls, never for stationary ones. Players resolve
+	// through their authoritative Vigor (>= VigorRunThreshold,
+	// spec §9.4b.7/§9.4b.18); generic entities delegate to the
+	// injected M4 RunGate unchanged.
 	speedMPS := WalkSpeedMetersPerSecond
 	wireSpeed := uint8(WalkSpeedWire)
-	if ent.activeRun && e.runGate.CanRun(ent.id) {
+	if ent.activeRun && e.entityCanRun(ent) {
 		speedMPS = RunSpeedMetersPerSecond
 		wireSpeed = uint8(RunSpeedWire)
 	}

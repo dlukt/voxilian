@@ -196,7 +196,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   Golden/property/fuzz-seed tests; NO timers/scheduling, NO entity.go/
   engine.go/ingress.go/saver.go changes, NO death. Spec: §9.4 (frozen
   v0.3.29), meridian59 §4.
-- [ ] **M5-T4b1** Live player-vitals entity integration (NO scheduling):
+- [x] **M5-T4b1** Live player-vitals entity integration (NO scheduling):
   attach/load validated `PlayerVitals` values to player entities under
   the single-writer model (value copies, no caller aliasing); player vs
   generic entity classification without overloading EntityID; immutable

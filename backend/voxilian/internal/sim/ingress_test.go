@@ -17,13 +17,38 @@ import (
 var ingressTestTick = time.Unix(1_700_000_000, 0).UTC()
 
 // runOwner starts Engine.Run and waits until this Run owns the
-// engine, returning the cancel func and the Run result channel.
-func runOwner(t *testing.T, e *Engine) (context.CancelFunc, <-chan error) {
+// engine AND (when clk is non-nil) has created its manual ticker,
+// returning the cancel func and the Run result channel. Waiting for
+// the ticker closes a harness race: without it, a test pulsing
+// currentTicker immediately after start could observe an empty list
+// (the new owner goroutine had not reached NewTicker yet) or pulse a
+// stopped ticker from a previous Run generation.
+func runOwner(t *testing.T, e *Engine, clk *manualClock) (context.CancelFunc, <-chan error) {
 	t.Helper()
+	before := 0
+	if clk != nil {
+		clk.mu.Lock()
+		before = len(clk.tickers)
+		clk.mu.Unlock()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- e.Run(ctx) }()
 	deadline := time.Now().Add(10 * time.Second)
+	if clk != nil {
+		for {
+			clk.mu.Lock()
+			n := len(clk.tickers)
+			clk.mu.Unlock()
+			if n > before {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("timeout waiting for Run ticker creation")
+			}
+			runtime.Gosched()
+		}
+	}
 	for {
 		e.runState.mu.Lock()
 		running := e.runState.running
@@ -123,8 +148,9 @@ func ingressEngine(t *testing.T, clk *manualClock, col CollisionWorld) *Engine {
 }
 
 func TestRunOwnerConcurrentSecondFails(t *testing.T) {
-	e := ingressEngine(t, newManualClock(), openCollision{})
-	cancel, done := runOwner(t, e)
+	clk := newManualClock()
+	e := ingressEngine(t, clk, openCollision{})
+	cancel, done := runOwner(t, e, clk)
 	defer stopOwner(t, cancel, done)
 	if err := e.Run(context.Background()); !errors.Is(err, ErrEngineAlreadyRunning) {
 		t.Fatalf("second concurrent Run = %v, want ErrEngineAlreadyRunning", err)
@@ -153,8 +179,9 @@ func TestEnqueueBeforeRunNotRunning(t *testing.T) {
 
 func TestIngressCapacity256(t *testing.T) {
 	col := newBlockingCollision()
-	e := ingressEngine(t, newManualClock(), col)
-	cancel, done := runOwner(t, e)
+	clk := newManualClock()
+	e := ingressEngine(t, clk, col)
+	cancel, done := runOwner(t, e, clk)
 
 	blockPos := world.Vec3{X: 1}
 	release := col.block(blockPos)
@@ -214,8 +241,9 @@ func TestIngressCapacity256(t *testing.T) {
 }
 
 func TestEnqueueCancelledBeforeAdmission(t *testing.T) {
-	e := ingressEngine(t, newManualClock(), openCollision{})
-	cancel, done := runOwner(t, e)
+	clk := newManualClock()
+	e := ingressEngine(t, clk, openCollision{})
+	cancel, done := runOwner(t, e, clk)
 	defer stopOwner(t, cancel, done)
 	ctx, stop := context.WithCancel(context.Background())
 	stop()
@@ -235,8 +263,9 @@ func TestEnqueueCancelledBeforeAdmission(t *testing.T) {
 
 func TestEnqueueCancelledAfterAdmissionExecutes(t *testing.T) {
 	col := newBlockingCollision()
-	e := ingressEngine(t, newManualClock(), col)
-	cancel, done := runOwner(t, e)
+	clk := newManualClock()
+	e := ingressEngine(t, clk, col)
+	cancel, done := runOwner(t, e, clk)
 	defer stopOwner(t, cancel, done)
 
 	release := col.block(world.Vec3{X: 1})
@@ -277,7 +306,7 @@ func TestRunStopDrainsQueued(t *testing.T) {
 	col := newBlockingCollision()
 	clk := newManualClock()
 	e := ingressEngine(t, clk, col)
-	cancel, done := runOwner(t, e)
+	cancel, done := runOwner(t, e, clk)
 
 	release := col.block(world.Vec3{X: 1})
 	firstDone := make(chan error, 1)
@@ -317,7 +346,7 @@ func TestRunStopDrainsQueued(t *testing.T) {
 
 	// Sequential restart owns a fresh empty generation: no stopped
 	// command reappears, and new work executes.
-	cancel2, done2 := runOwner(t, e)
+	cancel2, done2 := runOwner(t, e, clk)
 	snap, err := e.EnqueueAddEntity(context.Background(), world.Vec3{X: 42})
 	if err != nil || snap.ID == InvalidEntityID {
 		t.Fatalf("post-restart add = %+v,%v", snap, err)
@@ -332,7 +361,7 @@ func TestIngressTickPriorityOverBacklog(t *testing.T) {
 	col := newBlockingCollision()
 	clk := newManualClock()
 	e := ingressEngine(t, clk, col)
-	cancel, done := runOwner(t, e)
+	cancel, done := runOwner(t, e, clk)
 	defer stopOwner(t, cancel, done)
 
 	p1 := world.Vec3{X: 1}
@@ -372,8 +401,9 @@ func TestIngressTickPriorityOverBacklog(t *testing.T) {
 }
 
 func TestEnqueueAddRealEngine(t *testing.T) {
-	e := ingressEngine(t, newManualClock(), openCollision{})
-	cancel, done := runOwner(t, e)
+	clk := newManualClock()
+	e := ingressEngine(t, clk, openCollision{})
+	cancel, done := runOwner(t, e, clk)
 	pos := world.Vec3{X: 4, Y: 0, Z: -8}
 	snap, err := e.EnqueueAddEntity(context.Background(), pos)
 	if err != nil {
@@ -394,8 +424,9 @@ func TestEnqueueAddRealEngine(t *testing.T) {
 }
 
 func TestEnqueueRemoveRealEngine(t *testing.T) {
-	e := ingressEngine(t, newManualClock(), openCollision{})
-	cancel, done := runOwner(t, e)
+	clk := newManualClock()
+	e := ingressEngine(t, clk, openCollision{})
+	cancel, done := runOwner(t, e, clk)
 	ctx := context.Background()
 	snap, err := e.EnqueueAddEntity(ctx, world.Vec3{X: 5})
 	if err != nil {
@@ -410,7 +441,7 @@ func TestEnqueueRemoveRealEngine(t *testing.T) {
 	}
 	// Removal of the missing entity through a restarted owner keeps
 	// the exact ErrEntityNotFound semantics.
-	cancel2, done2 := runOwner(t, e)
+	cancel2, done2 := runOwner(t, e, clk)
 	if err := e.EnqueueRemoveEntity(ctx, snap.ID); !errors.Is(err, ErrEntityNotFound) {
 		t.Fatalf("second remove = %v, want ErrEntityNotFound", err)
 	}
@@ -420,7 +451,7 @@ func TestEnqueueRemoveRealEngine(t *testing.T) {
 func TestEnqueueMoveRealEngine(t *testing.T) {
 	clk := newManualClock()
 	e := ingressEngine(t, clk, openCollision{})
-	cancel, done := runOwner(t, e)
+	cancel, done := runOwner(t, e, clk)
 	ctx := context.Background()
 	snap, err := e.EnqueueAddEntity(ctx, world.Vec3{})
 	if err != nil {
@@ -438,7 +469,7 @@ func TestEnqueueMoveRealEngine(t *testing.T) {
 		t.Fatalf("position moved before tick: %v", got.Position)
 	}
 	// Restart, pulse exactly one manual tick, stop, then observe.
-	cancel2, done2 := runOwner(t, e)
+	cancel2, done2 := runOwner(t, e, clk)
 	currentTicker(clk).pulse(ingressTestTick)
 	waitForTick(t, e, 1)
 	stopOwner(t, cancel2, done2)
@@ -457,8 +488,9 @@ func TestEnqueueMoveRealEngine(t *testing.T) {
 }
 
 func TestEnqueueMoveDuplicateStale(t *testing.T) {
-	e := ingressEngine(t, newManualClock(), openCollision{})
-	cancel, done := runOwner(t, e)
+	clk := newManualClock()
+	e := ingressEngine(t, clk, openCollision{})
+	cancel, done := runOwner(t, e, clk)
 	defer stopOwner(t, cancel, done)
 	ctx := context.Background()
 	snap, err := e.EnqueueAddEntity(ctx, world.Vec3{})
@@ -502,7 +534,7 @@ func TestEnqueueMoveMigrationQueue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("beginHandoff: %v", err)
 	}
-	cancel, done := runOwner(t, e)
+	cancel, done := runOwner(t, e, clk)
 	ctx := context.Background()
 	mk := func(seq uint32) MoveIntent {
 		return MoveIntent{InputSeq: seq, HeldDirs: MoveDirForward, Yaw: 0, SampleTick: 0}
@@ -529,7 +561,7 @@ func TestEnqueueMoveMigrationQueue(t *testing.T) {
 func TestIngressRaceRunPlusMoves(t *testing.T) {
 	clk := newManualClock()
 	e := ingressEngine(t, clk, openCollision{})
-	cancel, done := runOwner(t, e)
+	cancel, done := runOwner(t, e, clk)
 	ctx := context.Background()
 	snap, err := e.EnqueueAddEntity(ctx, world.Vec3{})
 	if err != nil {
@@ -580,7 +612,7 @@ func TestIngressPropertyModel(t *testing.T) {
 		live := make(map[EntityID]bool)
 		lastTick := uint32(0)
 		start := func() {
-			runCancel, runDone = runOwner(t, e)
+			runCancel, runDone = runOwner(t, e, clk)
 			running = true
 		}
 		stop := func() {
