@@ -183,7 +183,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   hooks, other special spell-damage formulas needed by the MVP. Still no
   authoritative HP mutation, no room/world-object scheduler, no gateway, no
   real inventory/reagent mutation. Spec: §9.3b (frozen v0.3.28).
-- [ ] **M5-T4a** Authoritative vitals state/mutation/math core (pure/value
+- [x] **M5-T4a** Authoritative vitals state/mutation/math core (pure/value
   sim-domain only): canonical `PlayerVitals` (HP/BaseMaxHP/MaxHP/Mana/
   MaxMana/Vigor/RestThreshold/Exertion-accumulator/Stomach), HP mutation
   trio (loss, normal heal, over-max heal), base-max/max-HP primitives,
