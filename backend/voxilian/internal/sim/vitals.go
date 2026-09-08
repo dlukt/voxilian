@@ -386,8 +386,11 @@ func LoseMana(v PlayerVitals, amount int) (PlayerVitals, int, error) {
 
 // GainMana freezes source GainMana both modes (spec §9.4.15). Negative
 // amount is a domain error. Uncapped gains may exceed MaxMana (audit
-// finds no source upper bound); capped gains clamp to MaxMana. Returns
-// the actual gained amount.
+// finds no source upper bound) and return amount. Capped gains clamp to
+// MaxMana and return the EXACT source delta amount - (tempMana - MaxMana),
+// which is NEGATIVE when Mana already starts above MaxMana (source-faithful
+// corner, analogous to GainHealthOvercap): 23/20 +5 capped -> Mana 20,
+// gain -3. The equivalent MaxMana - Mana form below is overflow-safe.
 func GainMana(v PlayerVitals, amount int, capped bool) (PlayerVitals, int, error) {
 	if err := v.Validate(); err != nil {
 		return v, 0, err
@@ -397,23 +400,16 @@ func GainMana(v PlayerVitals, amount int, capped bool) (PlayerVitals, int, error
 	}
 	sum, ok := checkedAdd(int64(v.Mana), int64(amount))
 	if !ok {
-		if capped {
-			gained := v.MaxMana - v.Mana
-			if gained < 0 {
-				gained = 0
-			}
-			v.Mana = v.MaxMana
-			return v, gained, nil
+		// Non-negative operands overflowed: the temporary mana exceeds
+		// any MaxMana. Uncapped cannot represent the result; capped
+		// falls through to the clamp with the overflow-safe delta.
+		if !capped {
+			return v, 0, fmt.Errorf("sim: vitals gain mana %d: %w", amount, ErrInvalidManaAmount)
 		}
-		return v, 0, fmt.Errorf("sim: vitals gain mana %d: %w", amount, ErrInvalidManaAmount)
+		return applyManaCap(v)
 	}
 	if capped && sum > int64(v.MaxMana) {
-		gained := v.MaxMana - v.Mana
-		if gained < 0 {
-			gained = 0
-		}
-		v.Mana = v.MaxMana
-		return v, gained, nil
+		return applyManaCap(v)
 	}
 	out, ok := toInt(sum)
 	if !ok {
@@ -421,6 +417,20 @@ func GainMana(v PlayerVitals, amount int, capped bool) (PlayerVitals, int, error
 	}
 	v.Mana = out
 	return v, amount, nil
+}
+
+// applyManaCap resolves the capped clamp: Mana = MaxMana, returning the
+// exact source delta amount - (tempMana - MaxMana) via the algebraically
+// identical overflow-safe form MaxMana - Mana (tempMana - amount == Mana
+// exactly). Negative when Mana starts above MaxMana; never overflows:
+// Mana is in [0, MaxInt64] and MaxMana >= 1, so the difference fits int64.
+func applyManaCap(v PlayerVitals) (PlayerVitals, int, error) {
+	gained, ok := toInt(int64(v.MaxMana) - int64(v.Mana))
+	if !ok {
+		return v, 0, fmt.Errorf("sim: vitals gain mana cap: %w", ErrInvalidManaAmount)
+	}
+	v.Mana = v.MaxMana
+	return v, gained, nil
 }
 
 // HasVigor freezes source HasVigor exactly (spec §9.4.18): STRICT `>`,

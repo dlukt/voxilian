@@ -308,11 +308,12 @@ func TestLoseGainManaGoldens(t *testing.T) {
 	if err := nv.Validate(); err != nil {
 		t.Fatalf("uncapped-above-max state invalid: %v (Mana<=MaxMana is NOT an invariant)", err)
 	}
-	// Capped gain while already above max: stays, gains 0.
+	// Capped gain while already above max: source-faithful corner —
+	// temp 28, gain = 5-(28-20) = -3, Mana clamped to 20.
 	vv.Mana, vv.MaxMana = 23, 20
 	nv, g, err = GainMana(vv, 5, true)
-	if err != nil || nv.Mana != 20 || g != 0 {
-		t.Fatalf("capped 23/20+5 = (%+v,%d,%v), want (20,0,nil)", nv, g, err)
+	if err != nil || nv.Mana != 20 || g != -3 {
+		t.Fatalf("capped 23/20+5 = (%+v,%d,%v), want (20,-3,nil)", nv, g, err)
 	}
 	if _, _, err := GainMana(v, -1, true); !errors.Is(err, ErrInvalidManaAmount) {
 		t.Fatalf("negative mana gain err = %v, want ErrInvalidManaAmount", err)
@@ -321,6 +322,62 @@ func TestLoseGainManaGoldens(t *testing.T) {
 	nv, d, err := AdjustMaxMana(v, 6)
 	if err != nil || nv.MaxMana != 26 || d != 6 {
 		t.Fatalf("maxmana +6 = (%+v,%d,%v), want (26,6,nil)", nv, d, err)
+	}
+}
+
+// TestGainManaCappedCorners pins the exact source delta in capped mode
+// across the cap boundary, including the already-above-max corner where
+// the nominal gain reduces Mana and the returned delta is negative
+// (source iManaGained = amount - (tempMana - MaxMana)).
+func TestGainManaCappedCorners(t *testing.T) {
+	v := mustVitals(t) // mana 20/20
+	for _, tc := range []struct {
+		mana, max, amount int
+		capped            bool
+		after, gained     int
+	}{
+		{10, 20, 5, true, 15, 5},   // below max, cap not reached
+		{18, 20, 5, true, 20, 2},   // near max, cap reached
+		{20, 20, 5, true, 20, 0},   // exactly at max
+		{23, 20, 5, true, 20, -3},  // above max: temp 28, 5-(28-20)
+		{23, 20, 2, true, 20, -3},  // amount smaller than excess (3)
+		{23, 20, 3, true, 20, -3},  // amount equal to excess
+		{23, 20, 10, true, 20, -3}, // amount larger than excess
+		{21, 20, 0, true, 20, -1},  // zero amount still clamps: 0-(21-20)
+		{23, 20, 5, false, 28, 5},  // uncapped over-max unchanged
+		{20, 20, 5, false, 25, 5},  // uncapped from max
+		{10, 20, 5, false, 15, 5},  // uncapped below max
+	} {
+		vv := v
+		vv.Mana, vv.MaxMana = tc.mana, tc.max
+		nv, g, err := GainMana(vv, tc.amount, tc.capped)
+		if err != nil {
+			t.Fatalf("GainMana(%d/%d,%d,%v): unexpected err %v",
+				tc.mana, tc.max, tc.amount, tc.capped, err)
+		}
+		if nv.Mana != tc.after || g != tc.gained {
+			t.Fatalf("GainMana(%d/%d,%d,%v) = (%d,%d), want (%d,%d)",
+				tc.mana, tc.max, tc.amount, tc.capped, nv.Mana, g, tc.after, tc.gained)
+		}
+		if g != nv.Mana-tc.mana {
+			t.Fatalf("delta identity: GainMana(%d/%d,%d,%v) gained %d != %d-%d",
+				tc.mana, tc.max, tc.amount, tc.capped, g, nv.Mana, tc.mana)
+		}
+	}
+	// Hostile magnitudes: no overflow, no sign flip.
+	vv := v
+	vv.Mana, vv.MaxMana = math.MaxInt, 20
+	nv, g, err := GainMana(vv, 1, true)
+	if err != nil || nv.Mana != 20 || g != 20-math.MaxInt {
+		t.Fatalf("hostile capped = (%+v,%d,%v), want (20,%d,nil)", nv, g, err, 20-math.MaxInt)
+	}
+	if _, _, err := GainMana(vv, 1, false); !errors.Is(err, ErrInvalidManaAmount) {
+		t.Fatalf("hostile uncapped err = %v, want ErrInvalidManaAmount", err)
+	}
+	vv.Mana = math.MaxInt - 5
+	nv, g, err = GainMana(vv, 5, true)
+	if err != nil || nv.Mana != 20 || g != 20-(math.MaxInt-5) {
+		t.Fatalf("hostile capped edge = (%+v,%d,%v)", nv, g, err)
 	}
 }
 
@@ -883,7 +940,12 @@ func FuzzLoseGainMana(f *testing.F) {
 			t.Fatalf("capped invariant: (%d/%d+%d) -> (%+v,%d,%v)", mana, max, amt, ng, gained, err)
 		}
 		nu, gainedU, err := GainMana(v, amt, false)
-		if err != nil || nu.Mana < 0 || gainedU != amt {
+		if err != nil {
+			// Only hostile sum overflow may error on valid domains.
+			if !errors.Is(err, ErrInvalidManaAmount) {
+				t.Fatalf("uncapped: want overflow domain err, got %v", err)
+			}
+		} else if nu.Mana < 0 || gainedU != amt {
 			t.Fatalf("uncapped invariant: (%d/%d+%d) -> (%+v,%d,%v)", mana, max, amt, nu, gainedU, err)
 		}
 	})
