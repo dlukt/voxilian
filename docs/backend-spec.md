@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.31 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.32 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -4550,10 +4550,14 @@ pgx/generated sqlc; tests may use pgx/raw SQL for fixtures only.
 - Trade/bank/vault: offer/counter/accept state machine with both-party
   re-confirm; trades are single PG transactions; lawful-refusal + PK-tag rules
   ported.
-- Death: corpse spawn + full droppable drop, advancement wipe/halve,
-  Underworld-region respawn (HP 1/Mana 1/Vigor÷4), leaving-penalty
-  (cost 100 → newbie /3; −1 HP / −1–2 skills w/ Stam saves); Portal-of-Life
-  mitigation hook reserved.
+- Death: TWO-PHASE lifecycle per source `Killed`/`ApplyDeathPenalties`
+  (normative freeze §9.5): immediate real-death entry (disposition
+  avoided/cheap/normal, corpse, ordered droppable drop with PK-protection
+  plan, advancement reset/halve, post-death vitals, Underworld-phase entry)
+  and delayed Underworld-exit penalties (resolved DeathCost scaling,
+  BaseMaxHP penalty, per-ability losses, justice hooks). "Single-txn
+  state+ledger" (D7/§8.1) applies WITHIN each phase's durable mutation —
+  never across the whole lifecycle.
 - Phase 2 (reserved, not MVP): guilds, factions/territory, justice, assassin
   game, Jala hinder matrix — schema MUST NOT preclude them (flags/ledger/kills
   already carry what they need).
@@ -7914,6 +7918,359 @@ special cases. Consequences:
   invalid MaxMana, so no user-controlled input can create a panic path
   through invalid stored vitals.
 
+### 9.5 M5-T5 death pipeline (normative freeze, v0.3.32)
+
+Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
+`SetDeathCost`/`CreateCorpse`/`ChangeSpellAbility`/`ChangeSkillAbility`,
+`user.kod` `UserGotoDeadRoom`, `uworld.kod` `LeaveHold`/`ZaptoCorpse`,
+`body.kod`, `portlife.kod`, `item.kod` `DropOnDeath`, `settings.kod`
+`GetDefaultDeathCost` — audited 2026-09-08 against upstream commit
+`095c07b69e957fb5c49593e6ad488b4c64ba088d`; reconciled in
+`meridian59.md` §9.5. Source wins over older paraphrases.
+
+#### 9.5.1 Ownership split and the two-phase lifecycle
+
+M5-T5 is FOUR tasks (this section is their shared boundary):
+
+- **T5a — pure/source-faithful death mechanics and immutable plans**
+  (§9.5.4–§9.5.14 pure surface; §9.5.17 non-scope).
+- **T5b1 — durable immediate death-entry transaction** (§9.5.8, §8.1/§8.3
+  rules): one atomic critical Store operation conceptually
+  `CommitDeathEntry(ctx, plan)` covering pending-death recovery state,
+  character immediate death state, corpse row, droppable item relocation,
+  PK-drop metadata, advancement immediate reset/halve, kill/ledger audit —
+  plus stale/crash/commit-ambiguity proof.
+- **T5b2 — durable delayed Underworld-exit penalties** (§9.5.11–§9.5.13):
+  one SEPARATE atomic critical Store operation conceptually
+  `CommitDeathPenalties(ctx, plan)` covering pending-DeathCost consumption,
+  HP/ability penalties, clearing pending-death state, character/ability CAS
+  + ledger — plus the same proof obligations.
+- **T5c — live runtime + transport integration**: zero-HP → death
+  orchestration, dead/Underworld state, resolved world-target seams
+  (§9.5.15), rest/regen cancellation/composition, C→S 120, S→C 214/215,
+  reconnect/crash recovery, end-to-end lifecycle proof.
+
+Death is TWO durable phases mirroring source. Phase 1 (immediate
+real-death entry) and phase 2 (Underworld exit) are separate atomic
+critical transactions; NO database transaction remains open between them.
+The old phrase "single-txn state+ledger" means each phase's own mutation
+is atomic with its audit rows (§8.1) — never one transaction spanning the
+lifecycle.
+
+#### 9.5.2 Death disposition: avoided vs cheap vs normal (frozen)
+
+Three dispositions, semantically distinct:
+
+```text
+Avoided — not a death: HP set to 1, regen recreated, special-item
+          cheap-death activation, RETURN. No corpse, no drop, no
+          Underworld, no kill record.
+Cheap    — a real death (corpse IS created, death pipeline runs) with
+          zero drop/penalty cost (DeathCost = 0): chaos/frenzy night,
+          death in the newbie room range, newbie-honor string, or Token
+          death. Advancement is NOT reset. Special-item forced loss
+          (artifact re-entering circulation) still happens.
+Normal   — real death with DeathCost = the settings-sourced default.
+```
+
+Avoided conditions (source `Killed` early-return; all RESOLVED inputs):
+arena-and-in-play-and-not-arena-real-death; prison-room class;
+safe-player-attack room. World/game-mode facts (frenzy night, room
+newbie-zone membership, honor-string newbie status, carried-token,
+safe-player-attack, arena state) arrive as RESOLVED booleans. T5a MUST
+NOT assign `world.VolumeFlags` bits (no ROOM_SAFE_DEATH, no
+ROOM_NO_COMBAT, no arena/newbie bits) and no source room IDs (e.g.
+1010–1018) appear in pure mechanics; §5.3.5 remains the only volume-flag
+authority and later live integration resolves these facts.
+
+Sequencing freeze: the special-item forced-loss notification is emitted
+(1) in the avoided branch, and (2) after cheap-death determination but
+BEFORE the token check — so a Token death (which sets cheap) still loses
+the artifact. Token death additionally marks the token unused. The kill
+record/broadcast is written for every real death (cheap included), after
+the special-item block.
+
+#### 9.5.3 Double-death guard
+
+Source rejects a second death while `now < lastDeathTime + 2` whole
+seconds (strict `<`; exactly +2 s proceeds). T5a exposes this as a pure
+decision helper over (lastDeathSeconds, nowSeconds) plus the frozen
+2-second constant; T5c later owns runtime gating on the deterministic
+tick clock. No wall-clock timer in T5a.
+
+#### 9.5.4 Corpse policy (constants and metadata only in T5a)
+
+Frozen source facts (player corpses):
+
+```text
+decompose lifetime            = 600000 ms
+initial pickup/no-steal period= 25000 ms (only the corpse's own player)
+death-time scalar             = whole seconds (Portal-of-Life age input)
+resurrected flag              = at most ONE Portal of Life per corpse
+corpse identity/owner         = owning player + death position
+```
+
+Cheap real deaths create the SAME corpse (creation is unconditional for
+real deaths). Corpse expiration does NOT cancel the pending Underworld
+death state (a corpse may expire while its player is still dead;
+Portal-of-Life then can no longer target it — §9.5.10). T5a exposes
+these as immutable constants/plan fields ONLY: no corpse entity, no DB
+row, no timer (T5b1 owns the corpse row; T5c owns expiry).
+
+#### 9.5.5 Drop plan (resolved per-item policy inputs)
+
+Normal death iterates the two flat inventory families in source order
+(active-then-passive) and drops an item iff the room can accept it, the
+room movement check passes, AND the item's resolved policy says
+drop-on-death. Voxilian freezes the input contract:
+
+```go
+type DeathItemInput struct {
+    Key             // opaque deterministic identity for plan output
+    DropOnDeath     bool // resolved item policy (base true; shields/
+                         // rings/keys/crystals/item-attribute vetoes false)
+    ForcedCheapLoss bool // special-item artifact loss notification
+}
+```
+
+No catalog lookup, no PG, no live inventory walk, no item classes, no
+invented item IDs in T5a. Containers: source has NO nested player
+inventory (two flat lists); the plan is exactly the ordered inputs — no
+recursive descent is invented. The output plan preserves input order and
+records per dropped item: drop destination (to-death-position; source
+drops items at the death square unmerged), and PK-protection metadata
+WHEN the killer was a player:
+
+```text
+NeedsPKProtection bool   // killer was a player (resolved input)
+PKProtectionDurationMs = 600000 (source PKPOINTER_TIME = 10*60*1000)
+```
+
+The PK-protection POLICY (non-PK-enabled players cannot pick the item up;
+the victim always can) is frozen here; its STORAGE (enchants JSON vs
+column vs table vs corpse metadata) is a T5b1 persistence decision after
+schema audit — T5a must not invent one. Cheap deaths produce an empty
+drop plan but still produce the special-item forced-loss flags.
+
+#### 9.5.6 Immediate advancement plan (normal death only)
+
+Frozen source result: advancement points → 0; gain chance → integer half
+(truncation toward zero — the value is usually negative); gain flags
+reset (did-damage/took-damage/dodged + kill target); atrophy marks reset
+(spell entries marked unused; the atrophy feature itself stays disabled).
+All four are durable character-advancement state in Voxilian (written by
+T5b1); T5a returns them as an immutable plan value. Cheap/avoided deaths
+change none of these.
+
+#### 9.5.7 Immediate post-death vitals
+
+Frozen branch order (real deaths only):
+
+```text
+frenzy death:   HP = MaxHP/2, Mana = MaxMana/2, Vigor = 100
+ordinary death: HP = 1, Mana = 1, Vigor = bound(Vigor/4, 0, 50)
+                then vigor normalization bound 1..200 (0 becomes 1)
+angel-mail override (cost > 0 AND still-newbie AND not murderer):
+                Mana = MaxMana/2 + 2
+```
+
+Still-newbie is a resolved input (source `PFLAG_TUTORIAL` is TRUE = NO
+LONGER a newbie; "still newbie" = flag false). T5a exposes a pure helper
+returning the planned post-death `PlayerVitals` (reusing the §9.4 value
+type; result MUST pass `PlayerVitals.Validate()`; integer truncation and
+0→1 vigor floor exact). No live `Engine`/entity mutation, no timer
+scheduling (T5c recreates regen timers per §9.4b).
+
+#### 9.5.8 Durable pending-death representation (schema audit result)
+
+The CURRENT schema cannot safely represent the state between immediate
+death and Underworld exit: `corpses` carries no death-cost/death-time/
+portal state, `characters.vitals/advancement/flags` have no
+pending-death phase semantics, and hiding lifecycle state inside
+`advancement` JSON or `flags` bits has no established extensibility
+contract (§9 creation freezes `advancement = {}`, `flags = 0`). Between
+the phases the server must durably recover at least: the player is
+pending death penalties, the effective current DeathCost (a reduced
+Portal-of-Life cost MUST survive crash/reconnect), the death time (whole
+seconds) needed by Portal of Life, the corpse association, and the
+Underworld/dead lifecycle phase. A process crash/reconnect MUST NOT:
+erase a reduced Portal-of-Life DeathCost, apply penalties twice, skip
+penalties, create a second corpse/drop, or return the player alive for
+free.
+
+DECISION: T5b1 adds ONE narrow goose migration for a durable
+pending-death representation (exact shape is T5b1's after schema audit —
+e.g. a `pending_deaths` table keyed by character carrying phase,
+effective death cost, death-time scalar, corpse id, and a
+consumed-once/cleared marker with the character aggregate's CAS rules).
+T5a implements NOTHING durable; a pure, persistence-agnostic
+pending-death plan value (phase, effective cost, death-time scalar,
+corpse-policy result) MAY be defined for T5b1 to persist.
+
+#### 9.5.9 DeathCost domain
+
+The default cost comes from server settings (source default 100,
+per-server overrides 90/60, documented domain 1..100). The pure planner
+RECEIVES the default cost as an explicit input and validates it in
+1..100; it must not silently assume 100. Zero means cheap (no penalties,
+no drops). A Portal-reduced cost is 5..80 (§9.5.10); runtime pending
+costs live in 0..100.
+
+#### 9.5.10 Portal of Life (pure calculation in T5a)
+
+Frozen source formula over (pendingCost, corpseAgeSeconds, spellPower):
+
+```text
+timeAdj = age < 60 ? -(60 - age)      // age 0 → -60 … age 59 → -1 (bonus)
+                  : age/10 - 6        // age 60 → 0 … age 600 → +54 (penalty)
+newCost = pendingCost - (spellPower - timeAdj)
+newCost = bound(newCost, 5, 80)       // integer arithmetic, truncating /
+```
+
+Whole-second ages; the 60-second boundary is strict (`<`); `/10` integer
+truncation; spell power domain 1..99 (§9.3a). Once per corpse: a corpse
+that already received a Portal cannot receive another (source
+resurrected flag; T5b1 persists it with the corpse/pending-death state).
+`SetDeathCost` semantics: the pending cost only LOWERS (a later, worse
+portal result cannot raise it; override is admin-only, out of scope).
+Voxilian validation policy (frozen): negative age is a domain error;
+ages beyond the corpse lifetime are accepted by the formula but the
+runtime (T5c) may not offer expired corpses; invalid power (< 1, > 99)
+is a domain error BEFORE any RNG or mutation. T5a implements ONLY the
+pure calculation — no spell/corpse lookup, no gateway, no timer, no DB.
+
+#### 9.5.11 Delayed DeathCost normalization (T5a pure, T5b2 durable)
+
+Frozen branch order at Underworld exit:
+
+```text
+1. frenzy active at exit → clear haunted flag, NO penalties at all
+2. cost >= default (no portal mitigation) → clear outlaw flag,
+   re-evaluate PK status, clear haunted flag
+3. cost > 0:
+     still-newbie AND not murderer → cost = cost / 3 (truncation; no HP roll)
+     ELSE (experienced OR murderer)  → HP-loss roll (§9.5.12)
+4. guild-quit check (§9.5.14) — runs on every non-frenzy exit, even cost 0
+5. ability losses (§9.5.13)
+6. pending cost cleared to 0
+```
+
+Newbie status here is the resolved still-newbie boolean (§9.5.7) — NOT
+inferred from HP. Murderer is a resolved boolean. The murderer loss
+severity decision is read AFTER step 2's flag clears (source order; the
+PK re-evaluation is async and does not feed this check).
+
+#### 9.5.12 Delayed BaseMaxHP penalty (T5a composes T4a)
+
+The HP-loss roll happens only in the experienced-or-murderer branch with
+cost > 0, with boundary `roll <= cost` (roll EXACTLY cost loses — note
+this differs from the ability cost roll §9.5.13). On loss:
+`AdjustBaseMaxHP(vitals, -1, stamina)` — base floor 20 — and the SAME
+actual delta flows into `AdjustMaxHP` (source `GainBaseMaxHealth`
+followed by `GainMaxHealth` with the reported delta); current HP is NOT
+changed. T5a MUST compose the existing §9.4.4/§9.4.5 production helpers
+and MUST NOT rederive their bounds. Minimum behavior pinned: base 20
+loss → delta 0, nothing changes.
+
+#### 9.5.13 Ability penalties and RNG consumption order (frozen)
+
+For every spell then every skill (caller-supplied canonical order):
+
+```text
+eligible iff current ability > 5        (5 never eligible; 99 eligible)
+stamina save: roll > Stamina → save FAILED (roll == Stamina saves;
+              effective Stamina 1..70, resolved input)
+death-cost roll: roll < cost → ability lost (roll == cost saves)
+loss: -2 if murderer else -1
+result ability = bound(ability + loss, 1, 99)   (6 − 2 → 4; clamp is 1)
+```
+
+RNG consumption order (deterministic replay contract): HP roll first
+(when §9.5.11 routes to it), then spells in order, then skills in order.
+Within one ability: the stamina roll is consumed for every ELIGIBLE
+ability; the cost roll is consumed ONLY when the stamina save fails
+(short-circuit AND). An ineligible ability consumes NO rolls. A failed
+stamina save consumes the cost roll even when cost is 0 (the comparison
+still evaluates). Uses the existing injected `RNG`/`RollD100` seam; no
+`math/rand`. Output states exactly which abilities lose how much
+(ordered plan); no live ability-collection mutation. Validation of all
+inputs precedes the first roll.
+
+#### 9.5.14 Justice/guild/PK side-effect hook flags (classification)
+
+T5a outputs pure booleans; each is classified for later ownership:
+
+```text
+clearOutlaw        — T5b2 durable core state (cost >= default branch)
+clearHaunted       — T5b2 durable core state (both frenzy and full-cost)
+reEvaluatePKStatus — future phase-2 justice integration hook (flag now)
+quitGuild          — base BaseMaxHP < PKILL_ENABLE_HP (30) after penalties;
+                     future phase-2 guild integration hook (flag now);
+                     NOT live guild state on the player entity
+guardianAngelMail  — presentation/message only (mail system is post-MVP);
+                     the mana side-effect rides §9.5.7 vitals instead
+soldierShieldDied  — future item-hook integration (flag now)
+karmaBoobyPrize    — deferred content hook (M9 protos); plan flag now
+specialItemLoss    — resolved per-item forced-loss flag (§9.5.5)
+```
+
+No absent guild/faction/justice system is implemented in T5a; no fake
+guild state exists on the player entity.
+
+#### 9.5.15 Underworld target is resolved, not hard-coded
+
+No RID_UNDERWORLD, no Meridian row/column coordinates, no invented
+Voxilian coordinates in T5 tasks. Newbie-range deaths respawn at the
+resolved newbie-home placement; other deaths at the resolved
+Underworld-placement seam; both are T5c live-integration inputs (M10-T2b
+authors the real classic Underworld source). T5a performs NO world
+lookup.
+
+#### 9.5.16 Wire ownership (unchanged)
+
+The frozen codecs stand: C→S `120 respawn_ack {}`; S→C `214 death {victim
+u32}`; S→C `215 respawn {pos}` (§6.3). No second death wire protocol.
+T5a touches no proto/gateway code. T5c owns routing/state-machine
+integration incl. opcode 120 handling (rate-gated then delegated per
+§7.3.2 until then).
+
+#### 9.5.17 T5a pure surface and non-scope (binding)
+
+T5a delivers small pure functions + plain comparable structs in
+`internal/sim` covering: disposition decision (§9.5.2), double-death
+guard (§9.5.3), corpse constants (§9.5.4), ordered drop plan + PK
+metadata (§9.5.5), advancement plan (§9.5.6), post-death vitals
+(§9.5.7), persistence-agnostic pending-death plan value (§9.5.8),
+DeathCost validation (§9.5.9), Portal-of-Life cost (§9.5.10), delayed
+cost normalization (§9.5.11), HP penalty via T4a composition (§9.5.12),
+ability penalty plan + RNG order (§9.5.13), hook flags (§9.5.14).
+NON-SCOPE: live entity mutation, Store/PG imports, corpse DB rows, item
+mutation, gateway/proto changes, Underworld teleport, respawn, opcode
+120, timers, `internal/sim` importing `internal/store`/pgx/sqlc, any
+T5b1/T5b2/T5c/T6/T7 work. Stale-revision/commit-ambiguity behavior for
+T5b1/T5b2 follows §8.1/§8.3 exactly; no PG call occurs on the sim owner
+goroutine.
+
+#### 9.5.18 Test minimums (T5a)
+
+Avoided/cheap/normal matrix with corpse/drop/penalty/Underworld-plan
+differences and each cheap condition pinned separately (frenzy, newbie
+room, honor, token + token-still-loses-artifact ordering); corpse
+constants; post-death vitals boundary vectors (low/non-divisible/high
+vigor, cap 50, 0→1 floor, frenzy branch, angel-mana override) all
+`Validate()`-clean; advancement exact results; ordered drop plan
+(droppable/undroppable/mixed/cheap/PK vs non-PK); Portal-of-Life golden
+vectors (ages 0/59/60/61/later/lifetime-edge, power min/max, bounds 5
+and 80, truncation, invalid inputs); cost scaling (ordinary/newbie/3/
+murderer/zero); HP roll boundary (roll == cost) independent from ability
+boundaries (stamina ==, cost ==); eligibility 5/6/99; murderer clamp
+6−2→4; spell-vs-skill separation; scripted-RNG full-consumption-order
+proof (HP → spells → skills; ineligible and saved rolls consume exactly
+as frozen); hook flags; bounded property loops over DeathCost/vigor/
+BaseMaxHP/Stamina 1..70/ability 1..99/power 1..99/corpse ages with
+value invariants and no panics on hostile integers (overflow-safe
+arithmetic).
+
 ## 10. Config / deployment / ops
 
 - Config: env + file (`config.yaml` default, env override `VOX_*`); MUST
@@ -8069,6 +8426,37 @@ special cases. Consequences:
    survives it.
 
 ## 14. Version history
+
+- v0.3.32: freeze M5 death semantics and split M5-T5 into T5a/T5b1/T5b2/T5c
+  (normative §9.5): source-audited two-phase lifecycle (immediate
+  `Killed`-equivalent death entry as ONE atomic critical transaction;
+  delayed Underworld-exit `ApplyDeathPenalties`-equivalent as a SEPARATE
+  one; no open transaction between); avoided-vs-cheap-vs-normal
+  disposition with resolved world/game-mode inputs and no volume-flag or
+  source-room-ID leakage into pure mechanics; 2-second double-death guard;
+  corpse constants (600000 ms decompose, 25000 ms no-steal, whole-second
+  death time, once-per-corpse Portal flag); ordered drop plan from
+  resolved per-item policy with PK-protection policy (10 min) separated
+  from its future storage; immediate advancement plan (points 0, gain
+  chance truncated-half, gain/atrophy resets); immediate post-death
+  vitals (frenzy half/max vs 1/1/vigor÷4-cap-50 with 0→1 floor and
+  still-newbie angel-mana override); durable pending-death DECISION —
+  current schema insufficient, T5b1 will add ONE narrow migration;
+  settings-sourced DeathCost 1..100; exact Portal-of-Life formula
+  (60-second strict boundary, /10 truncation, bound 5..80,
+  lowers-only); delayed penalty branch order with exact d100 boundaries
+  (HP roll `<=` cost vs ability rolls stamina `>` / cost `<`), eligibility
+  > 5, clamp 1..99, murderer −2, still-newbie /3 with the inverted
+  source PFLAG_TUTORIAL reading; RNG consumption order; justice/guild
+  hook-flag classification; resolved Underworld placement seam;
+  unchanged 120/214/215 wire ownership; T5a pure surface + non-scope +
+  test minimums; `internal/sim` must not import store/pgx/sqlc and no PG
+  on the sim owner goroutine; T5b1 `CommitDeathEntry` / T5b2
+  `CommitDeathPenalties` conceptual boundaries under §8.1/§8.3 rules.
+  Reconciled `meridian59.md` §9.5 against source (avoided-vs-cheap
+  distinction, PFLAG_TUTORIAL inversion, exact roll boundaries, angel
+  mail/mana, newbie-range respawn target, PK pointer/cheap-death
+  sequencing, corpse metadata) + verified corrections recorded.
 
 - v0.3.31: narrow M5-T4b2 composition freeze closing the three
   implementation-architecture gaps exposed by the completed T4b1

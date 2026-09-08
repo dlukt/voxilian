@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.15)
+# Voxilian Backend — Implementation Plan (v1.16)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.31).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.32).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -231,11 +231,50 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   before EntityID consumption, no default stats); §9.4b.10 explicit
   armed/present deadline bit.
   Spec: §9.4b.1, §9.4b.3a, §9.4b.10–§9.4b.17, §9.4b.19, §9.4b.21–§9.4b.22.
-- [ ] **M5-T5** Death pipeline: corpse + full droppable drop (PK tags), advancement wipe/halve, Underworld-region respawn, leaving penalties (Stam saves), Portal-of-Life hook; single-txn state+ledger. Crash-during-death test. Spec: §9, §8.1.
+- [ ] **M5-T5a** Pure/source-faithful death mechanics and immutable
+  planning: disposition decision (avoided/cheap/normal from RESOLVED
+  inputs), double-death guard decision, corpse policy constants, ordered
+  drop plan from resolved per-item policy + PK-protection metadata,
+  immediate advancement reset/halve plan, post-death vitals calculation
+  (Validate-valid `PlayerVitals`), persistence-agnostic pending-death
+  plan value, DeathCost validation, Portal-of-Life pure cost, delayed
+  cost normalization/newbie scaling, delayed BaseMaxHP penalty via T4a
+  composition, per-spell/per-skill penalty planning with exact frozen
+  d100 boundaries + RNG consumption order, justice/guild hook flags.
+  NO live mutation, NO Store/PG, NO corpse DB row, NO gateway/proto,
+  NO Underworld teleport, NO respawn, NO opcode 120, NO migration.
+  Spec: §9.5 (frozen v0.3.32), meridian59 §9.5.
+- [ ] **M5-T5b1** Durable immediate death-entry transaction (depends on
+  T5a): ONE atomic critical Store operation conceptually
+  `CommitDeathEntry(ctx, plan)` covering pending-death recovery state
+  (incl. the §9.5.8 narrow migration — current schema is insufficient),
+  character immediate death state, corpse row, droppable item
+  relocation, PK-drop metadata persistence (schema-audited choice),
+  advancement immediate reset/halve, kill/ledger audit rows in the same
+  txn; stale-revision/crash/commit-ambiguity proof per §8.1/§8.3.
+  Spec: §9.5.1, §9.5.8, §9.5.18.
+- [ ] **M5-T5b2** Durable delayed Underworld-exit penalties (depends on
+  T5a + the durable pending-death representation frozen in T5b1): ONE
+  separate atomic critical Store operation conceptually
+  `CommitDeathPenalties(ctx, plan)` covering pending DeathCost
+  consumption (Portal-of-Life lowers-only persistence), HP/ability
+  penalty application through character/ability CAS, justice flag
+  writes, clearing pending-death state, ledger rows in the same txn;
+  penalties-exactly-once, never-skip, stale/crash/commit-ambiguity
+  proof per §8.1/§8.3. Spec: §9.5.1, §9.5.11–§9.5.14.
+- [ ] **M5-T5c** Live runtime + transport death integration (depends on
+  T5b1 + T5b2 + T4b2): zero-HP → death orchestration on the sim owner
+  (composing LoseHealth's ZeroHP hook), dead/Underworld lifecycle state,
+  resolved world-target/placement seams (no hard-coded Underworld
+  coordinates), rest/regen cancellation/composition with §9.4b runtime,
+  C→S 120 RespawnAck handling, S→C 214 Death / 215 Respawn transport,
+  reconnect/crash recovery through the durable pending-death state,
+  final end-to-end death lifecycle proof. Spec: §9.5.1, §9.5.15,
+  §9.5.16.
 - [ ] **M5-T6** Personal/world-light intents: `115 rest`, `116 eat` (hunger/vigor effects), `105 use` (skill/item dispatch incl. Second Wind), `119 safety_toggle`, `117/118 → 209` chat (+channel rules, length caps, rate limits). Owner of these opcodes: this task, no other. Spec: §6.3, §9.
 - [ ] **M5-T7** Authoritative attack/cast runtime integration (depends on
-  M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2, M5-T5,
-  M5-T6). Owns real C→S 103
+  M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2,
+  M5-T5-complete (T5a+T5b1+T5b2+T5c), M5-T6). Owns real C→S 103
   attack routing, real C→S 104 cast routing, typed sim-owner combat
   commands, composition of T1/T2/T3a/T3b mechanics, authoritative T4
   HP/mana/vigor mutation, T5 death handoff, T6 safety/personal-state
@@ -351,9 +390,12 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M5-T4a | M4-T1, M4-T2 | `backend/voxilian/internal/sim` (pure vitals state/math only: no entity fields, no timers, no gateway) |
 | M5-T4b1 | M5-T4a, M4-T1, M4-T2 | `backend/voxilian/internal/sim` (player-entity vitals attachment/inspection/mutation/dirty seam/run gate; no scheduling) |
 | M5-T4b2 | M5-T4b1 | `backend/voxilian/internal/sim` (deterministic vitals scheduling: deadlines, rest, acted-since-entry, stomach anchor) |
-| M5-T5 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2 | `backend/voxilian/internal/sim` (authoritative gameplay state; death composes owner-local vitals mutation and interacts with the rest lifecycle, so T4b must be complete) |
+| M5-T5a | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2 | `backend/voxilian/internal/sim` (pure death mechanics/plans only: no live vitals, no store, no gateway) |
+| M5-T5b1 | M5-T5a | `backend/voxilian/{migrations,queries,internal/store,internal/persist}` (durable immediate death entry; one narrow pending-death migration) |
+| M5-T5b2 | M5-T5a, M5-T5b1 | `backend/voxilian/{queries,internal/store,internal/persist}` (durable delayed penalties; no second migration unless audit requires) |
+| M5-T5c | M5-T5b1, M5-T5b2, M5-T4b2 | `backend/voxilian/internal/{sim,gateway}` (live death orchestration, 120/214/215, recovery) |
 | M5-T6 | M4-T1, M4-T2 | `backend/voxilian/internal/sim` + gateway only for its own listed personal intents |
-| M5-T7 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2, M5-T5, M5-T6 | `backend/voxilian/internal/{sim,gateway}` (authoritative 103/104 runtime integration) |
+| M5-T7 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2, M5-T5a, M5-T5b1, M5-T5b2, M5-T5c, M5-T6 | `backend/voxilian/internal/{sim,gateway}` (authoritative 103/104 runtime integration) |
 | M6-T1…T3 | M5-T1…T5 | `backend/voxilian/internal/sim` (progression) |
 | M7-T1 | M9-T1 (seed pipeline) + M1-T6b | `backend/voxilian/internal/sim`, `seed/` fixtures |
 | M7-T2a…c, T3, T4 | M4-T1…T3a, M1-T7b | `backend/voxilian/internal/sim` |
@@ -377,12 +419,44 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 106/107/108/109 get/drop/put/give | M7-T4 | world items |
 | 110–113 offer/counter/accept/cancel | M8-T1 | trade machine |
 | 114 buy | M8-T2 | vendor listings |
-| 120 respawn_ack | M5-T5 | death pipeline |
+| 120 respawn_ack | M5-T5c | death pipeline live integration |
 | 121–123 char CRUD, 126 leave | M3-T3b | lifecycle |
 | 124 enter_world | M3-T4a baseline, M3-T4b takeover | lifecycle |
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.16: freeze M5 death semantics after the upstream source audit
+  (spec v0.3.32 §9.5) and replace the oversized single M5-T5 row with
+  four tasks: T5a pure/source-faithful death mechanics + immutable
+  plans (disposition avoided/cheap/normal from resolved inputs,
+  double-death guard, corpse constants, ordered drop plan + PK
+  protection policy, advancement reset/halve plan, post-death vitals,
+  persistence-agnostic pending-death plan value, DeathCost domain,
+  Portal-of-Life pure formula, delayed cost scaling/HP penalty/ability
+  penalties with exact d100 boundaries and RNG order, hook flags; no
+  store/gateway/proto/migration), T5b1 durable immediate death-entry
+  transaction (one narrow pending-death migration — current schema
+  audited insufficient; corpse row, item relocation, PK-drop metadata,
+  advancement reset, kill/ledger, crash/ambiguity proof), T5b2 durable
+  delayed Underworld-exit penalties (separate atomic transaction,
+  lowers-only Portal persistence, exactly-once proof), T5c live
+  runtime + transport integration (zero-HP orchestration, 120/214/215,
+  resolved world-target seams, recovery, end-to-end proof). M5-T7 now
+  depends on T5-complete (T5a+T5b1+T5b2+T5c), not merely T5a.
+  `meridian59.md` §9.5 rewritten against source: avoided-vs-cheap
+  distinction (arena/prison/safe-player-attack avoid death entirely;
+  frenzy/newbie-room/newbie-honor/token are cheap real deaths that
+  still create a corpse), PFLAG_TUTORIAL inversion (flag TRUE =
+  no-longer-newbie; still-newbie non-murderer gets cost/3, the
+  experienced-or-murderer branch rolls HP), HP roll boundary `<=` vs
+  ability rolls `>`/`<`, angel mail + mana (MaxMana/2)+2 override for
+  still-newbie non-murderers, newbie-range deaths respawn at the
+  newbie home rather than the Underworld, special-item artifact loss
+  ordering before the token check, PK pointer 10 min policy separated
+  from storage, corpse 600000/25000 ms constants, whole-second death
+  time, once-per-corpse Portal flag, KOD division = C truncation
+  toward zero. T5a/T5b1/T5b2/T5c, T6, T7, and M5 exit all stay `[ ]`.
 
 - v1.15: narrow M5-T4b2 composition freeze (spec v0.3.31 §9.4b.3a/
   §9.4b.10/§9.4b.14a/§9.4b.17/§9.4b.22) closing the three gaps exposed

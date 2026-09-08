@@ -630,16 +630,129 @@ fractions 20–25%). Attacking same-faction/intriguing boots you.
   minor-heal 1; >75/<−75 very hard. Gates Qor/Shalille. Examples: Lich/Ghost
   −100, Troll −75, Orc −40, Spider −30, Ant −10, Ent +40, Frogman/Avar +80.
 
-### 9.5 Death / ghost / logoff (`player.kod:Killed/ApplyDeathPenalties`, `logghost.kod`)
+### 9.5 Death / ghost / logoff (`player.kod:Killed/ApplyDeathPenalties`, `uworld.kod`, `body.kod`, `portlife.kod`; audited 2026-09-08)
 
-- Cheap (no drop/penalty, HP=1): arena non-real, prison OutOfGrace,
-  `SAFE_DEATH`, frenzy, newbie Raza/honor, Token death.
-- Else: corpse at death pos, drop all droppable (PK-tagged), advancement 0,
-  gain-chance halved, teleport Underworld (HP 1, Mana 1, Vigor /4 capped 50),
-  angel mail (+half mana if not murderer). On leaving (Portal of Life can
-  mitigate): outlaw/haunted cleared if full cost; newbie cost /3 else
-  `DeathCost%` (default 100) chance −1 MaxHP (Stam save); −1 spell/skill >5
-  (−2 if murderer; Stam save each); <30 → quit guild + re-evaluate PK.
+Death is a TWO-PHASE lifecycle. `Killed` (immediate) does corpse + drops +
+advancement reset + Underworld teleport + post-death vitals. `ApplyDeathPenalties`
+(delayed) runs from the Underworld room's `LeaveHold` when the dead player
+leaves — deliberately AFTER Portal of Life has had time to lower the pending
+cost. No state is shared between the phases except `piDeathCost` + corpse.
+
+**Double-death guard:** `Killed` returns immediately if
+`GetTime() < piLastDeathTime + 2` (whole seconds, strict `<`; a death exactly
+2 s later proceeds). `piLastDeathTime` is stamped only after the guard passes.
+
+**Three dispositions inside `Killed` (not two):**
+
+1. *Avoided* (logged-on only): room `IsArena` AND player `InPlay` AND NOT
+   `ArenaRealDeath`, OR room is `OutOfGrace` prison class, OR room
+   `SafePlayerAttack()` (= `ROOM_SAFE_DEATH` flag). Not a death at all:
+   HP=1, `NewHealth`, special items get `ActivateCheapDeath`, return. No
+   corpse, no drop, no Underworld, no kill broadcast.
+2. *Cheap* real death ( corpse IS created, cost set 0): global Chaos/Frenzy
+   night; OR death room in `[RID_NEWB_BASE..RID_NEWB_MAX]` (Raza 1010–1018);
+   OR honor string = newbie-honor; OR carrying a `Token` item (token becomes
+   unused, message sent). Special-item artifact loss
+   (`ActivateCheapDeath`→`OwnerKilled`: Hunter Sword back into circulation,
+   amulet order disband) fires in the avoided branch AND after the
+   cheap-death determination but BEFORE the token check — so token deaths
+   still lose the artifact.
+3. *Normal*: `piDeathCost = settings.GetDefaultDeathCost()` — default 100,
+   per-server overrides 90/60, documented domain 1..100 (a setting, NOT a
+   compiled constant; never assume 100).
+
+**Immediate phase (all real deaths):** corpse created unconditionally
+(`CreateCorpse` — gender icon, name, `good = karma>0`, `DearlyDeparted`
+pointer, `TimeOfDeath = GetTime()` whole seconds), placed at the death
+row/col. Player corpse decomposition 600000 ms (mob corpses 120000 ms);
+no-steal window 25000 ms during which only the corpse's own player may take
+items; corpse registers itself with the Underworld (`Newdeath`) for the
+corpse list / `ZaptoCorpse`. `pbResurrected` flag allows at most ONE Portal
+of Life per corpse.
+
+**Normal-death drops:** for each held item in `[plActive, plPassive]` (both
+flat inventory families — wielded items are contents too; NO container
+nesting exists in M59 player inventory, so there is no recursive walk): drop
+iff room `ReqNewHold` AND `ReqSomethingMoved` AND item `DropOnDeath` (base
+TRUE; `SoldierShield`, mana crystals, reagent/wedding rings, room keys, and
+item-attribute vetoes return FALSE). If the killer `IsClass &user`, each
+dropped item additionally gets the `IA_PKPOINTER` item attribute,
+`PKPOINTER_TIME = 10*60*1000` ms, pointing at the victim: non-`PFLAG_PKILL_ENABLE`
+players cannot pick it up (victim always can). Dropped at the death square,
+`merge=FALSE`.
+
+**Immediate advancement (normal death only):** `piAdvancement_points = 0`;
+`piGain_chance = piGain_chance/2` (KOD `/` = C truncation toward zero —
+gain chance is usually negative); `ResetGainFlags` (kill target + did-damage/
+took-damage/dodged flags); `ResetAtrophyFlags` (negate all spell entries —
+atrophy itself is disabled); advancement timer cancelled. Also normal-death
+only: `Post EvaluatePKStatus`, SoldierShield `OwnerDied`, and the karma
+booby prize (karma > 5000 & home ≠ RID_NEWB1 → Hammer; else karma ≥ 0 →
+Mace; both tagged IA_MADE 5 h, anti-mule).
+
+**Immediate vitals + teleport:** `UserGotoDeadRoom`: death room in newbie
+range → teleport RID_NEWB1 (NOT the Underworld); else Underworld near-square
+24/10 fine 38/54. Then vitals: Frenzy death → `HP = MaxHealth/2`,
+`Mana = MaxMana/2`, `Vigor = 100`; ordinary/cheap death → `HP = 1`,
+`Mana = 1`, `Vigor = bound(Vigor/4, 0, 50)` then `NewVigor` bounds 1..200
+(so the 0 floor becomes 1). All three regen timers recreated via
+`NewHealth/NewMana/NewVigor`. Angel mail: if `piDeathCost > 0` AND
+still-newbie (see below) AND NOT murderer → mail + `Mana = MaxMana/2 + 2`
+(OVERWRITES the earlier mana=1) + `NewMana`.
+
+**`PFLAG_TUTORIAL` is inverted:** TRUE means the player is NO LONGER a
+newbie (set at age ≥ 2 game-months or on becoming PK-able/murderer/outlaw).
+"Still newbie" = flag FALSE.
+
+**Delayed phase `ApplyDeathPenalties` (Underworld `LeaveHold`):**
+
+1. Chaos night active → clear `PFLAG_HAUNTED`, return (no penalties at all).
+2. If `piDeathCost >= settings default` (i.e. no Portal mitigation):
+   clear `PFLAG_OUTLAW`, `Post EvaluatePKStatus`, clear `PFLAG_HAUNTED`.
+   (Cheap deaths have cost 0 → no clearing.)
+3. If `piDeathCost > 0`: still-newbie AND not murderer → `piDeathCost /= 3`
+   (truncation; NO HP roll); ELSE (experienced OR murderer) → HP loss roll
+   `random(1,100) <= piDeathCost` (roll == cost LOSES) → `GainBaseMaxHealth(-1)`
+   — base floor 20, and the SAME actual delta flows into `GainMaxHealth`
+   (MaxHP floor 20); current HP untouched.
+4. Guild quit if `piBase_max_health < PKILL_ENABLE_HP` (30) — runs on every
+   non-frenzy path reaching here, even cost-0.
+5. Ability loss: `iAmount = -2` if murderer else `-1`. For EVERY spell in
+   `plSpells`, then EVERY skill in `plSkills` (list order):
+   eligible iff ability `> 5` (5 itself never eligible, 99 eligible);
+   stamina save `random(1,100) > Stamina` (roll == Stamina SAVES; effective
+   Stamina `bound(base+mod,1,70)`); death-cost roll `random(1,100) <
+   piDeathCost` (roll == cost SAVES; note the DIFFERENT boundary vs the HP
+   roll's `<=`). AND short-circuits: ineligible abilities consume NO rolls;
+   a passed stamina save consumes NO cost roll (a failed save consumes the
+   cost roll even when cost is 0). Loss clamps at
+   `bound(ability+amount, 1, 99)` (ability 6, murderer −2 → 4). Roll order
+   overall: HP roll first (when it happens), then spells, then skills.
+6. `piDeathCost = 0` at the end. Source's stale comment "If you're not new,
+   chance to lose a hp" inverts the actual flag logic — the code is
+   authoritative.
+
+**Portal of Life (`portlife.kod`):** cast on a not-yet-resurrected player
+corpse (target must be DeadBody with `DearlyDeparted`); creates a
+`CorpsePortal` in the Underworld and calls `SetResurrected` (once per
+corpse). Cost: start from the victim's pending `GetDeathCost()`;
+`age = GetTime() − TimeOfDeath` (whole seconds; corpse alive ⇒ 0..600);
+if `age < 60` → `timeAdj = -(60 − age)` (age 0 → −60, age 59 → −1, a
+BONUS), else `timeAdj = age/10 − 6` (age 60 → 0, age 600 → +54, a
+PENALTY); `newCost = cost − (spellPower − timeAdj)`; final
+`bound(newCost, 5, 80)`. `SetDeathCost` only ever LOWERS the pending cost
+(raises ignored unless admin override). Getting the mana/portal is not
+death-dependent; the portal is the Underworld EXIT route that triggers
+`LeaveHold` → penalties.
+
+**Justice side effects:** outlaw + haunted cleared only at full cost;
+`EvaluatePKStatus` re-runs (murderer flag recompute, may SET
+`PFLAG_TUTORIAL`/`PFLAG_PKILL_ENABLE`); guild auto-quit below 30 base HP;
+guardian-angel mail is newbie-only (see vitals above — the "half mana"
+gift rides the same still-newbie/non-murderer gate, mana-only, no mail
+system in MVP). `SYS.UserKilled` (kill broadcast/news/webhooks) is
+presentation only.
+
 - Unsafe logoff leaves ghost 10 min (`LogoffPenaltyGhostTime=600 s`); return
   in time = no penalty, else escalating (mail → best stack → best item →
   =death by 10th; `EquivDeath=10`, decay 1/day); >35% net server loss in
@@ -751,7 +864,9 @@ Attack: 1/s; PostCast 2s; hit (Off*55)/Def 10..95%
 Offense: Stroke*3+Prof*2+Aim*4+HP*1.5 | Defense: Parry*2+Block+Dodge*3+Agi*4+HP*1.5
 Mana start 15+Myst/5; node ((5+Myst)/10)+3 (Fey x2); vigor 1..200 rest to 80
 Regen base 150s HP / mana per §4.4; rest 1-2.5s/tick; stomach 100->0 ~14min
-Death cost 100 (events 90/60); newbie /3; logoff ghost 600s, equiv-death 10
+Death cost: settings default 100 (per-server 90/60, domain 1..100);
+newbie non-murderer /3; HP roll `<=` cost; ability rolls `>` Stam, `<` cost;
+PK pointer 10 min; corpse 600 s / no-steal 25 s; Portal bound 5..80; double-death guard 2 s
 Rooms 265; guild max 400 min 3; karma -100..100 (x100 stored)
 ```
 
