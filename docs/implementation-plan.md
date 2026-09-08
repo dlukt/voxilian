@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.14)
+# Voxilian Backend — Implementation Plan (v1.15)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.30).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.31).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -221,8 +221,16 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   due comparison; runtime resolved regen inputs (no live lookups);
   stomach sim-time anchor with fractional-second preservation and
   documented no-offline-digestion MVP; handoff/no-double-fire scheduling
-  proof; manual-tick/manual-clock timer tests.
-  Spec: §9.4b.1, §9.4b.10–§9.4b.17, §9.4b.19, §9.4b.21.
+  proof; manual-tick/manual-clock timer tests. v0.3.31 composition
+  freeze: §9.4b.14a plain-value runtime-input ownership with validating
+  update API and never-restart timing; §9.4b.17 frozen per-entity Step
+  phase order (movement before vitals runtime, acted marked at input
+  consumption, one tick-start worklist); §9.4b.22 live post-commit
+  validity guard through the one commit seam; §9.4b.3a atomic
+  player-initialization signature (vitals + runtime inputs validate
+  before EntityID consumption, no default stats); §9.4b.10 explicit
+  armed/present deadline bit.
+  Spec: §9.4b.1, §9.4b.3a, §9.4b.10–§9.4b.17, §9.4b.19, §9.4b.21–§9.4b.22.
 - [ ] **M5-T5** Death pipeline: corpse + full droppable drop (PK tags), advancement wipe/halve, Underworld-region respawn, leaving penalties (Stam saves), Portal-of-Life hook; single-txn state+ledger. Crash-during-death test. Spec: §9, §8.1.
 - [ ] **M5-T6** Personal/world-light intents: `115 rest`, `116 eat` (hunger/vigor effects), `105 use` (skill/item dispatch incl. Second Wind), `119 safety_toggle`, `117/118 → 209` chat (+channel rules, length caps, rate limits). Owner of these opcodes: this task, no other. Spec: §6.3, §9.
 - [ ] **M5-T7** Authoritative attack/cast runtime integration (depends on
@@ -375,6 +383,26 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.15: narrow M5-T4b2 composition freeze (spec v0.3.31 §9.4b.3a/
+  §9.4b.10/§9.4b.14a/§9.4b.17/§9.4b.22) closing the three gaps exposed
+  by the verified T4b1 integration: runtime-input ownership (one
+  plain-value PlayerVitalsRuntimeInputs snapshot on the player entity,
+  validating owner-local update API, input changes never restart a
+  running deadline, fire-time rest multiplier, no stale cache); exact
+  per-entity Step phase ordering (movement consume/integrate/output ->
+  health->mana->rest runtime -> history sample, in the ONE tick-start
+  worklist, acted marked at input consumption before timers, Vigor-9
+  same-tick walk documented); live post-commit validity (one narrow
+  commit guard requiring after.Validate(), bit-identical state and no
+  event on failure, T4a AdjustMaxMana/ComputeMaxMana pures stay
+  unbounded; MaxMana 20-19 -> 1 allowed, 20-20 rejected). Plus atomic
+  T4b2-complete player initialization (vitals AND runtime inputs
+  validate before EntityID consumption, §9.4b.9 state installed
+  atomically, no invented default Stamina/Mysticism) and the explicit
+  deadline armed/present bit (due==0 is a valid wrapped deadline;
+  restArmed IS the resting state). Task checkbox state unchanged:
+  M5-T4b1 [x], M5-T4b2 [ ], T5/T6/T7 [ ], M5 exit [ ].
 
 - v1.14: split M5-T4b into live entity integration T4b1 (player-vitals
   attach/classification/inspection, owner-local T4a-composing mutation

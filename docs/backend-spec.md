@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.30 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.31 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -7335,7 +7335,7 @@ Property invariants: loss never yields `HP < 0`; normal heal from
 etc.). Fuzz SEEDS (no long campaign) for the cheap primitives with
 no-panic/no-overflow/stable-error/bounds properties.
 
-### 9.4b M5-T4b runtime vitals integration + scheduling (normative, v0.3.30)
+### 9.4b M5-T4b runtime vitals integration + scheduling (normative v0.3.30, T4b2 composition freeze v0.3.31)
 
 This section freezes the T4b runtime: attaching the §9.4 vitals value to
 live sim entities, owner-local mutation composition over the T4a
@@ -7414,6 +7414,42 @@ second timer-driven simulation path may exist.
   composition task that actually holds durable vitals (M5-T6/T7 era);
   when added it MUST be a typed command carrying a `PlayerVitals` value,
   never a `func(*Engine)` escape hatch.
+
+#### 9.4b.3a T4b2-complete atomic player initialization [T4b2, v0.3.31]
+
+At the T4b2-complete boundary a newly attached live player MUST NOT
+exist in an accidentally-unscheduled state: the §9.4b.9 initial state
+is installed ATOMICALLY with attach. The production-facing semantics
+are equivalent to the add/attach paths taking the §9.4b.14a runtime
+inputs alongside the vitals:
+
+```text
+AddPlayerEntity(pos, vitals, runtimeInputs)
+AttachPlayerVitals(id, vitals, runtimeInputs)
+```
+
+(or one equally atomic replacement API — the requirement is that
+production world-entry composition can never yield a player between
+steps with vitals attached but runtime metadata uninitialized).
+
+Rules:
+
+- BOTH the vitals AND the runtime inputs validate BEFORE a new
+  EntityID is consumed (same all-or-nothing contract as §9.4b.3; an
+  invalid runtime-input value allocates no ID and mutates nothing).
+- NO default Stamina/Mysticism is invented (e.g. no implicit 25): the
+  caller supplies resolved values (§9.4b.14a domain 1..70).
+- Initial runtime state at the current simulation tick:
+  `vitals` = supplied validated value; `runtimeInputs` = supplied
+  validated value; `actedSinceEntry = false`; rest deadline absent;
+  `stomachAnchorTick = current sim tick`; health deadline armed iff
+  `HP != MaxHP && HP > 0` (NewHealth create semantics applied
+  immediately); mana deadline armed iff `Mana != MaxMana` (NewMana
+  create semantics applied immediately). Deadlines arm from the
+  current tick using the supplied runtime inputs.
+- No runtime metadata is persisted (§9.4b.9). Remove/re-add/re-attach
+  re-anchors at the then-current tick; there is no offline digestion
+  or offline regen.
 
 #### 9.4b.4 Immutable inspection [T4b1]
 
@@ -7519,6 +7555,15 @@ simplify runtime code; only the §9.4.2 durable JSON fields exist.
   deadline slots on the entity, conceptually three optional due-tick
   fields (healthDue, manaDue, restDue) in the `uint32` tick domain. No
   goroutine, no heap, no global timer list, no wall-clock timestamp.
+- v0.3.31: slot ABSENCE MUST NOT be encoded as `due == 0` — a due tick
+  of `0` is a valid future deadline after uint32 wrap (§5.2.2 has no
+  "tick 0 is invalid" rule). Each slot carries an explicit
+  armed/present bit (or an equivalent small optional-deadline value).
+  `restArmed` IS the resting state; no redundant independent resting
+  boolean may exist that can disagree with the deadline's presence.
+  Runtime metadata fields are plain values (no pointers/maps/slices,
+  no `time.Time`, no timer handle, no durable ID/revision/session ID)
+  riding on the SAME entity object through cell handoff.
 - ONE canonical ms->tick conversion exists, the §9.3a.13 `CastTicks`
   semantics: `delayTicks = ceil(intervalMs * tickHz / 1000)` with
   integer-only arithmetic, `tickHz` domain `1..120`, overflow and
@@ -7631,6 +7676,57 @@ resolves the multiplier; T4b2 invents NO `ROOM_*` flag IDs or
 `world.VolumeFlags` bit assignments (content/world mapping belongs to its
 own later task).
 
+#### 9.4b.14a Runtime-input ownership value [T4b2, v0.3.31]
+
+v0.3.30 says interval calculations consume current already-resolved
+values; v0.3.31 freezes WHERE the authoritative current snapshot lives:
+one small plain-value runtime input type in sim, conceptually:
+
+```go
+type PlayerVitalsRuntimeInputs struct {
+    EffectiveStamina   int
+    EffectiveMysticism int
+
+    RestoratePower  int // 0 absent, else 1..99
+    RejuvenatePower int // 0 absent, else 1..99
+    ManaFocusPower  int // 0 absent, else 1..99
+    InvigoratePower int // 0 absent, else 1..99
+
+    RestRecoveryMultiplier int // exactly 1, 2, or 3
+}
+```
+
+Rules:
+
+- Effective Stamina/Mysticism domain `1..70` (source
+  `bound(base+mod,1,70)`); power `0` means absent and nonzero means
+  `1..99`; the rest recovery multiplier is exactly `1..3`. Validation
+  rejects anything else with the existing stable error sentinels
+  (§9.4.26 reuse; no string matching).
+- Faction regen remains phase 2 and contributes `0` in T4b2; T4b2
+  invents NO faction state or API. No named-spell lookup, no room flag
+  lookup, no `world.VolumeFlags` bit assignment, no pointers/maps/
+  slices, no durable IDs/revisions/session IDs. Runtime inputs are
+  ephemeral sim state and are NOT persisted (§9.4b.9).
+- The stored value is the authoritative CURRENT resolved snapshot used
+  by T4b2: every health/mana/rest create/re-arm and every rest
+  recovery event reads the entity's current value; NO stale secondary
+  cache may exist. Later tasks update it when stat modifiers, Jala
+  songs, or room policy change, through one owner-local update API,
+  conceptually `PlayerSetVitalsRuntimeInputs(id, inputs)`, which
+  validates BEFORE storage (hostile/invalid values are rejected before
+  any state change; the combination of Validate-valid vitals,
+  Validate-valid runtime inputs, and TickHz 1..120 makes every
+  interval calculation + CastTicks total, so `Step` can never receive
+  an error it cannot return).
+- SOURCE TIMING RULE: changing runtime inputs MUST NOT reset or
+  restart an already-running health, mana, or rest deadline. New
+  values affect ONLY the NEXT health create/re-arm, the NEXT mana
+  create/re-arm, the NEXT rest create/re-arm, and the CURRENT rest
+  recovery event's room multiplier — the multiplier is read at FIRE
+  time because source `RestAddExertion` checks then-current room
+  state.
+
 #### 9.4b.15 Stomach sim-time anchor [T4b2]
 
 - T4a owns only `DecayStomach(current, elapsedWholeSeconds)`. T4b2 adds
@@ -7702,6 +7798,49 @@ precedence at attach matches the per-entity slot order). Each slot fires
 at most once per Step (§9.4b.10), so equal-tick processing cannot
 cascade.
 
+v0.3.31 pins the timer phase's position relative to movement. The
+final per-entity Step order is FROZEN as:
+
+```text
+1. verify tick-start resident ownership epoch (existing worklist)
+2. consume/process movement input
+3. integrate movement/collision/handoff
+4. finalize + emit MovementUpdate if applicable
+5. process the T4b2 player runtime for THIS SAME entity:
+       health due, then mana due, then rest due
+6. append the position-history sample
+```
+
+This remains ONE canonical tick-start worklist in CellCoord/EntityID
+order — NO second global map iteration and no timer map walk; the
+runtime phase is one small private per-player step called from
+`Engine.Step` after movement output and before history sampling, only
+when the entity is a player. Consequences (documented AND tested):
+
+1. An ACCEPTED pending player movement input marks
+   `actedSinceEntry = true` when that input is CONSUMED in the
+   movement phase, before the same Step's due processing — including
+   zero-translation/turn-like accepted input (heldDirs may resolve to
+   no displacement; it still counts as the first action). Therefore,
+   if the first action and a health deadline occur on the same tick,
+   the health deadline sees `actedSinceEntry = true`.
+2. Movement/run selection happens BEFORE rest recovery: a player at
+   Vigor 9 requesting run on the same tick that a rest event raises
+   Vigor to >= 10 still WALKS that tick and may run from a later
+   tick. This frozen movement-before-vitals ordering is Voxilian's
+   explicit replacement for source per-millisecond deadline
+   interleaving.
+3. Technical cell handoff occurs before timer processing, but the
+   SAME entity object is still processed exactly once from its
+   tick-start work item: runtime metadata survives, each due event
+   fires exactly once, and the re-arm is one deadline (no duplicate
+   destination processing — §5.4.3/§9.4b.8).
+4. Movement output happens before any vitals event produced by the
+   timer phase for that entity on the same Step.
+5. A slot newly re-armed during processing is not revisited until a
+   later Step (§9.4b.10); a due slot fires once, never N catch-up
+   times.
+
 #### 9.4b.18 Run-gate wiring in Step [T4b1]
 
 The per-entity run decision in movement integration consults the player
@@ -7749,7 +7888,31 @@ threshold does not stop rest); due-tick arithmetic incl. u32 wrap and
 (canonical entity order, fixed slot order, at-most-once per Step);
 stomach anchor (fractional-second preservation across repeated lazy
 updates, wrap, re-attach re-anchor); handoff preserves all runtime
-metadata with no double firing; logon initialization snapshot.
+metadata with no double firing; logon initialization snapshot; the
+§9.4b.14a runtime-input validation/ownership matrix; the §9.4b.22
+post-commit guard corners; and the §9.4b.17 movement-before-vitals
+phase-ordering pin (Vigor-9 run-request-same-tick walk).
+
+#### 9.4b.22 Live post-commit validity guard [T4b2, v0.3.31]
+
+T4a pure/value mechanics stay UNCHANGED: in particular NO bound is
+added to the source-faithful pure `AdjustMaxMana`/`ComputeMaxMana`
+(the source adds blindly). But a live player entity is canonical
+runtime state, so T4b2 freezes: a `PlayerVitals` value may be
+committed to a live entity ONLY IF `after.Validate()` succeeds. The
+guard is ONE narrow commit check at the §9.4b.6 seam, not scattered
+special cases. Consequences:
+
+- every successful T4a output is post-validated before storage;
+- if post-validation fails, live state stays bit-identical, NO dirty
+  event fires, and the caller receives the validation error;
+- this primarily hardens the source-unreachable hostile corner where a
+  signed `AdjustMaxMana` request would make `MaxMana < 1` (pinned:
+  `MaxMana 20 + (-19) -> MaxMana 1` allowed; `MaxMana 20 + (-20) ->
+  rejected`, live MaxMana remains 20);
+- this guarantees T4b2 scheduling never receives a live player with an
+  invalid MaxMana, so no user-controlled input can create a panic path
+  through invalid stored vitals.
 
 ## 10. Config / deployment / ops
 
@@ -7906,6 +8069,33 @@ metadata with no double firing; logon initialization snapshot.
    survives it.
 
 ## 14. Version history
+
+- v0.3.31: narrow M5-T4b2 composition freeze closing the three
+  implementation-architecture gaps exposed by the completed T4b1
+  integration (mechanics unchanged; no new source research): (a)
+  runtime-input OWNERSHIP — §9.4b.14a freezes one plain-value
+  `PlayerVitalsRuntimeInputs` snapshot (effective Stamina/Mysticism
+  1..70, Restorate/Rejuvenate/ManaFocus/Invigorate powers 0-or-1..99,
+  rest multiplier exactly 1..3, faction still phase-2 zero) stored on
+  the player entity as the authoritative current resolved value with
+  one validating owner-local update API, the source timing rule that
+  input changes never restart a running deadline and affect only the
+  next create/re-arm plus the fire-time rest multiplier, and no stale
+  secondary cache; (b) STEP PHASE ORDERING — §9.4b.17 pins the final
+  per-entity order (ownership verify -> movement consume -> integrate/
+  handoff -> movement output -> health/mana/rest in fixed slot order ->
+  history sample) inside the ONE tick-start worklist with no second
+  global pass, including acted-marks-on-consume-before-timers and the
+  documented Vigor-9 same-tick walk; (c) POST-COMMIT LIVE-STATE
+  VALIDITY — §9.4b.22 freezes the one narrow commit guard (live commit
+  requires after.Validate(); failure leaves bit-identical state, no
+  event, caller error) while §9.4 T4a pures stay unbounded/
+  source-faithful, pinning MaxMana 20-19 -> 1 allowed and 20-20
+  rejected. Also §9.4b.3a freezes atomic T4b2-complete player
+  initialization (vitals + runtime inputs validate before an EntityID
+  is consumed; §9.4b.9 initial state installed atomically; no invented
+  default stats) and §9.4b.10 pins the explicit armed/present bit with
+  due==0 as a valid wrapped deadline.
 
 - v0.3.30: freeze M5-T4b runtime semantics and split the broad row into
   T4b1 entity integration + T4b2 deterministic scheduling (normative
