@@ -1184,3 +1184,316 @@ func TestDeathProperties(t *testing.T) {
 		t.Fatalf("large-time guard: %v %v", ok, err)
 	}
 }
+
+// --- immediate hooks: guardian angel mail -------------------------------------
+
+func TestImmediateDeathHooksGuardianAngelMail(t *testing.T) {
+	// The hook decision must equal the frozen gate for every combination,
+	// and must match the §9.5.7 mana override exactly.
+	for _, cost := range []int{0, 1, 50, 100} {
+		for _, newbie := range []bool{false, true} {
+			for _, murderer := range []bool{false, true} {
+				var plan DeathDispositionPlan
+				var disp DeathDisposition
+				if cost == 0 {
+					plan = mustPlan(t, 100, DeathContext{FrenzyActive: true}, false)
+					disp = DeathCheap
+				} else {
+					plan = DeathDispositionPlan{Disposition: DeathNormal, DeathCost: cost}
+					disp = DeathNormal
+				}
+				hooks, err := PlanImmediateDeathHooks(plan, ImmediateDeathHooksInput{
+					StillNewbie: newbie, Murderer: murderer,
+				})
+				if err != nil {
+					t.Fatalf("cost %d newbie %v murderer %v: %v", cost, newbie, murderer, err)
+				}
+				want := cost > 0 && newbie && !murderer
+				if hooks.GuardianAngelMail != want {
+					t.Fatalf("cost %d newbie %v murderer %v: mail = %v, want %v",
+						cost, newbie, murderer, hooks.GuardianAngelMail, want)
+				}
+				if GuardianAngelMailEligible(cost, newbie, murderer) != want {
+					t.Fatalf("helper drifts: cost %d newbie %v murderer %v", cost, newbie, murderer)
+				}
+				// The mana override consumes the same eligibility: mail
+				// true iff mana becomes MaxMana/2+2.
+				v, err := PlanPostDeathVitals(PostDeathVitalsInput{
+					Vitals:      mkVitals(0, 40, 45, 1, 25, 100),
+					Disposition: disp, AngelMailEligible: want,
+				})
+				if err != nil {
+					t.Fatalf("vitals cost %d newbie %v murderer %v: %v", cost, newbie, murderer, err)
+				}
+				manaOverridden := v.Mana == 25/2+2
+				if manaOverridden != hooks.GuardianAngelMail {
+					t.Fatalf("cost %d newbie %v murderer %v: mail=%v mana-override=%v (mana=%d)",
+						cost, newbie, murderer, hooks.GuardianAngelMail, manaOverridden, v.Mana)
+				}
+			}
+		}
+	}
+
+	// Frenzy with an eligible gate is contradictory (same rule as vitals).
+	normal := DeathDispositionPlan{Disposition: DeathNormal, DeathCost: 100}
+	if _, err := PlanImmediateDeathHooks(normal, ImmediateDeathHooksInput{
+		FrenzyActive: true, StillNewbie: true,
+	}); !errors.Is(err, ErrInvalidDeathInput) {
+		t.Fatalf("frenzy+eligible: err = %v", err)
+	}
+	// Invalid disposition plan is rejected, with zero output.
+	if hooks, err := PlanImmediateDeathHooks(
+		DeathDispositionPlan{Disposition: DeathCheap, DeathCost: 100},
+		ImmediateDeathHooksInput{},
+	); !errors.Is(err, ErrInvalidDeathInput) || hooks != (ImmediateDeathHooks{}) {
+		t.Fatalf("hostile plan: hooks=%+v err=%v", hooks, err)
+	}
+}
+
+// --- immediate hooks: soldier shield ------------------------------------------
+
+func TestImmediateDeathHooksSoldierShield(t *testing.T) {
+	normal := mustPlan(t, 100, DeathContext{}, false)
+	cases := []struct {
+		name string
+		plan DeathDispositionPlan
+		in   ImmediateDeathHooksInput
+		want bool
+	}{
+		{"rank3-enemy-dies", normal,
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 3, KilledByFactionEnemy: true}, true},
+		{"rank1-enemy-dies", normal,
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 1, KilledByFactionEnemy: true}, true},
+		{"rank4-enemy-survives", normal,
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 4, KilledByFactionEnemy: true}, false},
+		{"rank3-non-enemy-survives", normal,
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 3}, false},
+		{"no-shield", normal,
+			ImmediateDeathHooksInput{KilledByFactionEnemy: true}, false},
+		{"cheap-never-dies", mustPlan(t, 100, DeathContext{FrenzyActive: true}, false),
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 1, KilledByFactionEnemy: true}, false},
+		{"avoided-never-dies", mustPlan(t, 100, DeathContext{PrisonRoom: true}, false),
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 1, KilledByFactionEnemy: true}, false},
+	}
+	for _, c := range cases {
+		hooks, err := PlanImmediateDeathHooks(c.plan, c.in)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if hooks.SoldierShieldDied != c.want {
+			t.Fatalf("%s: died = %v, want %v", c.name, hooks.SoldierShieldDied, c.want)
+		}
+		if hooks.GuardianAngelMail {
+			t.Fatalf("%s: unexpected angel mail (no newbie inputs)", c.name)
+		}
+	}
+	// Rank outside 1..10 with a present shield is a domain error with
+	// zero output.
+	for _, rank := range []int{0, -1, 11, 99} {
+		hooks, err := PlanImmediateDeathHooks(normal, ImmediateDeathHooksInput{
+			HasSoldierShield: true, SoldierShieldRank: rank, KilledByFactionEnemy: true,
+		})
+		if !errors.Is(err, ErrInvalidDeathInput) || hooks != (ImmediateDeathHooks{}) {
+			t.Fatalf("rank %d: hooks=%+v err=%v", rank, hooks, err)
+		}
+	}
+}
+
+// --- ability namespace: same numeric key in both lists -------------------------
+
+func TestDeathPenaltySameKeySpellAndSkill(t *testing.T) {
+	base := mkVitals(10, 40, 45, 5, 20, 100)
+	// HP roll first (100 <= 100 loses), then spell Key 7 loses
+	// (stamina 50 > 30 fails, cost 1 < 100 loses), then skill Key 7
+	// loses (stamina 60 > 30 fails, cost 1 < 100 loses).
+	p, err := PlanDeathPenalties(d100Rolls(100, 50, 1, 60, 1), DeathPenaltyInput{
+		PendingCost: 100, DefaultCost: 100, Stamina: 30, Vitals: base,
+		Spells: []DeathAbilityInput{{Key: 7, Ability: 50}},
+		Skills: []DeathAbilityInput{{Key: 7, Ability: 60}},
+	})
+	if err != nil {
+		t.Fatalf("same key: %v", err)
+	}
+	if len(p.AbilityLosses) != 2 {
+		t.Fatalf("want both Key-7 losses: %+v", p.AbilityLosses)
+	}
+	spell, skill := p.AbilityLosses[0], p.AbilityLosses[1]
+	if spell.Kind != DeathAbilitySpell || spell.Key != 7 || spell.FromAbility != 50 {
+		t.Fatalf("spell loss: %+v", spell)
+	}
+	if skill.Kind != DeathAbilitySkill || skill.Key != 7 || skill.FromAbility != 60 {
+		t.Fatalf("skill loss: %+v", skill)
+	}
+	if spell.Kind == skill.Kind {
+		t.Fatalf("losses indistinguishable: %+v", p.AbilityLosses)
+	}
+	// RNG order preserved: HP, spells in order, skills in order.
+	if !p.HPRolled || p.HPRoll != 100 || spell.StaminaRoll != 50 || skill.StaminaRoll != 60 {
+		t.Fatalf("consumption order drifted: %+v", p)
+	}
+}
+
+// --- post-death vitals: contradiction guards ------------------------------------
+
+func TestDeathPostVitalsContradictions(t *testing.T) {
+	v := mkVitals(0, 40, 45, 1, 25, 100)
+	bads := map[string]PostDeathVitalsInput{
+		"normal+frenzy": {Vitals: v, Disposition: DeathNormal, FrenzyActive: true},
+		"cheap+angel":   {Vitals: v, Disposition: DeathCheap, AngelMailEligible: true},
+		"frenzy+angel":  {Vitals: v, Disposition: DeathCheap, FrenzyActive: true, AngelMailEligible: true},
+		"avoided":       {Vitals: v, Disposition: DeathAvoided},
+	}
+	for name, in := range bads {
+		got, err := PlanPostDeathVitals(in)
+		if !errors.Is(err, ErrInvalidDeathInput) {
+			t.Fatalf("%s: err = %v, want ErrInvalidDeathInput", name, err)
+		}
+		if got != (PlayerVitals{}) {
+			t.Fatalf("%s: output = %+v, want zero", name, got)
+		}
+	}
+	// The legitimate corners stay accepted.
+	if _, err := PlanPostDeathVitals(PostDeathVitalsInput{Vitals: v, Disposition: DeathCheap}); err != nil {
+		t.Fatalf("cheap plain: %v", err)
+	}
+	if _, err := PlanPostDeathVitals(PostDeathVitalsInput{Vitals: v, Disposition: DeathNormal}); err != nil {
+		t.Fatalf("normal plain: %v", err)
+	}
+	if _, err := PlanPostDeathVitals(PostDeathVitalsInput{Vitals: v, Disposition: DeathCheap, FrenzyActive: true}); err != nil {
+		t.Fatalf("cheap frenzy: %v", err)
+	}
+	if _, err := PlanPostDeathVitals(PostDeathVitalsInput{Vitals: v, Disposition: DeathNormal, AngelMailEligible: true}); err != nil {
+		t.Fatalf("normal angel: %v", err)
+	}
+}
+
+// --- disposition-plan invariants --------------------------------------------------
+
+func TestDispositionPlanInvariants(t *testing.T) {
+	corpse, err := PlanCorpse(7)
+	if err != nil {
+		t.Fatalf("corpse: %v", err)
+	}
+	hostiles := map[string]DeathDispositionPlan{
+		"cheap+cost":            {Disposition: DeathCheap, DeathCost: 100, SpecialItemsKept: true},
+		"normal+zero":           {Disposition: DeathNormal},
+		"normal+token":          {Disposition: DeathNormal, DeathCost: 100, TokenDeath: true},
+		"normal+newbie-respawn": {Disposition: DeathNormal, DeathCost: 100, NewbieHomeRespawn: true},
+		"normal+kept":           {Disposition: DeathNormal, DeathCost: 100, SpecialItemsKept: true},
+		"avoided+cost":          {Disposition: DeathAvoided, SpecialItemsKept: true, DeathCost: 5},
+		"avoided+token":         {Disposition: DeathAvoided, SpecialItemsKept: true, TokenDeath: true},
+		"avoided+respawn":       {Disposition: DeathAvoided, SpecialItemsKept: true, NewbieHomeRespawn: true},
+		"avoided+unkept":        {Disposition: DeathAvoided},
+		"cheap+unkept":          {Disposition: DeathCheap},
+		"token+normal":          {Disposition: DeathNormal, DeathCost: 100, TokenDeath: true},
+		"hostile-enum":          {Disposition: DeathDisposition(9)},
+	}
+	for name, plan := range hostiles {
+		if _, err := PlanDeathDrops(plan, nil); !errors.Is(err, ErrInvalidDeathInput) {
+			t.Fatalf("drops %s: err = %v", name, err)
+		}
+		if _, err := PlanPendingDeath(plan, corpse); !errors.Is(err, ErrInvalidDeathInput) {
+			t.Fatalf("pending %s: err = %v", name, err)
+		}
+		if _, err := PlanImmediateDeathHooks(plan, ImmediateDeathHooksInput{}); !errors.Is(err, ErrInvalidDeathInput) {
+			t.Fatalf("hooks %s: err = %v", name, err)
+		}
+	}
+	// Legitimate combinations remain accepted by every consumer.
+	legits := map[string]DeathDispositionPlan{
+		"pure-token":    {Disposition: DeathCheap, TokenDeath: true},
+		"newbie+token":  {Disposition: DeathCheap, TokenDeath: true, SpecialItemsKept: true, NewbieHomeRespawn: true},
+		"frenzy-cheap":  {Disposition: DeathCheap, SpecialItemsKept: true},
+		"normal":        {Disposition: DeathNormal, DeathCost: 100, KillerIsPlayer: true},
+		"avoided":       {Disposition: DeathAvoided, SpecialItemsKept: true, KillerIsPlayer: true},
+		"cheap-pk-echo": {Disposition: DeathCheap, SpecialItemsKept: true, KillerIsPlayer: true},
+	}
+	for name, plan := range legits {
+		// Avoided deaths never reach drop planning by design; the
+		// validator itself must still accept the plan (proven via
+		// pending + hooks below).
+		if plan.Disposition != DeathAvoided {
+			if _, err := PlanDeathDrops(plan, nil); err != nil {
+				t.Fatalf("drops legit %s: %v", name, err)
+			}
+		}
+		if _, err := PlanPendingDeath(plan, corpse); err != nil {
+			t.Fatalf("pending legit %s: %v", name, err)
+		}
+		if _, err := PlanImmediateDeathHooks(plan, ImmediateDeathHooksInput{}); err != nil {
+			t.Fatalf("hooks legit %s: %v", name, err)
+		}
+	}
+	// Constructor outputs always validate, including the tricky
+	// newbie-zone + token sequencing (keep-guard stays armed).
+	for _, ctx := range []DeathContext{
+		{},
+		{FrenzyActive: true},
+		{NewbieZoneDeath: true},
+		{NewbieHonor: true},
+		{CarriesToken: true},
+		{NewbieZoneDeath: true, CarriesToken: true},
+		{FrenzyActive: true, CarriesToken: true},
+		{PrisonRoom: true},
+	} {
+		p := mustPlan(t, 100, ctx, true)
+		if p.Disposition != DeathAvoided {
+			if _, err := PlanDeathDrops(p, nil); err != nil {
+				t.Fatalf("ctor %+v drops: %v", ctx, err)
+			}
+		}
+		if _, err := PlanPendingDeath(p, corpse); err != nil {
+			t.Fatalf("ctor %+v pending: %v", ctx, err)
+		}
+	}
+	// Token + earlier newbie cheap keeps the guard armed end to end.
+	seq := mustPlan(t, 100, DeathContext{NewbieZoneDeath: true, CarriesToken: true}, true)
+	if !seq.TokenDeath || !seq.SpecialItemsKept || seq.DeathCost != 0 {
+		t.Fatalf("newbie+token sequencing: %+v", seq)
+	}
+	drops, err := PlanDeathDrops(seq, []DeathItemInput{{Key: 1, SpecialItem: true}})
+	if err != nil {
+		t.Fatalf("newbie+token drops: %v", err)
+	}
+	if !drops.Items[0].SpecialItemKept || drops.Items[0].SpecialItemLost() {
+		t.Fatalf("newbie+token must keep the artifact: %+v", drops.Items[0])
+	}
+}
+
+// --- special-item loss: single direct test ------------------------------------------
+
+func TestDropPlanSpecialItemLost(t *testing.T) {
+	items := []DeathItemInput{{Key: 1, DropOnDeath: true, RoomAccepts: true, SpecialItem: true}}
+	// Normal death loses the artifact.
+	normal, err := PlanDeathDrops(mustPlan(t, 100, DeathContext{}, false), items)
+	if err != nil {
+		t.Fatalf("normal: %v", err)
+	}
+	if !normal.Items[0].SpecialItemLost() {
+		t.Fatalf("normal must lose the artifact: %+v", normal.Items[0])
+	}
+	// Pure token cheap death loses the artifact.
+	token, err := PlanDeathDrops(mustPlan(t, 100, DeathContext{CarriesToken: true}, false), items)
+	if err != nil {
+		t.Fatalf("token: %v", err)
+	}
+	if !token.Items[0].SpecialItemLost() {
+		t.Fatalf("token must lose the artifact: %+v", token.Items[0])
+	}
+	// Non-token cheap death keeps it.
+	cheap, err := PlanDeathDrops(mustPlan(t, 100, DeathContext{FrenzyActive: true}, false), items)
+	if err != nil {
+		t.Fatalf("cheap: %v", err)
+	}
+	if cheap.Items[0].SpecialItemLost() {
+		t.Fatalf("non-token cheap must keep the artifact: %+v", cheap.Items[0])
+	}
+	// The helper is exactly SpecialItem && !SpecialItemKept everywhere.
+	for _, plan := range []DeathDropPlan{normal, token, cheap} {
+		for _, it := range plan.Items {
+			if it.SpecialItemLost() != (it.SpecialItem && !it.SpecialItemKept) {
+				t.Fatalf("helper drifted: %+v", it)
+			}
+		}
+	}
+}

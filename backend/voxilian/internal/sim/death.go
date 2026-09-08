@@ -119,6 +119,57 @@ func checkDisposition(d DeathDisposition) error {
 	return nil
 }
 
+// validateDispositionPlan rejects a full disposition plan whose fields
+// contradict the frozen §9.5.2 routing invariants, so a manually or
+// incorrectly reconstructed plan cannot smuggle impossible combinations
+// into composition helpers (notably PlanDeathDrops and PlanPendingDeath).
+// Plans produced by PlanDeathDisposition always pass. KillerIsPlayer is
+// deliberately unconstrained: it is an echo consumed only by the drop
+// planner for normal deaths.
+func validateDispositionPlan(plan DeathDispositionPlan) error {
+	if err := checkDisposition(plan.Disposition); err != nil {
+		return err
+	}
+	if plan.TokenDeath && plan.Disposition != DeathCheap {
+		return fmt.Errorf("sim: token death without cheap disposition: %w", ErrInvalidDeathInput)
+	}
+	switch plan.Disposition {
+	case DeathAvoided:
+		if plan.DeathCost != 0 {
+			return fmt.Errorf("sim: avoided death cost %d: %w", plan.DeathCost, ErrInvalidDeathInput)
+		}
+		if plan.TokenDeath || plan.NewbieHomeRespawn {
+			return fmt.Errorf("sim: avoided death with token/newbie-respawn state: %w", ErrInvalidDeathInput)
+		}
+		// Source activates the special-item keep-guard in the avoided
+		// branch (same ActivateCheapDeath as cheap deaths).
+		if !plan.SpecialItemsKept {
+			return fmt.Errorf("sim: avoided death without special-item keep: %w", ErrInvalidDeathInput)
+		}
+	case DeathCheap:
+		if plan.DeathCost != 0 {
+			return fmt.Errorf("sim: cheap death cost %d: %w", plan.DeathCost, ErrInvalidDeathInput)
+		}
+		// The keep-guard is armed by the frenzy/newbie determination
+		// BEFORE the token check: a non-token cheap death always keeps
+		// artifacts, while a token cheap death may keep (earlier
+		// frenzy/newbie cause) or lose (pure token) them.
+		if !plan.TokenDeath && !plan.SpecialItemsKept {
+			return fmt.Errorf("sim: non-token cheap death without special-item keep: %w", ErrInvalidDeathInput)
+		}
+	case DeathNormal:
+		// Same 1..100 domain as ValidateDefaultDeathCost, reported as
+		// a plan-invariant violation.
+		if plan.DeathCost < minDefaultDeathCost || plan.DeathCost > maxDefaultDeathCost {
+			return fmt.Errorf("sim: normal death cost %d: %w", plan.DeathCost, ErrInvalidDeathInput)
+		}
+		if plan.TokenDeath || plan.NewbieHomeRespawn || plan.SpecialItemsKept {
+			return fmt.Errorf("sim: normal death with cheap-only state: %w", ErrInvalidDeathInput)
+		}
+	}
+	return nil
+}
+
 // ValidateDefaultDeathCost rejects a resolved settings default outside
 // 1..100 (spec §9.5.9). The default is server configuration, never a
 // silent 100.
@@ -324,6 +375,13 @@ type DeathDropItem struct {
 	PKProtectionDurationMs int64
 }
 
+// SpecialItemLost is the single unambiguous direct test T5b1/T5c consume
+// for the §9.5.14 specialItemLoss hook: the item is an artifact AND the
+// disposition's keep-guard did not save it.
+func (d DeathDropItem) SpecialItemLost() bool {
+	return d.SpecialItem && !d.SpecialItemKept
+}
+
 // DeathDropPlan is the ordered immutable relocation plan (input order
 // preserved over the two flat inventory families; source has no nested
 // player containers, so there is no recursive descent).
@@ -340,7 +398,7 @@ type DeathDropPlan struct {
 // consulted.
 func PlanDeathDrops(plan DeathDispositionPlan, items []DeathItemInput) (DeathDropPlan, error) {
 	disposition := plan.Disposition
-	if err := checkDisposition(disposition); err != nil {
+	if err := validateDispositionPlan(plan); err != nil {
 		return DeathDropPlan{}, err
 	}
 	if disposition == DeathAvoided {
@@ -426,7 +484,12 @@ type PostDeathVitalsInput struct {
 	FrenzyActive bool
 	// AngelMailEligible: the resolved still-newbie AND not-murderer AND
 	// cost>0 gate (source PFLAG_TUTORIAL false + PFLAG_MURDERER false).
-	// Contradictory with FrenzyActive (frenzy forces cost 0).
+	// Callers MUST produce this with GuardianAngelMailEligible (the one
+	// frozen gate shared with the §9.5.14 hook output); passing an
+	// invented value lets the mana override drift from the mail decision.
+	// Contradictory with FrenzyActive (frenzy forces cost 0), with a
+	// cheap disposition (cost 0), and a normal disposition contradicts
+	// FrenzyActive.
 	AngelMailEligible bool
 }
 
@@ -454,6 +517,17 @@ func PlanPostDeathVitals(in PostDeathVitalsInput) (PlayerVitals, error) {
 	}
 	if in.FrenzyActive && in.AngelMailEligible {
 		return PlayerVitals{}, fmt.Errorf("sim: angel mail on frenzy death: %w", ErrInvalidDeathInput)
+	}
+	// Frenzy routing is a cheap real death (source sets piDeathCost = 0),
+	// so a normal disposition with frenzy active is contradictory.
+	if in.Disposition == DeathNormal && in.FrenzyActive {
+		return PlayerVitals{}, fmt.Errorf("sim: frenzy death with normal disposition: %w", ErrInvalidDeathInput)
+	}
+	// The guardian mail/mana gate requires DeathCost > 0 while a cheap
+	// death has cost 0, so a cheap disposition with angel eligibility is
+	// contradictory.
+	if in.Disposition == DeathCheap && in.AngelMailEligible {
+		return PlayerVitals{}, fmt.Errorf("sim: angel mail on cheap death: %w", ErrInvalidDeathInput)
 	}
 	v := in.Vitals
 	if in.FrenzyActive {
@@ -493,6 +567,95 @@ func PlanPostDeathVitals(in PostDeathVitalsInput) (PlayerVitals, error) {
 	return v, nil
 }
 
+// GuardianAngelMailEligible freezes the ONE source guardian-angel gate
+// (player.kod Killed): piDeathCost > 0 AND still-newbie (source
+// PFLAG_TUTORIAL false) AND NOT murderer. It feeds BOTH the §9.5.7 mana
+// override (PlanPostDeathVitals AngelMailEligible input) and the §9.5.14
+// GuardianAngelMail hook output (PlanImmediateDeathHooks), so the mail
+// decision and the mana decision can never drift apart. deathCost is the
+// disposition's starting cost (0 for cheap/avoided, 1..100 for normal).
+func GuardianAngelMailEligible(deathCost int, stillNewbie, murderer bool) bool {
+	return deathCost > 0 && stillNewbie && !murderer
+}
+
+// ImmediateDeathHooksInput carries the RESOLVED facts the source Killed
+// immediate phase consumes for the two T5a hook outputs (spec §9.5.14).
+// T5a performs no item lookup and implements no faction system; the
+// caller resolves world/item state into these booleans/scalars.
+type ImmediateDeathHooksInput struct {
+	// FrenzyActive: chaos/frenzy night at death time. Contradictory with
+	// an eligible angel gate (frenzy forces cost 0).
+	FrenzyActive bool
+	// StillNewbie: source PFLAG_TUTORIAL is FALSE. Resolved input; never
+	// inferred from HP.
+	StillNewbie bool
+	// Murderer: resolved PFLAG_MURDERER.
+	Murderer bool
+	// HasSoldierShield: source FindUsing(&SoldierShield) <> $ (the victim
+	// was using a soldier shield at death time).
+	HasSoldierShield bool
+	// SoldierShieldRank: the shield's piFactionRank 1..10; meaningful
+	// only when HasSoldierShield is true.
+	SoldierShieldRank int
+	// KilledByFactionEnemy: resolved (logoff-penalty OR
+	// IsEnemyAttack(killer)) fact the source OwnerDied consumes: a
+	// faction enemy killed the victim (opposing-faction shield holder),
+	// or the logoff-ghost penalty applies regardless.
+	KilledByFactionEnemy bool
+}
+
+// ImmediateDeathHooks is the immutable immediate-phase hook decision
+// (spec §9.5.14): pure facts for later ownership. No mail is sent, no
+// shield object is mutated, no player state changes.
+type ImmediateDeathHooks struct {
+	// GuardianAngelMail: the guardian-angel mail is sent (presentation/
+	// message only; the mail system is post-MVP). Produced from the SAME
+	// frozen gate as the §9.5.7 mana override via
+	// GuardianAngelMailEligible.
+	GuardianAngelMail bool
+	// SoldierShieldDied: the victim's soldier shield is destroyed (source
+	// OwnerDied posts Delete when the faction-enemy/logoff death finds
+	// rank <= 3; higher ranks only lose 4 ranks — item mutation owned by
+	// the future item-hook integration, flag only here).
+	SoldierShieldDied bool
+}
+
+// PlanImmediateDeathHooks freezes the source Killed immediate hook facts
+// (spec §9.5.14) as a pure decision over a validated disposition plan
+// plus resolved inputs:
+//
+//	guardian mail: GuardianAngelMailEligible(plan.DeathCost, StillNewbie,
+//	               Murderer) — the exact gate producing the §9.5.7 mana
+//	               override. Frenzy with an eligible gate is rejected as
+//	               contradictory (same rule as PlanPostDeathVitals).
+//	shield died:  Disposition == DeathNormal (the OwnerDied call lives
+//	               inside the source NOT-cheap branch only) AND
+//	               HasSoldierShield AND KilledByFactionEnemy AND
+//	               SoldierShieldRank <= 3.
+//
+// A rank outside 1..10 with a present shield is ErrInvalidDeathInput; a
+// missing shield ignores rank/killer inputs. Avoided and cheap deaths
+// yield zero hooks through the natural gates (cost 0 kills the mail;
+// non-normal kills the shield fact). No lookup, gateway, Store, or live
+// mutation.
+func PlanImmediateDeathHooks(plan DeathDispositionPlan, in ImmediateDeathHooksInput) (ImmediateDeathHooks, error) {
+	if err := validateDispositionPlan(plan); err != nil {
+		return ImmediateDeathHooks{}, err
+	}
+	if in.HasSoldierShield && (in.SoldierShieldRank < 1 || in.SoldierShieldRank > 10) {
+		return ImmediateDeathHooks{}, fmt.Errorf("sim: soldier shield rank %d: %w", in.SoldierShieldRank, ErrInvalidDeathInput)
+	}
+	eligible := GuardianAngelMailEligible(plan.DeathCost, in.StillNewbie, in.Murderer)
+	if in.FrenzyActive && eligible {
+		return ImmediateDeathHooks{}, fmt.Errorf("sim: angel mail on frenzy death: %w", ErrInvalidDeathInput)
+	}
+	var hooks ImmediateDeathHooks
+	hooks.GuardianAngelMail = eligible
+	hooks.SoldierShieldDied = plan.Disposition == DeathNormal &&
+		in.HasSoldierShield && in.KilledByFactionEnemy && in.SoldierShieldRank <= 3
+	return hooks, nil
+}
+
 // DeathPhase is the persistence-agnostic lifecycle phase of the
 // pending-death plan (spec §9.5.8).
 type DeathPhase int8
@@ -521,7 +684,7 @@ type PendingDeathPlan struct {
 // real deaths (cheap AND normal) are pending with their starting cost
 // (cheap = 0) and death-time scalar.
 func PlanPendingDeath(plan DeathDispositionPlan, corpse CorpsePolicy) (PendingDeathPlan, error) {
-	if err := checkDisposition(plan.Disposition); err != nil {
+	if err := validateDispositionPlan(plan); err != nil {
 		return PendingDeathPlan{}, err
 	}
 	if corpse.LifetimeMs != PlayerCorpseDecomposeMs || corpse.NoStealMs != PlayerCorpseNoStealMs {
@@ -630,9 +793,23 @@ type DeathAbilityInput struct {
 	Ability int
 }
 
+// DeathAbilityKind identifies which stable namespace a planned ability
+// loss belongs to (spec §9.5.13). Voxilian keeps separate tables
+// (spell_protos/character_spells vs skill_protos/character_skills), so
+// the same numeric key MAY legally exist in both; every loss carries
+// its kind and T5b2 never guesses. Zero is invalid/unset.
+type DeathAbilityKind uint8
+
+const (
+	DeathAbilitySpell DeathAbilityKind = iota + 1
+	DeathAbilitySkill
+)
+
 // DeathAbilityLoss records one planned ability decrement, in roll and
-// list order.
+// list order. Kind states the namespace; Key is unique only within its
+// own list.
 type DeathAbilityLoss struct {
+	Kind        DeathAbilityKind
 	Key         int
 	FromAbility int
 	ToAbility   int
@@ -833,7 +1010,11 @@ func PlanDeathPenalties(rng RNG, in DeathPenaltyInput) (DeathPenaltyPlan, error)
 
 	// 6. Ability losses: spells then skills, input order.
 	plan.AbilityLosses = make([]DeathAbilityLoss, 0, len(in.Spells)+len(in.Skills))
-	for _, list := range [][]DeathAbilityInput{in.Spells, in.Skills} {
+	for i, list := range [][]DeathAbilityInput{in.Spells, in.Skills} {
+		kind := DeathAbilitySpell
+		if i == 1 {
+			kind = DeathAbilitySkill
+		}
 		for _, a := range list {
 			if a.Ability <= deathAbilityEligibilityAbove {
 				continue // ineligible: NO roll consumed
@@ -852,6 +1033,7 @@ func PlanDeathPenalties(rng RNG, in DeathPenaltyInput) (DeathPenaltyPlan, error)
 			if costRoll < plan.ScaledCost { // roll == cost SAVES
 				newAbility := boundInt64(int64(a.Ability)+int64(loss), deathAbilityFloor, deathAbilityCeil)
 				plan.AbilityLosses = append(plan.AbilityLosses, DeathAbilityLoss{
+					Kind:        kind,
 					Key:         a.Key,
 					FromAbility: a.Ability,
 					ToAbility:   int(newAbility),
