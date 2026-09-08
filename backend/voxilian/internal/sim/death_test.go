@@ -1254,34 +1254,70 @@ func TestImmediateDeathHooksGuardianAngelMail(t *testing.T) {
 
 func TestImmediateDeathHooksSoldierShield(t *testing.T) {
 	normal := mustPlan(t, 100, DeathContext{}, false)
+	cheap := mustPlan(t, 100, DeathContext{FrenzyActive: true}, false)
+	avoided := mustPlan(t, 100, DeathContext{PrisonRoom: true}, false)
 	cases := []struct {
 		name string
 		plan DeathDispositionPlan
 		in   ImmediateDeathHooksInput
-		want bool
+		want SoldierShieldDeathEffect
 	}{
-		{"rank3-enemy-dies", normal,
-			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 3, KilledByFactionEnemy: true}, true},
-		{"rank1-enemy-dies", normal,
-			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 1, KilledByFactionEnemy: true}, true},
-		{"rank4-enemy-survives", normal,
-			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 4, KilledByFactionEnemy: true}, false},
-		{"rank3-non-enemy-survives", normal,
-			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 3}, false},
+		{"rank1-enemy-delete", normal,
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 1, KilledByShieldEnemy: true},
+			SoldierShieldDeathEffect{Triggered: true, Delete: true}},
+		{"rank3-enemy-delete", normal,
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 3, KilledByShieldEnemy: true},
+			SoldierShieldDeathEffect{Triggered: true, Delete: true}},
+		{"rank4-enemy-survive-1", normal,
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 4, KilledByShieldEnemy: true},
+			SoldierShieldDeathEffect{Triggered: true, RankAfter: 1}},
+		{"rank5-enemy-survive-1", normal,
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 5, KilledByShieldEnemy: true},
+			SoldierShieldDeathEffect{Triggered: true, RankAfter: 1}},
+		{"rank6-enemy-survive-2", normal,
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 6, KilledByShieldEnemy: true},
+			SoldierShieldDeathEffect{Triggered: true, RankAfter: 2}},
+		{"rank7-enemy-survive-3", normal,
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 7, KilledByShieldEnemy: true},
+			SoldierShieldDeathEffect{Triggered: true, RankAfter: 3}},
+		{"rank8-enemy-survive-4", normal,
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 8, KilledByShieldEnemy: true},
+			SoldierShieldDeathEffect{Triggered: true, RankAfter: 4}},
+		{"rank9-enemy-survive-5", normal,
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 9, KilledByShieldEnemy: true},
+			SoldierShieldDeathEffect{Triggered: true, RankAfter: 5}},
+		{"rank10-enemy-survive-6", normal,
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 10, KilledByShieldEnemy: true},
+			SoldierShieldDeathEffect{Triggered: true, RankAfter: 6}},
+		{"rank1-non-enemy-no-effect", normal,
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 1},
+			SoldierShieldDeathEffect{}},
+		{"rank10-non-enemy-no-effect", normal,
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 10},
+			SoldierShieldDeathEffect{}},
 		{"no-shield", normal,
-			ImmediateDeathHooksInput{KilledByFactionEnemy: true}, false},
-		{"cheap-never-dies", mustPlan(t, 100, DeathContext{FrenzyActive: true}, false),
-			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 1, KilledByFactionEnemy: true}, false},
-		{"avoided-never-dies", mustPlan(t, 100, DeathContext{PrisonRoom: true}, false),
-			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 1, KilledByFactionEnemy: true}, false},
+			ImmediateDeathHooksInput{KilledByShieldEnemy: true},
+			SoldierShieldDeathEffect{}},
+		{"cheap-enemy-rank1-no-effect", cheap,
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 1, KilledByShieldEnemy: true},
+			SoldierShieldDeathEffect{}},
+		{"cheap-enemy-rank10-no-effect", cheap,
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 10, KilledByShieldEnemy: true},
+			SoldierShieldDeathEffect{}},
+		{"avoided-enemy-no-effect", avoided,
+			ImmediateDeathHooksInput{HasSoldierShield: true, SoldierShieldRank: 1, KilledByShieldEnemy: true},
+			SoldierShieldDeathEffect{}},
 	}
 	for _, c := range cases {
 		hooks, err := PlanImmediateDeathHooks(c.plan, c.in)
 		if err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
-		if hooks.SoldierShieldDied != c.want {
-			t.Fatalf("%s: died = %v, want %v", c.name, hooks.SoldierShieldDied, c.want)
+		if hooks.SoldierShield != c.want {
+			t.Fatalf("%s: effect = %+v, want %+v", c.name, hooks.SoldierShield, c.want)
+		}
+		if hooks.SoldierShield.Died() != c.want.Delete {
+			t.Fatalf("%s: Died() = %v, want %v", c.name, hooks.SoldierShield.Died(), c.want.Delete)
 		}
 		if hooks.GuardianAngelMail {
 			t.Fatalf("%s: unexpected angel mail (no newbie inputs)", c.name)
@@ -1291,11 +1327,46 @@ func TestImmediateDeathHooksSoldierShield(t *testing.T) {
 	// zero output.
 	for _, rank := range []int{0, -1, 11, 99} {
 		hooks, err := PlanImmediateDeathHooks(normal, ImmediateDeathHooksInput{
-			HasSoldierShield: true, SoldierShieldRank: rank, KilledByFactionEnemy: true,
+			HasSoldierShield: true, SoldierShieldRank: rank, KilledByShieldEnemy: true,
 		})
 		if !errors.Is(err, ErrInvalidDeathInput) || hooks != (ImmediateDeathHooks{}) {
 			t.Fatalf("rank %d: hooks=%+v err=%v", rank, hooks, err)
 		}
+	}
+}
+
+// --- immediate hooks: normal+frenzy contradiction --------------------------------
+
+func TestImmediateDeathHooksNormalFrenzyRejected(t *testing.T) {
+	normal := mustPlan(t, 100, DeathContext{}, false)
+	// Source-impossible: frenzy routing is a cheap real death before
+	// immediate hooks are planned. Rejected regardless of
+	// newbie/murderer/angel eligibility, with zero hook output.
+	bads := map[string]ImmediateDeathHooksInput{
+		"newbie-eligible":   {FrenzyActive: true, StillNewbie: true},
+		"non-newbie":        {FrenzyActive: true},
+		"murderer":          {FrenzyActive: true, StillNewbie: true, Murderer: true},
+		"with-shield-enemy": {FrenzyActive: true, HasSoldierShield: true, SoldierShieldRank: 1, KilledByShieldEnemy: true},
+	}
+	for name, in := range bads {
+		hooks, err := PlanImmediateDeathHooks(normal, in)
+		if !errors.Is(err, ErrInvalidDeathInput) {
+			t.Fatalf("%s: err = %v, want ErrInvalidDeathInput", name, err)
+		}
+		if hooks != (ImmediateDeathHooks{}) {
+			t.Fatalf("%s: hooks = %+v, want zero", name, hooks)
+		}
+	}
+	// The legitimate corners stay accepted: cheap + frenzy (frenzy routing
+	// IS a cheap death), and avoided coexisting with a globally-active
+	// frenzy via the avoided early-return precedence.
+	cheap := mustPlan(t, 100, DeathContext{FrenzyActive: true}, false)
+	if _, err := PlanImmediateDeathHooks(cheap, ImmediateDeathHooksInput{FrenzyActive: true}); err != nil {
+		t.Fatalf("cheap frenzy: %v", err)
+	}
+	avoided := mustPlan(t, 100, DeathContext{PrisonRoom: true}, false)
+	if _, err := PlanImmediateDeathHooks(avoided, ImmediateDeathHooksInput{FrenzyActive: true}); err != nil {
+		t.Fatalf("avoided frenzy: %v", err)
 	}
 }
 

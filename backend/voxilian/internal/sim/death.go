@@ -597,11 +597,35 @@ type ImmediateDeathHooksInput struct {
 	// SoldierShieldRank: the shield's piFactionRank 1..10; meaningful
 	// only when HasSoldierShield is true.
 	SoldierShieldRank int
-	// KilledByFactionEnemy: resolved (logoff-penalty OR
-	// IsEnemyAttack(killer)) fact the source OwnerDied consumes: a
-	// faction enemy killed the victim (opposing-faction shield holder),
-	// or the logoff-ghost penalty applies regardless.
-	KilledByFactionEnemy bool
+	// KilledByShieldEnemy: the resolved SoldierShield.IsEnemyAttack(killer)
+	// fact for THIS immediate death. This is the immediate `Killed`
+	// planner's OwnerDied input only: source `Player.Killed` invokes
+	// `OwnerDied(what=killer)` with the source default `logoff = FALSE`.
+	// The `logoff = TRUE` branch is a separate logoff-ghost penalty path
+	// (logghost system) and MUST NOT be folded into this resolved input;
+	// T5a takes no logoff boolean.
+	KilledByShieldEnemy bool
+}
+
+// SoldierShieldDeathEffect is the complete immutable SoldierShield death
+// outcome (spec §9.5.14): the source-faithful plan for future item-hook
+// ownership. No shield object is mutated, no faction state is touched, no
+// lookup is performed. The zero value is no effect.
+type SoldierShieldDeathEffect struct {
+	// Triggered: the OwnerDied death effect applies (Normal death with a
+	// present shield and IsEnemyAttack(killer)).
+	Triggered bool
+	// Delete: the shield is destroyed (rank 1..3). False with Triggered
+	// means the shield survives with RankAfter.
+	Delete bool
+	// RankAfter: the exact post-death faction rank when Triggered && !Delete
+	// (source ModifyFactionRank(-4) bounded 1..10). Meaningless otherwise.
+	RankAfter int
+}
+
+// Died reports whether the shield is destroyed (Triggered && Delete).
+func (e SoldierShieldDeathEffect) Died() bool {
+	return e.Triggered && e.Delete
 }
 
 // ImmediateDeathHooks is the immutable immediate-phase hook decision
@@ -613,11 +637,30 @@ type ImmediateDeathHooks struct {
 	// frozen gate as the §9.5.7 mana override via
 	// GuardianAngelMailEligible.
 	GuardianAngelMail bool
-	// SoldierShieldDied: the victim's soldier shield is destroyed (source
-	// OwnerDied posts Delete when the faction-enemy/logoff death finds
-	// rank <= 3; higher ranks only lose 4 ranks — item mutation owned by
-	// the future item-hook integration, flag only here).
-	SoldierShieldDied bool
+	// SoldierShield: the complete SoldierShield death outcome (source
+	// OwnerDied rank-loss branch included: rank 1..3 deleted, rank 4..10
+	// surviving with the exact post-death faction rank). Future
+	// item-hook integration consumes it; nothing is mutated here.
+	SoldierShield SoldierShieldDeathEffect
+}
+
+// planSoldierShieldDeathEffect is the ONE frozen SoldierShield outcome
+// computation (spec §9.5.14): Normal death with a present shield and
+// IsEnemyAttack(killer) triggers OwnerDied; rank 1..3 deletes the shield,
+// rank 4..10 survives with ModifyFactionRank(-4) bounded 1..10
+// (4->1, 5->1, 6->2, 7->3, 8->4, 9->5, 10->6). Rank domain (1..10 with a
+// present shield) is validated by the caller. No mutation, no lookup.
+func planSoldierShieldDeathEffect(disposition DeathDisposition, in ImmediateDeathHooksInput) SoldierShieldDeathEffect {
+	if disposition != DeathNormal || !in.HasSoldierShield || !in.KilledByShieldEnemy {
+		return SoldierShieldDeathEffect{}
+	}
+	if in.SoldierShieldRank <= 3 {
+		return SoldierShieldDeathEffect{Triggered: true, Delete: true}
+	}
+	return SoldierShieldDeathEffect{
+		Triggered: true,
+		RankAfter: int(boundInt64(int64(in.SoldierShieldRank)-4, 1, 10)),
+	}
 }
 
 // PlanImmediateDeathHooks freezes the source Killed immediate hook facts
@@ -628,16 +671,20 @@ type ImmediateDeathHooks struct {
 //	               Murderer) — the exact gate producing the §9.5.7 mana
 //	               override. Frenzy with an eligible gate is rejected as
 //	               contradictory (same rule as PlanPostDeathVitals).
-//	shield died:  Disposition == DeathNormal (the OwnerDied call lives
-//	               inside the source NOT-cheap branch only) AND
-//	               HasSoldierShield AND KilledByFactionEnemy AND
-//	               SoldierShieldRank <= 3.
+//	shield effect: planSoldierShieldDeathEffect — the OwnerDied call lives
+//	               inside the source NOT-cheap branch only (normal deaths),
+//	               with the source default logoff = FALSE, so the resolved
+//	               enemy input is IsEnemyAttack(killer) alone.
 //
-// A rank outside 1..10 with a present shield is ErrInvalidDeathInput; a
-// missing shield ignores rank/killer inputs. Avoided and cheap deaths
-// yield zero hooks through the natural gates (cost 0 kills the mail;
-// non-normal kills the shield fact). No lookup, gateway, Store, or live
-// mutation.
+// A normal disposition with frenzy active is rejected unconditionally
+// (frenzy routing is a cheap real death before immediate hooks are
+// planned), regardless of newbie/murderer/angel eligibility; a cheap
+// death with frenzy stays accepted, and an avoided death keeps its
+// early-return precedence. A rank outside 1..10 with a present shield is
+// ErrInvalidDeathInput; a missing shield ignores rank/killer inputs.
+// Avoided and cheap deaths yield zero shield effect through the natural
+// gates (non-normal kills the OwnerDied fact) and no mail (cost 0 kills
+// the gate). No lookup, gateway, Store, or live mutation.
 func PlanImmediateDeathHooks(plan DeathDispositionPlan, in ImmediateDeathHooksInput) (ImmediateDeathHooks, error) {
 	if err := validateDispositionPlan(plan); err != nil {
 		return ImmediateDeathHooks{}, err
@@ -645,15 +692,21 @@ func PlanImmediateDeathHooks(plan DeathDispositionPlan, in ImmediateDeathHooksIn
 	if in.HasSoldierShield && (in.SoldierShieldRank < 1 || in.SoldierShieldRank > 10) {
 		return ImmediateDeathHooks{}, fmt.Errorf("sim: soldier shield rank %d: %w", in.SoldierShieldRank, ErrInvalidDeathInput)
 	}
+	// Frenzy routing is a cheap real death (source sets piDeathCost = 0),
+	// so a normal disposition with frenzy active is contradictory —
+	// unconditionally, even when the angel gate is ineligible (same rule
+	// as PlanPostDeathVitals).
+	if plan.Disposition == DeathNormal && in.FrenzyActive {
+		return ImmediateDeathHooks{}, fmt.Errorf("sim: frenzy death with normal disposition: %w", ErrInvalidDeathInput)
+	}
 	eligible := GuardianAngelMailEligible(plan.DeathCost, in.StillNewbie, in.Murderer)
 	if in.FrenzyActive && eligible {
 		return ImmediateDeathHooks{}, fmt.Errorf("sim: angel mail on frenzy death: %w", ErrInvalidDeathInput)
 	}
-	var hooks ImmediateDeathHooks
-	hooks.GuardianAngelMail = eligible
-	hooks.SoldierShieldDied = plan.Disposition == DeathNormal &&
-		in.HasSoldierShield && in.KilledByFactionEnemy && in.SoldierShieldRank <= 3
-	return hooks, nil
+	return ImmediateDeathHooks{
+		GuardianAngelMail: eligible,
+		SoldierShield:     planSoldierShieldDeathEffect(plan.Disposition, in),
+	}, nil
 }
 
 // DeathPhase is the persistence-agnostic lifecycle phase of the
