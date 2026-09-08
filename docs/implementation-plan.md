@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.16)
+# Voxilian Backend — Implementation Plan (v1.17)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.32).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.33).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -243,7 +243,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   d100 boundaries + RNG consumption order, justice/guild hook flags.
   NO live mutation, NO Store/PG, NO corpse DB row, NO gateway/proto,
   NO Underworld teleport, NO respawn, NO opcode 120, NO migration.
-  Spec: §9.5 (frozen v0.3.32), meridian59 §9.5.
+  Spec: §9.5 (frozen v0.3.33), meridian59 §9.5.
 - [ ] **M5-T5b1** Durable immediate death-entry transaction (depends on
   T5a): ONE atomic critical Store operation conceptually
   `CommitDeathEntry(ctx, plan)` covering pending-death recovery state
@@ -425,6 +425,20 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.17: freeze M5 soldier-shield death outcome (spec v0.3.33 §9.5.14,
+  `meridian59.md` §9.5): `Player.Killed` invokes the currently-used
+  `SoldierShield` `OwnerDied(what=killer)` in the NORMAL-death branch
+  with source default `logoff = FALSE`; complete immutable
+  `soldierShieldDeathEffect` (no effect / delete shield / survive with
+  exact post-death faction rank) replaces the insufficient bare
+  `soldierShieldDied` boolean; rank 1..3 deleted, rank 4..10 survive
+  with exact vectors 4->1, 5->1, 6->2, 7->3, 8->4, 9->5, 10->6, gated
+  on Normal + shield present + `IsEnemyAttack(killer)`; `logoff = TRUE`
+  stays in the separate logoff-ghost system, out of the T5a immediate
+  `Killed` planner; unconditional `DeathNormal + FrenzyActive`
+  rejection frozen. Docs only; M5-T5a stays `[x]`, T5b1/T5b2/T5c/T6/T7
+  stay `[ ]`.
 
 - v1.16: freeze M5 death semantics after the upstream source audit
   (spec v0.3.32 §9.5) and replace the oversized single M5-T5 row with

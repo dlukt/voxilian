@@ -686,9 +686,21 @@ players cannot pick it up (victim always can). Dropped at the death square,
 gain chance is usually negative); `ResetGainFlags` (kill target + did-damage/
 took-damage/dodged flags); `ResetAtrophyFlags` (negate all spell entries —
 atrophy itself is disabled); advancement timer cancelled. Also normal-death
-only: `Post EvaluatePKStatus`, SoldierShield `OwnerDied`, and the karma
+only: `Post EvaluatePKStatus`, the currently-used SoldierShield
+`OwnerDied(what=killer)` (normal `Killed` call, source default
+`logoff = FALSE`; the `logoff = TRUE` branch is the separate
+logoff-ghost penalty path, not this immediate death), and the karma
 booby prize (karma > 5000 & home ≠ RID_NEWB1 → Hammer; else karma ≥ 0 →
 Mace; both tagged IA_MADE 5 h, anti-mule).
+
+**SoldierShield `OwnerDied` death outcome (normal death only):** no
+effect without a used shield, on non-Normal deaths, or when the killer
+is NOT `IsEnemyAttack` for the shield. On Normal death with a used
+shield AND `IsEnemyAttack(killer)`: rank 1..3 → shield deleted; rank
+4..10 → shield survives with `ModifyFactionRank(-4)`, rank bounded
+1..10. Exact surviving vectors: 4→1, 5→1, 6→2, 7→3, 8→4, 9→5, 10→6
+(item mutation itself is future integration; the plan carries the full
+outcome).
 
 **Immediate vitals + teleport:** `UserGotoDeadRoom`: death room in newbie
 range → teleport RID_NEWB1 (NOT the Underworld); else Underworld near-square

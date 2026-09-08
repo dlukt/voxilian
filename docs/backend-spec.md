@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.32 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.33 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -7918,7 +7918,7 @@ special cases. Consequences:
   invalid MaxMana, so no user-controlled input can create a panic path
   through invalid stored vitals.
 
-### 9.5 M5-T5 death pipeline (normative freeze, v0.3.32)
+### 9.5 M5-T5 death pipeline (normative freeze, v0.3.33)
 
 Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
 `SetDeathCost`/`CreateCorpse`/`ChangeSpellAbility`/`ChangeSkillAbility`,
@@ -8198,7 +8198,7 @@ inputs precedes the first roll.
 
 #### 9.5.14 Justice/guild/PK side-effect hook flags (classification)
 
-T5a outputs pure booleans; each is classified for later ownership:
+T5a outputs pure hook decisions; each is classified for later ownership:
 
 ```text
 clearOutlaw        — T5b2 durable core state (cost >= default branch)
@@ -8209,13 +8209,56 @@ quitGuild          — base BaseMaxHP < PKILL_ENABLE_HP (30) after penalties;
                      NOT live guild state on the player entity
 guardianAngelMail  — presentation/message only (mail system is post-MVP);
                      the mana side-effect rides §9.5.7 vitals instead
-soldierShieldDied  — future item-hook integration (flag now)
+soldierShieldDeathEffect — future item-hook integration (plan value now,
+                     NOT a bare boolean; see frozen rule below)
 karmaBoobyPrize    — deferred content hook (M9 protos); plan flag now
 specialItemLoss    — resolved per-item forced-loss flag (§9.5.5)
 ```
 
 No absent guild/faction/justice system is implemented in T5a; no fake
-guild state exists on the player entity.
+guild state exists on the player entity. No shield object is mutated, no
+faction state is implemented, no lookup is performed: T5a exposes only
+the immutable source-faithful plan below.
+
+Frozen SoldierShield death-outcome rule (source `player.kod` `Killed`
+normal-death branch invoking the currently-used `soldshld.kod`
+`OwnerDied(what=killer)` with the source default `logoff = FALSE`):
+
+```text
+if no SoldierShield:                              no effect
+if death is not Normal:                           no OwnerDied death effect
+if Normal death but NOT IsEnemyAttack(killer):    no SoldierShield death effect
+if Normal death AND shield present AND IsEnemyAttack(killer):
+    rank 1..3:   shield is deleted
+    rank 4..10:  shield survives with ModifyFactionRank(-4),
+                 rank bounded to 1..10
+```
+
+Exact surviving rank vectors (frozen):
+
+```text
+4  -> 1
+5  -> 1
+6  -> 2
+7  -> 3
+8  -> 4
+9  -> 5
+10 -> 6
+```
+
+The T5a immediate-`Killed` planner's resolved enemy input MUST mean only
+the immediate death's `SoldierShield.IsEnemyAttack(killer)`. The
+`logoff = TRUE` branch is a separate logoff-ghost penalty path
+(`logghost.kod` system) and MUST NOT be folded into the T5a immediate
+`Killed` plan; the future unsafe-logoff owner may compose the same pure
+calculation with `logoff = true`. T5a takes no logoff boolean.
+
+Frozen Normal+Frenzy contradiction guard: `plan.Disposition ==
+DeathNormal && FrenzyActive -> ErrInvalidDeathInput` unconditionally
+(zero hook output), regardless of newbie/murderer/angel eligibility.
+Frenzy routing is a cheap real death before immediate hooks are planned.
+`DeathCheap + FrenzyActive` remains accepted; an avoided death's
+early-return takes precedence so it is not over-constrained.
 
 #### 9.5.15 Underworld target is resolved, not hard-coded
 
@@ -8426,6 +8469,21 @@ arithmetic).
    survives it.
 
 ## 14. Version history
+
+- v0.3.33: freeze M5 soldier-shield death outcome (normative §9.5.14):
+  source `Player.Killed` invokes the currently-used `SoldierShield`
+  `OwnerDied(what=killer)` in the NORMAL-death branch with the source
+  default `logoff = FALSE`; `soldierShieldDied` alone is insufficient so
+  T5a exposes the complete immutable `soldierShieldDeathEffect` (no
+  effect / delete shield / survive with exact post-death faction rank);
+  rank 1..3 deleted, rank 4..10 survive via `ModifyFactionRank(-4)`
+  bounded 1..10 with exact vectors 4->1, 5->1, 6->2, 7->3, 8->4, 9->5,
+  10->6, gated on Normal + shield present + `IsEnemyAttack(killer)`; the
+  `logoff = TRUE` branch belongs to the separate logoff-ghost system and
+  is NOT merged into the T5a immediate `Killed` planner; unconditional
+  `DeathNormal + FrenzyActive -> ErrInvalidDeathInput` guard frozen
+  (cheap + frenzy stays accepted, avoided keeps early-return precedence).
+  Reconciled `meridian59.md` §9.5 accordingly. No implementation change.
 
 - v0.3.32: freeze M5 death semantics and split M5-T5 into T5a/T5b1/T5b2/T5c
   (normative §9.5): source-audited two-phase lifecycle (immediate
