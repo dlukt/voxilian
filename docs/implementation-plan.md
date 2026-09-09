@@ -256,7 +256,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   `CommitDeathEntry`, NO character/item death CAS composition, NO
   kill/ledger composition, NO sim/gateway/proto change, NO Portal
   mutation, NO penalties, NO expiry worker.
-- [ ] **M5-T5b1b** Atomic immediate death-entry Store transaction
+- [x] **M5-T5b1b** Atomic immediate death-entry Store transaction
   (depends on T5b1a): ONE atomic critical Store operation conceptually
   `CommitDeathEntry(ctx, plan)` covering pending-death recovery state,
   character immediate death state, corpse row (generated ID composed

@@ -29,6 +29,7 @@ type Store interface {
 	EnsureAccount(ctx context.Context, keycloakSub string, email *string) (int64, error)
 	CreateCharacter(ctx context.Context, nc NewCharacter) (int64, error)
 	ListLiveCharacters(ctx context.Context, accountID int64) ([]LiveCharacter, error)
+	CommitDeathEntry(ctx context.Context, req DeathEntryRequest) (DeathEntryResult, error)
 }
 
 // BankSnapshot is the complete bank write: composite identity plus the
