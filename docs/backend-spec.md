@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.36 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.37 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -7930,7 +7930,7 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
 
 #### 9.5.1 Ownership split and the two-phase lifecycle
 
-M5-T5 is FIVE tasks (this section is their shared boundary):
+M5-T5 is SIX tasks (this section is their shared boundary):
 
 - **T5a — pure/source-faithful death mechanics and immutable plans**
   (§9.5.4–§9.5.14 pure surface; §9.5.17 non-scope).
@@ -7946,15 +7946,43 @@ M5-T5 is FIVE tasks (this section is their shared boundary):
   character/mob identity domain. NO death/drop ledger row is written:
   T5b1b invents no ledger kind (§9.5.8a is binding) —
   plus stale/crash/commit-ambiguity proof. Depends on T5b1a.
-- **T5b2 — durable delayed Underworld-exit penalties** (§9.5.11–§9.5.13):
-  one SEPARATE atomic critical Store operation conceptually
-  `CommitDeathPenalties(ctx, plan)` covering pending-DeathCost consumption,
-  HP/ability penalties, clearing pending-death state, character/ability CAS
-  + ledger — plus the same proof obligations.
+- **T5b2a — durable Portal-of-Life state transition** (§9.5.10,
+  §8.1/§8.3 rules): one SEPARATE atomic critical Store operation
+  conceptually `CommitPortalOfLife(ctx, req)` covering ONLY the
+  character-root CAS plus the pending-death lowers-only cost update
+  with the once-per-corpse flag. Depends on T5a + T5b1b.
+- **T5b2b — exactly-once Underworld-exit penalty consumption**
+  (§9.5.11–§9.5.13): one SEPARATE atomic critical Store operation
+  conceptually `CommitDeathPenalties(ctx, plan)` covering the complete
+  already-resolved post-penalty character snapshot, pending-death
+  verification against the planned effective cost, child state
+  persistence, and pending-row deletion in the same transaction.
+  Depends on T5a + T5b1b + T5b2a.
 - **T5c — live runtime + transport integration**: zero-HP → death
   orchestration, dead/Underworld state, resolved world-target seams
   (§9.5.15), rest/regen cancellation/composition, C→S 120, S→C 214/215,
-  reconnect/crash recovery, end-to-end lifecycle proof.
+  reconnect/crash recovery, end-to-end lifecycle proof. Depends on
+  T5b1b + T5b2a + T5b2b + T4b2.
+
+M5-T5-complete is `T5a + T5b1a + T5b1b + T5b2a + T5b2b + T5c`.
+
+Ledger contract (binding on T5b2a/T5b2b): Portal-of-Life writes ZERO
+ledger rows. Underworld-exit death penalties write ZERO ledger rows.
+§8 ledger is the append-only money/item movement audit
+(trade/bank/vault/loot); no death-penalty ledger kind is frozen.
+§8.1 requires ledger/audit rows to share the critical transaction
+WHEN an operation produces such rows — it does not require every
+critical state mutation to invent an audit row. No death-penalty
+ledger kind is invented. Death history remains the existing `kills`
+row written during T5b1b where the killer was auditable. Recovery is
+always materialized state, never ledger replay.
+
+Ability persistence (binding): there is NO spell-row or skill-row
+revision/CAS root. `characters.revision` is the sole character
+aggregate CAS root. `character_spells` and `character_skills` are
+child rows guarded by the successful character-root CAS and replaced
+transactionally as part of the complete CharacterSnapshot. T5b2b
+reuses `saveCharacterSnapshotTx`; no separate ability CAS exists.
 
 Death is TWO durable phases mirroring source. Phase 1 (immediate
 real-death entry) and phase 2 (Underworld exit) are separate atomic
@@ -8190,7 +8218,7 @@ Semantics, all binding:
   and MUST NOT be used to reconstruct the mechanics scalar.
 - Phase encoding: the row's very existence means
   `DeathPhasePending`; there is deliberately NO phase column and no
-  speculative future state-machine value. Deleting the row (T5b2,
+  speculative future state-machine value. Deleting the row (T5b2b,
   inside its character-CAS transaction) IS the transition to
   `DeathPhaseNone`.
 - Corpse association: `corpse_id` is nullable with
@@ -8204,7 +8232,7 @@ Semantics, all binding:
   row: a partial `UNIQUE (corpse_id) WHERE corpse_id IS NOT NULL`
   pins this.
 - Portal once-per-corpse state: `portal_used` is the durable source
-  `pbResurrected` equivalent. It survives restart; T5b2 later
+  `pbResurrected` equivalent. It survives restart; T5b2a
   implements the atomic "Portal once + lowers-only DeathCost"
   operation against it. Default `FALSE`; round-trips.
 - CAS ownership: pending-death rows are a CHILD of the character
@@ -8214,7 +8242,7 @@ Semantics, all binding:
   inside a transaction whose FIRST mutation is a successful
   character-root revision CAS (`UPDATE characters ... WHERE
   revision = $expected`), per the §8.1 aggregate rule — exactly
-  like `character_spells`/`character_skills`. Future T5b1b/T5b2
+  like `character_spells`/`character_skills`. Future T5b1b/T5b2a/T5b2b
   critical transactions therefore can never combine stale character
   state with pending-death writes: a stale character revision
   aborts the whole transaction, including the pending-death
@@ -8322,14 +8350,14 @@ character/corpse transaction or PK protection without item CAS):
 InsertPendingDeath(character_id, effective_cost, death_time_seconds,
                    corpse_id, portal_used)   -- PK violation => replay
 GetPendingDeathByCharacter(character_id)     -- recovery/read path
-DeletePendingDeathByCharacter(character_id)  -- T5b2 frozen ClearPending
+DeletePendingDeathByCharacter(character_id)  -- T5b2b frozen ClearPending
 UpsertItemPKProtection(item_id, victim_character_id, expires_at)
 GetItemPKProtection(item_id)
 DeleteItemPKProtection(item_id)              -- expiry/pickup cleanup
 ```
 
 No pending-cost update primitive is added here: the lowers-only
-Portal mutation belongs to T5b2, which will freeze its own update
+Portal mutation belongs to T5b2a, which freezes its own update
 semantics. No `CommitDeathEntry`, no character/item death CAS
 composition, no kill/ledger composition in T5b1a.
 
@@ -8365,7 +8393,55 @@ runtime (T5c) may not offer expired corpses; invalid power (< 1, > 99)
 is a domain error BEFORE any RNG or mutation. T5a implements ONLY the
 pure calculation — no spell/corpse lookup, no gateway, no timer, no DB.
 
-#### 9.5.11 Delayed DeathCost normalization (T5a pure, T5b2 durable)
+#### 9.5.10a Durable Portal-of-Life transition (T5b2a, binding)
+
+Portal occurs after successful death entry but before Underworld
+exit, so it persists immediately and independently as its own
+durable transaction. The conceptual operation is
+`CommitPortalOfLife(ctx, req)`. Its atomic durable effect is:
+
+```text
+character root revision CAS
+pending_deaths.effective_cost lowers-only
+pending_deaths.portal_used = TRUE
+```
+
+No corpse mutation. No item mutation. No kill. No ledger. No
+pending-row deletion. No Underworld-exit penalties. Every
+pending-death gameplay mutation is guarded by a successful
+character-root CAS per §9.5.8a.
+
+Once + lowers-only semantics (binding): given current pending cost
+C and the caller-resolved proposed Portal cost P, the result cost
+is `min(C, P)` and `portal_used` becomes TRUE — even when the
+proposed value does NOT lower the cost:
+
+```text
+current 100, proposed 40 -> cost 40, portal_used true
+current 30,  proposed 50 -> cost 30, portal_used true
+current 30,  proposed 30 -> cost 30, portal_used true
+current 0,   proposed 5  -> cost 0,  portal_used true
+```
+
+The last case matters: a Cheap death must never be raised to 5
+merely because Portal's pure formula has a 5 floor. Portal use
+remains once-per-corpse even when no cost reduction occurs.
+
+Target identity (binding): Portal operates on the corpse the
+caster actually targeted, so the Store request carries the durable
+target corpse ID. The pending row must currently have
+`corpse_id = requested corpse ID` AND `portal_used = false`. A
+pending row whose `corpse_id` became NULL due to corpse expiry is
+no longer a valid Portal target; a different corpse ID is also
+invalid. No caller may apply Portal merely by character ID while
+ignoring the target corpse association.
+
+The caller supplies the proposed Portal result from the existing
+pure T5a calculation (output domain `5..80`; current pending cost
+itself remains `0..100`). Store calculates no corpse age, spell
+power, or Portal formula.
+
+#### 9.5.11 Delayed DeathCost normalization (T5a pure, T5b2b durable)
 
 Frozen branch order at Underworld exit:
 
@@ -8385,6 +8461,18 @@ Newbie status here is the resolved still-newbie boolean (§9.5.7) — NOT
 inferred from HP. Murderer is a resolved boolean. The murderer loss
 severity decision is read AFTER step 2's flag clears (source order; the
 PK re-evaluation is async and does not feed this check).
+
+#### 9.5.11a Durable Underworld-exit penalties (T5b2b future contract, binding)
+
+T5b2b is NOT implemented here; this freezes only enough to remove
+ambiguity for the following task. T5b2b will take a COMPLETE
+already-resolved post-penalty CharacterSnapshot, CAS the character
+root FIRST, verify the pending death still exists and matches the
+planned effective cost, persist vitals/flags/spell/skill child
+state through `saveCharacterSnapshotTx`, delete `pending_deaths`
+in the SAME transaction, commit once, and write ZERO ledger rows.
+No separate ability CAS exists. No T5b2b implementation belongs in
+T5b2a.
 
 #### 9.5.12 Delayed BaseMaxHP penalty (T5a composes T4a)
 
@@ -8427,8 +8515,8 @@ inputs precedes the first roll.
 T5a outputs pure hook decisions; each is classified for later ownership:
 
 ```text
-clearOutlaw        — T5b2 durable core state (cost >= default branch)
-clearHaunted       — T5b2 durable core state (both frenzy and full-cost)
+clearOutlaw        — T5b2b durable core state (cost >= default branch)
+clearHaunted       — T5b2b durable core state (both frenzy and full-cost)
 reEvaluatePKStatus — future phase-2 justice integration hook (flag now)
 quitGuild          — base BaseMaxHP < PKILL_ENABLE_HP (30) after penalties;
                      future phase-2 guild integration hook (flag now);
@@ -8516,8 +8604,8 @@ ability penalty plan + RNG order (§9.5.13), hook flags (§9.5.14).
 NON-SCOPE: live entity mutation, Store/PG imports, corpse DB rows, item
 mutation, gateway/proto changes, Underworld teleport, respawn, opcode
 120, timers, `internal/sim` importing `internal/store`/pgx/sqlc, any
-T5b1/T5b2/T5c/T6/T7 work. Stale-revision/commit-ambiguity behavior for
-T5b1/T5b2 follows §8.1/§8.3 exactly; no PG call occurs on the sim owner
+T5b1/T5b2a/T5b2b/T5c/T6/T7 work. Stale-revision/commit-ambiguity behavior for
+T5b1/T5b2a/T5b2b follows §8.1/§8.3 exactly; no PG call occurs on the sim owner
 goroutine.
 
 #### 9.5.18 Test minimums (T5a)
@@ -8695,6 +8783,32 @@ arithmetic).
    survives it.
 
 ## 14. Version history
+
+- v0.3.37: split M5 durable death phase-two into T5b2a (durable
+  Portal-of-Life state transition) + T5b2b (exactly-once
+  Underworld-exit penalty consumption), docs only; no schema/query
+  change. T5b2a <- T5a + T5b1b; T5b2b <- T5a + T5b1b + T5b2a;
+  T5c <- T5b1b + T5b2a + T5b2b + T4b2;
+  M5-T5-complete = T5a+T5b1a+T5b1b+T5b2a+T5b2b+T5c. Ledger contract
+  frozen: Portal-of-Life writes ZERO ledger rows, Underworld-exit
+  penalties write ZERO ledger rows (§8 ledger is the append-only
+  money/item audit; §8.1 shares the txn only WHEN rows are
+  produced); no death-penalty ledger kind invented; recovery stays
+  materialized state. Ability wording corrected: characters.revision
+  is the sole character aggregate CAS root; spells/skills are child
+  rows replaced transactionally in the complete CharacterSnapshot
+  (T5b2b reuses saveCharacterSnapshotTx). Portal frozen as its own
+  durable transaction (character-root CAS + lowers-only
+  effective_cost + portal_used TRUE; no corpse/item/kill/ledger/
+  deletion/penalties) with once + lowers-only semantics
+  (`min(C, P)`; flag TRUE even when proposed >= current, incl.
+  cheap cost 0 vs proposed 5) and target-corpse identity
+  (`corpse_id` match + `portal_used = false`; NULL/expired or
+  different corpse invalid). T5b2b future contract frozen
+  (complete snapshot, character-root CAS first, pending
+  verification, saveCharacterSnapshotTx, same-txn delete, zero
+  ledger). Checkbox state unchanged: T5a/T5b1a/T5b1b `[x]`,
+  T5b2a/T5b2b/T5c/T6/T7 and M5 exit `[ ]`.
 
 - v0.3.36: freeze M5 death-entry item relocation (docs only; T5a stays
   `[x]`, no schema/query change): normal player-death drops are GROUND

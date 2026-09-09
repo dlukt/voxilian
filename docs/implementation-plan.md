@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.20)
+# Voxilian Backend — Implementation Plan (v1.21)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.36).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.37).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -269,17 +269,30 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   replay rejection via the `pending_deaths` PK mapped to
   `ErrDeathAlreadyPending`; stale-revision/crash/commit-ambiguity
   proof per §8.1/§8.3. Spec: §9.5.1, §9.5.8a, §9.5.18.
-- [ ] **M5-T5b2** Durable delayed Underworld-exit penalties (depends on
-  T5a + T5b1b): ONE
-  separate atomic critical Store operation conceptually
-  `CommitDeathPenalties(ctx, plan)` covering pending DeathCost
-  consumption (Portal-of-Life lowers-only persistence), HP/ability
-  penalty application through character/ability CAS, justice flag
-  writes, clearing pending-death state, ledger rows in the same txn;
-  penalties-exactly-once, never-skip, stale/crash/commit-ambiguity
-  proof per §8.1/§8.3. Spec: §9.5.1, §9.5.11–§9.5.14.
+- [ ] **M5-T5b2a** Durable Portal-of-Life state transition (depends on
+  T5a + T5b1b): ONE separate atomic critical Store operation
+  conceptually `CommitPortalOfLife(ctx, req)` covering ONLY the
+  character-root CAS plus the pending-death lowers-only cost update
+  (`effective_cost = min(current, proposed)`, `portal_used = TRUE`
+  even when the proposal does not lower, incl. cheap cost 0) against
+  the durable target corpse ID (`corpse_id` match +
+  `portal_used = false`; expired/NULL or different corpse rejected);
+  zero ledger rows, zero kill rows; stale/crash/commit-ambiguity
+  proof per §8.1/§8.3. Spec: §9.5.1, §9.5.10, §9.5.10a.
+- [ ] **M5-T5b2b** Exactly-once Underworld-exit penalty consumption
+  (depends on T5a + T5b1b + T5b2a): ONE separate atomic critical
+  Store operation conceptually `CommitDeathPenalties(ctx, plan)`
+  taking a COMPLETE already-resolved post-penalty CharacterSnapshot,
+  CASing the character root FIRST, verifying the pending death still
+  exists and matches the planned effective cost, persisting
+  vitals/flags/spell/skill child state through
+  `saveCharacterSnapshotTx`, deleting `pending_deaths` in the SAME
+  transaction, committing once, writing ZERO ledger rows; no
+  separate ability CAS; penalties-exactly-once, never-skip,
+  stale/crash/commit-ambiguity proof per §8.1/§8.3.
+  Spec: §9.5.1, §9.5.11–§9.5.14, §9.5.11a.
 - [ ] **M5-T5c** Live runtime + transport death integration (depends on
-  T5b1b + T5b2 + T4b2): zero-HP → death orchestration on the sim owner
+  T5b1b + T5b2a + T5b2b + T4b2): zero-HP → death orchestration on the sim owner
   (composing LoseHealth's ZeroHP hook), dead/Underworld lifecycle state,
   resolved world-target/placement seams (no hard-coded Underworld
   coordinates), rest/regen cancellation/composition with §9.4b runtime,
@@ -290,7 +303,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
 - [ ] **M5-T6** Personal/world-light intents: `115 rest`, `116 eat` (hunger/vigor effects), `105 use` (skill/item dispatch incl. Second Wind), `119 safety_toggle`, `117/118 → 209` chat (+channel rules, length caps, rate limits). Owner of these opcodes: this task, no other. Spec: §6.3, §9.
 - [ ] **M5-T7** Authoritative attack/cast runtime integration (depends on
   M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a,   M5-T4b1, M5-T4b2,
-  M5-T5-complete (T5a+T5b1a+T5b1b+T5b2+T5c), M5-T6). Owns real C→S 103
+  M5-T5-complete (T5a+T5b1a+T5b1b+T5b2a+T5b2b+T5c), M5-T6). Owns real C→S 103
   attack routing, real C→S 104 cast routing, typed sim-owner combat
   commands, composition of T1/T2/T3a/T3b mechanics, authoritative T4
   HP/mana/vigor mutation, T5 death handoff, T6 safety/personal-state
@@ -409,10 +422,11 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M5-T5a | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2 | `backend/voxilian/internal/sim` (pure death mechanics/plans only: no live vitals, no store, no gateway) |
 | M5-T5b1a | M5-T5a | `backend/voxilian/{migrations,queries,internal/store}` (durable death schema + SQL primitives; one narrow pending-death/PK migration) |
 | M5-T5b1b | M5-T5b1a | `backend/voxilian/{queries,internal/store,internal/persist}` (atomic immediate death entry; no new migration) |
-| M5-T5b2 | M5-T5a, M5-T5b1b | `backend/voxilian/{queries,internal/store,internal/persist}` (durable delayed penalties; no second migration unless audit requires) |
-| M5-T5c | M5-T5b1b, M5-T5b2, M5-T4b2 | `backend/voxilian/internal/{sim,gateway}` (live death orchestration, 120/214/215, recovery) |
+| M5-T5b2a | M5-T5a, M5-T5b1b | `backend/voxilian/{queries,internal/store}` (durable Portal lowers-only transition; no new migration) |
+| M5-T5b2b | M5-T5a, M5-T5b1b, M5-T5b2a | `backend/voxilian/{queries,internal/store,internal/persist}` (durable delayed penalties; no second migration unless audit requires) |
+| M5-T5c | M5-T5b1b, M5-T5b2a, M5-T5b2b, M5-T4b2 | `backend/voxilian/internal/{sim,gateway}` (live death orchestration, 120/214/215, recovery) |
 | M5-T6 | M4-T1, M4-T2 | `backend/voxilian/internal/sim` + gateway only for its own listed personal intents |
-| M5-T7 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2, M5-T5a, M5-T5b1a, M5-T5b1b, M5-T5b2, M5-T5c, M5-T6 | `backend/voxilian/internal/{sim,gateway}` (authoritative 103/104 runtime integration) |
+| M5-T7 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2, M5-T5a, M5-T5b1a, M5-T5b1b, M5-T5b2a, M5-T5b2b, M5-T5c, M5-T6 | `backend/voxilian/internal/{sim,gateway}` (authoritative 103/104 runtime integration) |
 | M6-T1…T3 | M5-T1…T5 | `backend/voxilian/internal/sim` (progression) |
 | M7-T1 | M9-T1 (seed pipeline) + M1-T6b | `backend/voxilian/internal/sim`, `seed/` fixtures |
 | M7-T2a…c, T3, T4 | M4-T1…T3a, M1-T7b | `backend/voxilian/internal/sim` |
@@ -442,6 +456,23 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.21: split M5-T5b2 into T5b2a (durable Portal-of-Life state
+  transition) + T5b2b (exactly-once Underworld-exit penalty
+  consumption) and freeze the phase-two contracts (spec v0.3.37
+  §9.5.1/§9.5.10a/§9.5.11a: T5b2a <- T5a + T5b1b, T5b2b <-
+  T5a + T5b1b + T5b2a, T5c <- T5b1b + T5b2a + T5b2b + T4b2;
+  M5-T5-complete = T5a+T5b1a+T5b1b+T5b2a+T5b2b+T5c; Portal and
+  Underworld-exit penalties each write ZERO ledger rows — the old
+  "ledger rows in the same txn" T5b2 wording is not binding; no
+  death-penalty ledger kind invented; characters.revision is the
+  sole character aggregate CAS root with spells/skills as child
+  rows through saveCharacterSnapshotTx; Portal persists
+  immediately as its own transaction with once + lowers-only
+  semantics against the durable target corpse ID; T5b2b future
+  contract frozen to character-root-CAS-first + pending
+  verification + same-txn delete). Docs only; T5b2a/T5b2b/T5c/T6/T7
+  stay `[ ]`.
 
 - v1.20: freeze M5 death-entry item relocation (docs only, spec v0.3.36;
   no scope or dependency change): normal death drops persist as GROUND
