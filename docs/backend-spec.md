@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.33 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.34 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -7930,16 +7930,19 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
 
 #### 9.5.1 Ownership split and the two-phase lifecycle
 
-M5-T5 is FOUR tasks (this section is their shared boundary):
+M5-T5 is FIVE tasks (this section is their shared boundary):
 
 - **T5a — pure/source-faithful death mechanics and immutable plans**
   (§9.5.4–§9.5.14 pure surface; §9.5.17 non-scope).
-- **T5b1 — durable immediate death-entry transaction** (§9.5.8, §8.1/§8.3
-  rules): one atomic critical Store operation conceptually
+- **T5b1a — durable death schema + SQL primitives** (§9.5.8a): ONE
+  narrow goose migration (`pending_deaths` + `item_pk_protections`)
+  plus low-level sqlc primitives. No Store transaction, no sim.
+- **T5b1b — durable immediate death-entry transaction** (§9.5.8a,
+  §8.1/§8.3 rules): one atomic critical Store operation conceptually
   `CommitDeathEntry(ctx, plan)` covering pending-death recovery state,
   character immediate death state, corpse row, droppable item relocation,
   PK-drop metadata, advancement immediate reset/halve, kill/ledger audit —
-  plus stale/crash/commit-ambiguity proof.
+  plus stale/crash/commit-ambiguity proof. Depends on T5b1a.
 - **T5b2 — durable delayed Underworld-exit penalties** (§9.5.11–§9.5.13):
   one SEPARATE atomic critical Store operation conceptually
   `CommitDeathPenalties(ctx, plan)` covering pending-DeathCost consumption,
@@ -8047,9 +8050,9 @@ PKProtectionDurationMs = 600000 (source PKPOINTER_TIME = 10*60*1000)
 ```
 
 The PK-protection POLICY (non-PK-enabled players cannot pick the item up;
-the victim always can) is frozen here; its STORAGE (enchants JSON vs
-column vs table vs corpse metadata) is a T5b1 persistence decision after
-schema audit — T5a must not invent one. Cheap deaths produce an empty
+the victim always can) is frozen here; its STORAGE is frozen in §9.5.8a:
+the dedicated `item_pk_protections` child of the item aggregate (NOT
+`enchants` JSON). Cheap deaths produce an empty
 drop plan but still produce the special-item forced-loss flags.
 
 #### 9.5.6 Immediate advancement plan (normal death only)
@@ -8106,6 +8109,165 @@ consumed-once/cleared marker with the character aggregate's CAS rules).
 T5a implements NOTHING durable; a pure, persistence-agnostic
 pending-death plan value (phase, effective cost, death-time scalar,
 corpse-policy result) MAY be defined for T5b1 to persist.
+
+#### 9.5.8a T5b1a frozen death-persistence schema (migration 0006)
+
+This section freezes the T5b1 schema audit result. T5b1 is split into
+T5b1a (this schema + low-level SQL primitives, no transaction) and
+T5b1b (the atomic `CommitDeathEntry` Store transaction composing them).
+T5b1a implements no Store transaction, no sim change, no Portal
+mutation, no penalties, no expiry worker.
+
+Migration `0006_death_persistence.sql` is the ONE new goose migration;
+its Down reverses exactly what its Up adds. No second migration, no
+`corpses` alteration (that table stays as-is: corpse remains NOT a CAS
+root, and no DeathCost/Portal/death-time mechanics are duplicated into
+it).
+
+`pending_deaths` — the durable between-phase state. Columns:
+
+```text
+character_id         BIGINT PRIMARY KEY REFERENCES characters (id)
+effective_cost       SMALLINT NOT NULL CHECK (effective_cost BETWEEN 0 AND 100)
+death_time_seconds   BIGINT NOT NULL CHECK (death_time_seconds >= 0)
+corpse_id            BIGINT NULL REFERENCES corpses (id) ON DELETE SET NULL
+portal_used          BOOLEAN NOT NULL DEFAULT FALSE
+created_at           TIMESTAMPTZ NOT NULL DEFAULT now()  -- operational only
+```
+
+Semantics, all binding:
+
+- Character cardinality: at most ONE active pending-death row per
+  character. The PRIMARY KEY is `character_id` itself — the table IS
+  current state, never death history. Kills/ledger remain the
+  audit/history. A second death-entry insert for a character with a
+  live row fails on this PK; T5b1b maps that violation to the frozen
+  machine-readable sentinel `ErrDeathAlreadyPending` (a caller with a
+  freshly reloaded character revision is still rejected — character
+  CAS alone is not sufficient).
+- `effective_cost` is the Portal-reduced current cost, persisted
+  explicitly with a `0..100` DB CHECK. No `NULL = 0` magic: cheap
+  deaths store literal `0`.
+- `death_time_seconds` is the source-semantic whole-second scalar
+  (`>= 0`), persisted explicitly. `created_at` is operational only
+  and MUST NOT be used to reconstruct the mechanics scalar.
+- Phase encoding: the row's very existence means
+  `DeathPhasePending`; there is deliberately NO phase column and no
+  speculative future state-machine value. Deleting the row (T5b2,
+  inside its character-CAS transaction) IS the transition to
+  `DeathPhaseNone`.
+- Corpse association: `corpse_id` is nullable with
+  `ON DELETE SET NULL`. Pending death MUST survive natural corpse
+  expiration/deletion: after `DeleteCorpse`, the pending row STILL
+  EXISTS with `corpse_id` NULL and cost/time/portal state preserved
+  (the corpse FK `SET NULL` is a referential side effect, not a
+  gameplay mutation — it advances no revision). The association
+  therefore MUST NOT cascade-delete the pending row and MUST NOT
+  block `DeleteCorpse`. One live corpse backs at most one pending
+  row: a partial `UNIQUE (corpse_id) WHERE corpse_id IS NOT NULL`
+  pins this.
+- Portal once-per-corpse state: `portal_used` is the durable source
+  `pbResurrected` equivalent. It survives restart; T5b2 later
+  implements the atomic "Portal once + lowers-only DeathCost"
+  operation against it. Default `FALSE`; round-trips.
+- CAS ownership: pending-death rows are a CHILD of the character
+  aggregate, NOT an independent revisioned root (no `revision`
+  column). Every gameplay write to this table (insert at death
+  entry, cost lowering, row deletion at penalties) happens ONLY
+  inside a transaction whose FIRST mutation is a successful
+  character-root revision CAS (`UPDATE characters ... WHERE
+  revision = $expected`), per the §8.1 aggregate rule — exactly
+  like `character_spells`/`character_skills`. Future T5b1b/T5b2
+  critical transactions therefore can never combine stale character
+  state with pending-death writes: a stale character revision
+  aborts the whole transaction, including the pending-death
+  mutation. The sole exception is the FK-driven `SET NULL` above,
+  which carries no gameplay semantics.
+
+`item_pk_protections` — the durable PK-protection pointer (source
+`IA_PKPOINTER`, 600000 ms, victim-directed). A dedicated relational
+child table is chosen OVER `item_instances.enchants` JSON: `enchants`
+is opaque per-item content with no established extensibility contract
+for temporary gameplay attributes, while protection needs FK-backed
+victim identity, exactly-one-row cardinality, and deterministic
+replace semantics. Columns:
+
+```text
+item_id              BIGINT PRIMARY KEY REFERENCES item_instances (id)
+victim_character_id  BIGINT NOT NULL REFERENCES characters (id)
+expires_at           TIMESTAMPTZ NOT NULL
+```
+
+Semantics, all binding:
+
+- One current protection row per item (PRIMARY KEY is `item_id`);
+  the victim FK and the absolute expiry are always present. The
+  killer is NOT stored (no later policy consumes it).
+- Item-aggregate ownership: the protection is mutable child state of
+  the ITEM aggregate. Every write/replacement happens ONLY in the
+  SAME transaction as that item root's successful item-root CAS
+  (`UPDATE item_instances ... WHERE revision = $expected`), per
+  §8.1. NO public Store method may add protection to an existing
+  item without advancing/checking the item root revision; T5b1b
+  composes the low-level primitive inside the death transaction.
+- Re-drop semantics: re-protection of an already-protected item is a
+  deterministic UPSERT replacing victim + expiry with the new
+  death's values (no duplicate rows possible by construction).
+- Expiry: T5b1a implements no enforcement and no worker. Later
+  pickup enforcement owns interpreting `expires_at` (absolute time;
+  T5b1b computes it as death time + 600000 ms).
+
+Generated corpse-ID composition contract (binding on T5b1b): the
+corpse ID does not exist before the death-entry transaction. The
+future Store API MUST NOT require the caller/sim to fabricate or
+preallocate a corpse ID. The transaction conceptually begins,
+validates/CASes durable roots, inserts the corpse, obtains the
+generated corpse ID, and uses that ID for the pending-death
+association plus dropped-item corpse locations — committing once.
+
+Multi-item CAS / deadlock contract (binding on T5b1b): each dropped
+existing item is its own CAS root. The death transaction locks/CASes
+roots in deterministic order — character root FIRST, then item roots
+in ASCENDING `item_instances.id`. The T5a drop-plan order stays the
+GAMEPLAY/audit order and is not re-sorted for locking. Any stale root
+(character or item) rolls back EVERYTHING: character update, corpse
+creation, every earlier item update, pending-death insertion, PK
+metadata, kills, ledger. Nothing partially survives.
+
+Kill-audit decision (binding): `InsertKill` is mandatory ONLY when
+the resolved killer fits the existing auditable character/mob
+identity domain (`killer_kind` 0/1). Environmental/system/item killers
+outside that domain MUST NOT be represented by a fabricated
+mob/character ID — no `kills` row is written for them. `kills` is not
+broadened for convenience.
+
+Ledger decision (binding): T5b1b invents NO death/drop ledger kind.
+No death/drop ledger-kind numeric meaning is frozen anywhere in §8,
+so T5b1b inserts only the already-normative audit rows (the `kills`
+row per the paragraph above) and no ledger rows. Recovery MUST come
+from materialized state (`characters`, `pending_deaths`, `corpses`,
+`item_instances`/`item_locations`, `item_pk_protections`) — never by
+replaying ledger rows (§8.1/D7).
+
+T5b1a SQL primitives (low-level `internal/store` building blocks for
+T5b1b to compose transactionally — NOT independent public Store
+mutations, which could create pending death without the
+character/corpse transaction or PK protection without item CAS):
+
+```text
+InsertPendingDeath(character_id, effective_cost, death_time_seconds,
+                   corpse_id, portal_used)   -- PK violation => replay
+GetPendingDeathByCharacter(character_id)     -- recovery/read path
+DeletePendingDeathByCharacter(character_id)  -- T5b2 frozen ClearPending
+UpsertItemPKProtection(item_id, victim_character_id, expires_at)
+GetItemPKProtection(item_id)
+DeleteItemPKProtection(item_id)              -- expiry/pickup cleanup
+```
+
+No pending-cost update primitive is added here: the lowers-only
+Portal mutation belongs to T5b2, which will freeze its own update
+semantics. No `CommitDeathEntry`, no character/item death CAS
+composition, no kill/ledger composition in T5b1a.
 
 #### 9.5.9 DeathCost domain
 
