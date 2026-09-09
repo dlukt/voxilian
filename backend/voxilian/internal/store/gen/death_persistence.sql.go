@@ -11,6 +11,39 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const applyPendingDeathPortal = `-- name: ApplyPendingDeathPortal :one
+UPDATE pending_deaths
+SET effective_cost = LEAST(
+        effective_cost,
+        $1::smallint
+    ),
+    portal_used = TRUE
+WHERE character_id = $2
+  AND corpse_id = $3
+  AND portal_used = FALSE
+RETURNING character_id, effective_cost, death_time_seconds, corpse_id, portal_used, created_at
+`
+
+type ApplyPendingDeathPortalParams struct {
+	ProposedCost int16       `json:"proposed_cost"`
+	CharacterID  int64       `json:"character_id"`
+	CorpseID     pgtype.Int8 `json:"corpse_id"`
+}
+
+func (q *Queries) ApplyPendingDeathPortal(ctx context.Context, arg ApplyPendingDeathPortalParams) (PendingDeath, error) {
+	row := q.db.QueryRow(ctx, applyPendingDeathPortal, arg.ProposedCost, arg.CharacterID, arg.CorpseID)
+	var i PendingDeath
+	err := row.Scan(
+		&i.CharacterID,
+		&i.EffectiveCost,
+		&i.DeathTimeSeconds,
+		&i.CorpseID,
+		&i.PortalUsed,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const deleteItemPKProtection = `-- name: DeleteItemPKProtection :exec
 DELETE FROM item_pk_protections
 WHERE item_id = $1
@@ -86,13 +119,13 @@ type InsertPendingDeathParams struct {
 }
 
 // M5-T5b1a: low-level death-persistence primitives (spec §9.5.8a).
-// Building blocks for the T5b1b/T5b2 transactions ONLY. No public Store
+// Building blocks for the T5b1b/T5b2a/T5b2b transactions ONLY. No public Store
 // mutation may call these outside a character-root CAS transaction
 // (pending_deaths) or an item-root CAS transaction (item_pk_protections):
 // pending death without the character/corpse transaction, or PK
-// protection without item CAS, is forbidden. No pending-cost UPDATE
-// exists here — the lowers-only Portal mutation belongs to T5b2, which
-// freezes its own update semantics.
+// protection without item CAS, is forbidden. The ONE permitted
+// pending-cost UPDATE is the T5b2a lowers-only Portal mutation below
+// (spec §9.5.10a); no other UPDATE of either table exists.
 func (q *Queries) InsertPendingDeath(ctx context.Context, arg InsertPendingDeathParams) (PendingDeath, error) {
 	row := q.db.QueryRow(ctx, insertPendingDeath,
 		arg.CharacterID,

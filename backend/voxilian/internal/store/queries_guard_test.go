@@ -55,16 +55,31 @@ var auditMutateRe = regexp.MustCompile(`(?mi)^\s*(UPDATE\s+ledger|DELETE\s+FROM\
 // deathPersistenceFile owns the only production writes to the T5b1a
 // death-persistence tables (spec §9.5.8a). pending_deaths and
 // item_pk_protections are aggregate children composed transactionally
-// by T5b1b/T5b2 beside character/item-root CAS — never standalone.
-// T5b1a freezes no cost UPDATE: the lowers-only Portal update belongs
-// to T5b2, so UPDATE of either table is forbidden everywhere for now
-// (the sanctioned UPSERT's `DO UPDATE SET` line starts with ON
-// CONFLICT and is not matched, same as UpsertItemLocation above).
+// by T5b1b/T5b2a/T5b2b beside character/item-root CAS — never standalone.
+// T5b2a owns the ONE permitted production UPDATE of pending_deaths
+// (ApplyPendingDeathPortal: lowers-only cost + once flag, spec §9.5.10a).
+// No UPDATE of item_pk_protections exists anywhere, and no second
+// pending-death UPDATE may be added (the sanctioned UPSERT's
+// `DO UPDATE SET` line starts with ON CONFLICT and is not matched,
+// same as UpsertItemLocation above).
 var deathPersistenceFile = "death_persistence.sql"
 
 var deathWriteRe = regexp.MustCompile(`(?mi)^\s*(INSERT\s+INTO\s+(pending_deaths|item_pk_protections)\b|DELETE\s+FROM\s+(pending_deaths|item_pk_protections)\b)`)
 
 var deathUpdateRe = regexp.MustCompile(`(?mi)^\s*UPDATE\s+(pending_deaths|item_pk_protections)\b`)
+
+// deathPendingUpdateRe matches the one T5b2a-sanctioned UPDATE shape:
+// UPDATE pending_deaths (statement level). deathPKUpdateRe matches any
+// statement-level UPDATE of item_pk_protections, which is forbidden
+// everywhere with no exception.
+var deathPendingUpdateRe = regexp.MustCompile(`(?mi)^\s*UPDATE\s+pending_deaths\b`)
+
+var deathPKUpdateRe = regexp.MustCompile(`(?mi)^\s*UPDATE\s+item_pk_protections\b`)
+
+// portalUpdateQueryRe names the single permitted pending-death UPDATE
+// query. The guard requires exactly one UPDATE pending_deaths
+// statement in death_persistence.sql and requires it to be this query.
+var portalUpdateQueryRe = regexp.MustCompile(`-- name: ApplyPendingDeathPortal\b`)
 
 // catalogAccessRe matches production SQL touching catalog tables. Only
 // queries/catalogs.sql may do so (M1-T6d owns all catalog access).
@@ -146,14 +161,23 @@ func TestNoMutableRootQueries(t *testing.T) {
 		if m := deathWriteRe.FindString(string(raw)); m != "" && name != deathPersistenceFile {
 			t.Errorf("%s contains death-persistence write outside %s: %q", name, deathPersistenceFile, m)
 		}
-		if m := deathUpdateRe.FindString(string(raw)); m != "" {
-			t.Errorf("%s contains forbidden death-persistence UPDATE %q (no cost UPDATE in T5b1a)", name, m)
+		if m := deathUpdateRe.FindString(string(raw)); m != "" && name != deathPersistenceFile {
+			t.Errorf("%s contains death-persistence UPDATE outside %s: %q", name, deathPersistenceFile, m)
 		}
 		if name == deathPersistenceFile {
-			for _, want := range []string{"InsertPendingDeath", "GetPendingDeathByCharacter", "DeletePendingDeathByCharacter", "UpsertItemPKProtection", "GetItemPKProtection", "DeleteItemPKProtection"} {
+			for _, want := range []string{"InsertPendingDeath", "GetPendingDeathByCharacter", "DeletePendingDeathByCharacter", "ApplyPendingDeathPortal", "UpsertItemPKProtection", "GetItemPKProtection", "DeleteItemPKProtection"} {
 				if !strings.Contains(string(raw), "-- name: "+want) {
 					t.Errorf("%s missing required query %s", name, want)
 				}
+			}
+			if !portalUpdateQueryRe.MatchString(string(raw)) {
+				t.Errorf("%s missing required query ApplyPendingDeathPortal", name)
+			}
+			if n := len(deathPendingUpdateRe.FindAllString(string(raw), -1)); n != 1 {
+				t.Errorf("%s contains %d UPDATE pending_deaths statements, want exactly 1 (ApplyPendingDeathPortal)", name, n)
+			}
+			if m := deathPKUpdateRe.FindString(string(raw)); m != "" {
+				t.Errorf("%s contains forbidden %q (no UPDATE of item_pk_protections)", name, m)
 			}
 		}
 		if name == "catalogs.sql" {

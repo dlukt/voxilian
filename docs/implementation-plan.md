@@ -269,7 +269,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   replay rejection via the `pending_deaths` PK mapped to
   `ErrDeathAlreadyPending`; stale-revision/crash/commit-ambiguity
   proof per §8.1/§8.3. Spec: §9.5.1, §9.5.8a, §9.5.18.
-- [ ] **M5-T5b2a** Durable Portal-of-Life state transition (depends on
+- [x] **M5-T5b2a** Durable Portal-of-Life state transition (depends on
   T5a + T5b1b): ONE separate atomic critical Store operation
   conceptually `CommitPortalOfLife(ctx, req)` covering ONLY the
   character-root CAS plus the pending-death lowers-only cost update
