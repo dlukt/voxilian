@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.35 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.36 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -7992,7 +7992,19 @@ authority and later live integration resolves these facts.
 Sequencing freeze: the special-item forced-loss notification is emitted
 (1) in the avoided branch, and (2) after cheap-death determination but
 BEFORE the token check — so a Token death (which sets cheap) still loses
-the artifact. Token death additionally marks the token unused. The kill
+the artifact. A Token-triggered cheap death additionally carries a
+separate caller-resolved token unuse/ground-relocation side effect:
+the token is unused, its stored rest-threshold adjustment is undone on
+the player, and the token is moved to the death room at the player's
+death position — while the generic cheap `DeathDropPlan` remains
+empty. Ownership is frozen: T5a's `TokenDeath` bool remains the pure
+classification signal (no item object lookup in T5a); T5c/runtime
+resolves the actual token item, its runtime unuse state, and the
+resulting restored `PlayerVitals.Threshold`, building the complete
+character/item durable snapshots; T5b1b atomically persists those
+already-resolved snapshots together with the rest of immediate death
+entry. No Token proto/catalog ID is hard-coded anywhere, and no
+token-class lookup belongs in Store. The kill
 record/broadcast is written for every real death (cheap included), after
 the special-item block.
 
@@ -8044,7 +8056,9 @@ invented item IDs in T5a. Containers: source has NO nested player
 inventory (two flat lists); the plan is exactly the ordered inputs — no
 recursive descent is invented. The output plan preserves input order and
 records per dropped item: drop destination (to-death-position; source
-drops items at the death square unmerged), and PK-protection metadata
+places normal death drops on the GROUND at the death square unmerged —
+the player corpse and the dropped items are separate world objects),
+and PK-protection metadata
 WHEN the killer was a player:
 
 ```text
@@ -8055,8 +8069,28 @@ PKProtectionDurationMs = 600000 (source PKPOINTER_TIME = 10*60*1000)
 The PK-protection POLICY (non-PK-enabled players cannot pick the item up;
 the victim always can) is frozen here; its STORAGE is frozen in §9.5.8a:
 the dedicated `item_pk_protections` child of the item aggregate (NOT
-`enchants` JSON). Cheap deaths produce an empty
-drop plan but still produce the special-item forced-loss flags.
+`enchants` JSON). The generic cheap-death drop plan is empty but still
+produces the special-item forced-loss flags; a Token death additionally
+has the separate caller-resolved token unuse/ground-relocation side
+effect frozen in §9.5.2 (never a generic drop-plan entry).
+
+In Voxilian storage every normal-death drop is a ground placement at
+the death position:
+
+```text
+item_locations.kind = 1
+pos_x/pos_y/pos_z = death position
+character_id = NULL, corpse_id = NULL, container_item_id = NULL,
+vault_region = NULL, slot = NULL
+```
+
+Drops are NOT `kind = 2` corpse-contained placements using the
+generated corpse ID. The generic `item_locations kind = 2` schema stays
+valid for other corpse-contained item use cases; it is simply not the
+normal player-death drop location. The Token special relocation ends at
+the same ground death position and never gains PK protection merely
+because the killer was a player: Token death is cheap and the generic
+normal drop/PK path is skipped.
 
 #### 9.5.6 Immediate advancement plan (normal death only)
 
@@ -8226,7 +8260,34 @@ future Store API MUST NOT require the caller/sim to fabricate or
 preallocate a corpse ID. The transaction conceptually begins,
 validates/CASes durable roots, inserts the corpse, obtains the
 generated corpse ID, and uses that ID for the pending-death
-association plus dropped-item corpse locations — committing once.
+`pending_deaths.corpse_id` association (plus any genuinely
+corpse-owned future behavior) — committing once. The generated corpse
+ID is NOT used for ordinary player death-drop item locations: those
+are ground placements at the death position per §9.5.5
+(`item_locations.kind = 1`, all of `character_id`/`corpse_id`/
+`container_item_id`/`vault_region`/`slot` NULL). The player corpse row
+and the dropped-item ground rows are separate world objects sharing
+only the death position; no player death item is placed in the
+generated corpse merely to make the DB transaction easier.
+
+T5b1b death-item mutation contract (binding): the death transaction
+carries zero or more caller-resolved item aggregate mutations
+representing normal-death ground drops and/or the Token-death special
+ground relocation. Every such death-entry relocation MUST end at
+exactly the transaction's death position (`Kind = ground`,
+`Pos = DeathPos`, all non-ground references NULL); T5b1b rejects
+anything else, in particular `Kind = 2` / `CorpseID != nil`.
+Ordinary normal drops may additionally receive PK protection; the
+Token special relocation never does via the player-killer path. The
+frozen transaction model is therefore:
+
+```text
+character post-death durable snapshot
+item death-relocations -> ground at death position
+corpse row -> separate row at death position
+pending_deaths.corpse_id -> generated corpse ID
+optional kills row
+```
 
 Multi-item CAS / deadlock contract (binding on T5b1b): each dropped
 existing item is its own CAS root. The death transaction locks/CASes
@@ -8634,6 +8695,21 @@ arithmetic).
    survives it.
 
 ## 14. Version history
+
+- v0.3.36: freeze M5 death-entry item relocation (docs only; T5a stays
+  `[x]`, no schema/query change): normal player-death drops are GROUND
+  placements at the death position (`item_locations.kind = 1`, death
+  pos, all non-ground references NULL) — NOT `kind = 2` corpse-contained
+  placements; the generated corpse ID serves `pending_deaths.corpse_id`
+  (plus genuinely corpse-owned future behavior), never ordinary drop
+  locations; the generic cheap `DeathDropPlan` stays empty while a Token
+  death additionally carries a separate caller-resolved token
+  unuse/ground-relocation side effect (unuse, rest-threshold restore,
+  move to death room at death position; no PK protection via the
+  player-killer path); ownership split frozen as T5a pure `TokenDeath`
+  signal / T5c resolution / T5b1b atomic persistence with zero or more
+  caller-resolved ground relocations. No Token proto/catalog ID is
+  hard-coded; no token-class lookup belongs in Store.
 
 - v0.3.35: documentation consistency correction only (no schema or
   implemented-behavior change): §9.5.1 T5b1b ownership now states the

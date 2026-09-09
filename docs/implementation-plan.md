@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.19)
+# Voxilian Backend — Implementation Plan (v1.20)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.35).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.36).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -442,6 +442,17 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.20: freeze M5 death-entry item relocation (docs only, spec v0.3.36;
+  no scope or dependency change): normal death drops persist as GROUND
+  placements at the death position (never `kind = 2` corpse-contained);
+  the generated corpse ID serves `pending_deaths.corpse_id` only; the
+  generic cheap drop plan stays empty while Token death carries a
+  separate caller-resolved unuse/ground-relocation side effect owned as
+  T5a pure `TokenDeath` signal / T5c resolution / T5b1b atomic
+  persistence. T5a stays `[x]` (its pure signal is sufficient);
+  checkbox state unchanged: T5a/T5b1a `[x]`, T5b1b/T5b2/T5c/T6/T7 and
+  M5 exit `[ ]`.
 
 - v1.19: documentation consistency correction only (no scope or
   dependency change): M5-T5b1b task text now states the §9.5.8a audit

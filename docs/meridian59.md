@@ -651,8 +651,11 @@ cost. No state is shared between the phases except `piDeathCost` + corpse.
    corpse, no drop, no Underworld, no kill broadcast.
 2. *Cheap* real death ( corpse IS created, cost set 0): global Chaos/Frenzy
    night; OR death room in `[RID_NEWB_BASE..RID_NEWB_MAX]` (Raza 1010–1018);
-   OR honor string = newbie-honor; OR carrying a `Token` item (token becomes
-   unused, message sent). Special-item artifact loss
+   OR honor string = newbie-honor; OR carrying a `Token` item (token is
+   unused with its stored rest-threshold adjustment undone on the
+   player, the token is moved to the death room at the death position,
+   message sent; the generic cheap drop loop still drops nothing).
+   Special-item artifact loss
    (`ActivateCheapDeath`→`OwnerKilled`: Hunter Sword back into circulation,
    amulet order disband) fires in the avoided branch AND after the
    cheap-death determination but BEFORE the token check — so token deaths
@@ -678,8 +681,13 @@ TRUE; `SoldierShield`, mana crystals, reagent/wedding rings, room keys, and
 item-attribute vetoes return FALSE). If the killer `IsClass &user`, each
 dropped item additionally gets the `IA_PKPOINTER` item attribute,
 `PKPOINTER_TIME = 10*60*1000` ms, pointing at the victim: non-`PFLAG_PKILL_ENABLE`
-players cannot pick it up (victim always can). Dropped at the death square,
-`merge=FALSE`.
+players cannot pick it up (victim always can). Drops are placed on the
+GROUND at the death square (`merge=FALSE`) as world objects separate
+from the corpse row, which is placed at the same death square: the
+corpse holds no death-dropped items. The Token-triggered cheap death
+drops nothing through this generic loop; its only item movement is the
+separate token unuse/ground-relocation to the death room at the death
+position described above.
 
 **Immediate advancement (normal death only):** `piAdvancement_points = 0`;
 `piGain_chance = piGain_chance/2` (KOD `/` = C truncation toward zero —
