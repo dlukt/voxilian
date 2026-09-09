@@ -103,6 +103,12 @@ type ItemLocation struct {
 	Slot            pgtype.Text `json:"slot"`
 }
 
+type ItemPkProtection struct {
+	ItemID            int64              `json:"item_id"`
+	VictimCharacterID int64              `json:"victim_character_id"`
+	ExpiresAt         pgtype.Timestamptz `json:"expires_at"`
+}
+
 type ItemProto struct {
 	ID      int32       `json:"id"`
 	Kind    int16       `json:"kind"`
@@ -156,6 +162,15 @@ type Mute struct {
 	Reason    string             `json:"reason"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+type PendingDeath struct {
+	CharacterID      int64              `json:"character_id"`
+	EffectiveCost    int16              `json:"effective_cost"`
+	DeathTimeSeconds int64              `json:"death_time_seconds"`
+	CorpseID         pgtype.Int8        `json:"corpse_id"`
+	PortalUsed       bool               `json:"portal_used"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 }
 
 type ShopListing struct {

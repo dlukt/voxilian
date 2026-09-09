@@ -52,6 +52,20 @@ var characterDeleteRe = regexp.MustCompile(`(?mi)^\s*DELETE\s+FROM\s+characters\
 // ON CONFLICT replacement are normative and NOT matched here.
 var auditMutateRe = regexp.MustCompile(`(?mi)^\s*(UPDATE\s+ledger|DELETE\s+FROM\s+ledger|UPDATE\s+kills|DELETE\s+FROM\s+kills)\b`)
 
+// deathPersistenceFile owns the only production writes to the T5b1a
+// death-persistence tables (spec §9.5.8a). pending_deaths and
+// item_pk_protections are aggregate children composed transactionally
+// by T5b1b/T5b2 beside character/item-root CAS — never standalone.
+// T5b1a freezes no cost UPDATE: the lowers-only Portal update belongs
+// to T5b2, so UPDATE of either table is forbidden everywhere for now
+// (the sanctioned UPSERT's `DO UPDATE SET` line starts with ON
+// CONFLICT and is not matched, same as UpsertItemLocation above).
+var deathPersistenceFile = "death_persistence.sql"
+
+var deathWriteRe = regexp.MustCompile(`(?mi)^\s*(INSERT\s+INTO\s+(pending_deaths|item_pk_protections)\b|DELETE\s+FROM\s+(pending_deaths|item_pk_protections)\b)`)
+
+var deathUpdateRe = regexp.MustCompile(`(?mi)^\s*UPDATE\s+(pending_deaths|item_pk_protections)\b`)
+
 // catalogAccessRe matches production SQL touching catalog tables. Only
 // queries/catalogs.sql may do so (M1-T6d owns all catalog access).
 // Comments are stripped first so prose like "never UPDATE ledger" or
@@ -128,6 +142,19 @@ func TestNoMutableRootQueries(t *testing.T) {
 		}
 		if m := auditMutateRe.FindString(string(raw)); m != "" {
 			t.Errorf("%s contains forbidden audit mutation %q (ledger/kills are append-only)", name, m)
+		}
+		if m := deathWriteRe.FindString(string(raw)); m != "" && name != deathPersistenceFile {
+			t.Errorf("%s contains death-persistence write outside %s: %q", name, deathPersistenceFile, m)
+		}
+		if m := deathUpdateRe.FindString(string(raw)); m != "" {
+			t.Errorf("%s contains forbidden death-persistence UPDATE %q (no cost UPDATE in T5b1a)", name, m)
+		}
+		if name == deathPersistenceFile {
+			for _, want := range []string{"InsertPendingDeath", "GetPendingDeathByCharacter", "DeletePendingDeathByCharacter", "UpsertItemPKProtection", "GetItemPKProtection", "DeleteItemPKProtection"} {
+				if !strings.Contains(string(raw), "-- name: "+want) {
+					t.Errorf("%s missing required query %s", name, want)
+				}
+			}
 		}
 		if name == "catalogs.sql" {
 			continue

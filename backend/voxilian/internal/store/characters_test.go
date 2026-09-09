@@ -32,7 +32,7 @@ func contains(s, sub string) bool {
 }
 
 // openQueries migrates a fresh disposable database to the full current
-// schema (version 5) and returns a pool plus generated queries.
+// schema (version 6) and returns a pool plus generated queries.
 func openQueries(t *testing.T) (*pgxpool.Pool, *gen.Queries) {
 	t.Helper()
 	pg := simtest.StartPostgres18(t)
@@ -45,8 +45,8 @@ func openQueries(t *testing.T) (*pgxpool.Pool, *gen.Queries) {
 		t.Fatal(err)
 	}
 	dir := filepath.Join(simtest.RepoRoot(t), "backend", "voxilian", "migrations")
-	if err := goose.UpTo(sqldb, dir, 5); err != nil {
-		t.Fatalf("migrate to 5: %v", err)
+	if err := goose.UpTo(sqldb, dir, 6); err != nil {
+		t.Fatalf("migrate to 6: %v", err)
 	}
 	pool, err := pgxpool.New(context.Background(), pg.DSN)
 	if err != nil {

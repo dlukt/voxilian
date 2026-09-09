@@ -1058,6 +1058,163 @@ func TestMigration0005(t *testing.T) {
 	}
 }
 
+// TestMigration0006 proves the M5-T5b1a death-persistence schema against
+// real PostgreSQL 18. Pinned to version 6.
+func TestMigration0006(t *testing.T) {
+	pg := simtest.StartPostgres18(t)
+	db := openMigratedTo(t, pg.DSN, 6)
+
+	// 1-2: version and tables.
+	var ver int64
+	if err := db.QueryRow(`SELECT version_id FROM goose_db_version ORDER BY version_id DESC LIMIT 1`).Scan(&ver); err != nil {
+		t.Fatalf("goose version: %v", err)
+	}
+	if ver != 6 {
+		t.Fatalf("goose version = %d, want 6", ver)
+	}
+	for _, tbl := range []string{"pending_deaths", "item_pk_protections"} {
+		if !tableExists(t, db, tbl) {
+			t.Fatalf("table %s missing", tbl)
+		}
+	}
+	if !indexExists(t, db, "pending_deaths_corpse_uidx") {
+		t.Fatal("pending_deaths_corpse_uidx missing")
+	}
+
+	// Fixtures: account, two characters, one corpse, one item.
+	var acct, c1, c2, corpse, item int64
+	if err := db.QueryRow(`INSERT INTO accounts (keycloak_sub) VALUES ('sub-d6') RETURNING id`).Scan(&acct); err != nil {
+		t.Fatal(err)
+	}
+	mkchar := func(acct int64, slot int, name string) int64 {
+		var id int64
+		err := db.QueryRow(`INSERT INTO characters
+			(account_id, slot, name, gender, face, might, intellect, stamina, agility, mysticism, aim,
+			 karma, hometown, pos_x, pos_y, pos_z, vitals, advancement, flags, updated_at)
+			VALUES ($1,$2,$3,0,'{}',10,10,10,10,10,10,0,'tos',0,0,0,'{}','{}',0,now()) RETURNING id`,
+			acct, slot, name).Scan(&id)
+		if err != nil {
+			t.Fatalf("insert character %s: %v", name, err)
+		}
+		return id
+	}
+	c1, c2 = mkchar(acct, 0, "D6Victim"), mkchar(acct, 1, "D6Other")
+	if err := db.QueryRow(`INSERT INTO corpses (character_id,pos_x,pos_y,pos_z,expires_at)
+		VALUES ($1,0,0,0,now() + interval '10 minutes') RETURNING id`, c1).Scan(&corpse); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, `INSERT INTO item_protos (id,kind,slot,base,version) VALUES (760,0,NULL,'{}',1)`)
+	if err := db.QueryRow(`INSERT INTO item_instances (proto,qty,hits,enchants) VALUES (760,1,100,'{}') RETURNING id`).Scan(&item); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3: minimal row — cost 0, time 0, NULL corpse; portal_used and
+	// created_at take their defaults (FALSE / now()).
+	var portal bool
+	var created bool
+	mustExec(t, db, `INSERT INTO pending_deaths (character_id,effective_cost,death_time_seconds) VALUES ($1,0,0)`, c2)
+	if err := db.QueryRow(`SELECT portal_used, created_at IS NOT NULL FROM pending_deaths WHERE character_id=$1`, c2).Scan(&portal, &created); err != nil || portal || !created {
+		t.Fatalf("defaults portal=%v created=%v, %v; want false/true", portal, created, err)
+	}
+	mustExec(t, db, `DELETE FROM pending_deaths WHERE character_id=$1`, c2)
+
+	// 4: cost-100 boundary with corpse association + portal flag.
+	mustExec(t, db, `INSERT INTO pending_deaths (character_id,effective_cost,death_time_seconds,corpse_id,portal_used) VALUES ($1,100,42,$2,true)`, c1, corpse)
+	var cost int16
+	var dtime int64
+	var gotCorpse *int64
+	if err := db.QueryRow(`SELECT effective_cost,death_time_seconds,corpse_id FROM pending_deaths WHERE character_id=$1`, c1).Scan(&cost, &dtime, &gotCorpse); err != nil ||
+		cost != 100 || dtime != 42 || gotCorpse == nil || *gotCorpse != corpse {
+		t.Fatalf("roundtrip cost=%d time=%d corpse=%v, %v", cost, dtime, gotCorpse, err)
+	}
+	if err := db.QueryRow(`SELECT portal_used FROM pending_deaths WHERE character_id=$1`, c1).Scan(&portal); err != nil || !portal {
+		t.Fatalf("portal = %v, %v; want true", portal, err)
+	}
+
+	// 5: duplicate pending death for one character is impossible
+	// (T5b1b maps this PK to ErrDeathAlreadyPending).
+	if _, err := db.Exec(`INSERT INTO pending_deaths (character_id,effective_cost,death_time_seconds) VALUES ($1,0,0)`, c1); err == nil ||
+		!strings.Contains(err.Error(), "pending_deaths_pkey") {
+		t.Fatalf("duplicate err = %v, want pending_deaths_pkey", err)
+	}
+
+	// 6-7: cost rejects -1 and 101; time rejects negative.
+	for _, bad := range []int{-1, 101} {
+		if _, err := db.Exec(`INSERT INTO pending_deaths (character_id,effective_cost,death_time_seconds) VALUES ($1,$2,0)`, c2, bad); err == nil ||
+			!strings.Contains(err.Error(), "pending_deaths_effective_cost_check") {
+			t.Fatalf("cost %d err = %v, want effective_cost_check", bad, err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO pending_deaths (character_id,effective_cost,death_time_seconds) VALUES ($1,0,-1)`, c2); err == nil ||
+		!strings.Contains(err.Error(), "pending_deaths_death_time_check") {
+		t.Fatalf("negative time err = %v, want death_time_check", err)
+	}
+
+	// 8: invalid character and corpse FKs rejected.
+	if _, err := db.Exec(`INSERT INTO pending_deaths (character_id,effective_cost,death_time_seconds) VALUES (999999,0,0)`); err == nil {
+		t.Fatal("bad character accepted")
+	}
+	if _, err := db.Exec(`INSERT INTO pending_deaths (character_id,effective_cost,death_time_seconds,corpse_id) VALUES ($1,0,0,999999)`, c2); err == nil {
+		t.Fatal("bad corpse accepted")
+	}
+
+	// 9: one live corpse backs at most one pending row.
+	if _, err := db.Exec(`INSERT INTO pending_deaths (character_id,effective_cost,death_time_seconds,corpse_id) VALUES ($1,0,0,$2)`, c2, corpse); err == nil ||
+		!strings.Contains(err.Error(), "pending_deaths_corpse_uidx") {
+		t.Fatalf("shared corpse err = %v, want pending_deaths_corpse_uidx", err)
+	}
+
+	// 10: corpse expiry preserves the pending death with NULL
+	// association (ON DELETE SET NULL) — cost/time/portal survive.
+	mustExec(t, db, `DELETE FROM corpses WHERE id=$1`, corpse)
+	var keptCost int16
+	var keptTime int64
+	var keptPortal bool
+	var keptCorpse *int64
+	if err := db.QueryRow(`SELECT effective_cost,death_time_seconds,corpse_id,portal_used FROM pending_deaths WHERE character_id=$1`, c1).Scan(&keptCost, &keptTime, &keptCorpse, &keptPortal); err != nil ||
+		keptCost != 100 || keptTime != 42 || keptCorpse != nil || !keptPortal {
+		t.Fatalf("after expiry cost=%d time=%d corpse=%v portal=%v, %v", keptCost, keptTime, keptCorpse, keptPortal, err)
+	}
+
+	// 11-13: PK protection — valid row, expiry round-trip, one row per
+	// item, victim FK, bad item/victim rejected.
+	mustExec(t, db, `INSERT INTO item_pk_protections (item_id,victim_character_id,expires_at) VALUES ($1,$2,now() + interval '10 minutes')`, item, c1)
+	var victimGot int64
+	var expGot bool
+	if err := db.QueryRow(`SELECT victim_character_id, expires_at > now() FROM item_pk_protections WHERE item_id=$1`, item).Scan(&victimGot, &expGot); err != nil ||
+		victimGot != c1 || !expGot {
+		t.Fatalf("protection victim=%d future=%v, %v", victimGot, expGot, err)
+	}
+	if _, err := db.Exec(`INSERT INTO item_pk_protections (item_id,victim_character_id,expires_at) VALUES ($1,$2,now())`, item, c2); err == nil ||
+		!strings.Contains(err.Error(), "item_pk_protections_pkey") {
+		t.Fatalf("dup protection err = %v, want item_pk_protections_pkey", err)
+	}
+	if _, err := db.Exec(`INSERT INTO item_pk_protections (item_id,victim_character_id,expires_at) VALUES (999999,$1,now())`, c1); err == nil {
+		t.Fatal("bad protection item accepted")
+	}
+	if _, err := db.Exec(`INSERT INTO item_pk_protections (item_id,victim_character_id,expires_at) VALUES ($1,999999,now())`, item); err == nil {
+		t.Fatal("bad protection victim accepted")
+	}
+
+	// Rollback 6 → 5.
+	if err := goose.DownTo(db, migrationsDir(t), 5); err != nil {
+		t.Fatalf("goose down to 5: %v", err)
+	}
+	for _, tbl := range []string{"pending_deaths", "item_pk_protections"} {
+		if tableExists(t, db, tbl) {
+			t.Fatalf("table %s survives down-to-5", tbl)
+		}
+	}
+	if err := db.QueryRow(`SELECT version_id FROM goose_db_version ORDER BY version_id DESC LIMIT 1`).Scan(&ver); err != nil || ver != 5 {
+		t.Fatalf("version after down = %d, %v; want 5", ver, err)
+	}
+	for _, tbl := range []string{"accounts", "characters", "mob_protos", "item_instances", "item_locations", "banks", "corpses", "character_spells", "ledger", "kills"} {
+		if !tableExists(t, db, tbl) {
+			t.Fatalf("table %s lost by down-to-5", tbl)
+		}
+	}
+}
+
 // colsOf/valsOf split "a=1,b=2" fragments for negative-case INSERTs.
 func colsOf(frag string) string {
 	parts := strings.Split(frag, ",")

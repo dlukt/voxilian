@@ -11,7 +11,7 @@ import (
 )
 
 // TestMigratorEmbeddedSources proves the binary embeds exactly migrations
-// 1-5 with the expected filenames (no SQL contents asserted here).
+// 1-6 with the expected filenames (no SQL contents asserted here).
 func TestMigratorEmbeddedSources(t *testing.T) {
 	entries, err := migrations.FS.ReadDir(".")
 	if err != nil {
@@ -23,6 +23,7 @@ func TestMigratorEmbeddedSources(t *testing.T) {
 		"0003_character_abilities.sql":   false,
 		"0004_items_corpses_banks.sql":   false,
 		"0005_audit_kills_sanctions.sql": false,
+		"0006_death_persistence.sql":     false,
 	}
 	for _, e := range entries {
 		if _, ok := want[e.Name()]; !ok {
@@ -63,7 +64,7 @@ func TestMigratorFreshStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
-	if rep.Current != 0 || rep.Target != 5 || rep.Pending() != 5 || len(rep.Entries) != 5 {
+	if rep.Current != 0 || rep.Target != 6 || rep.Pending() != 6 || len(rep.Entries) != 6 {
 		t.Fatalf("fresh report = %+v", rep)
 	}
 }
@@ -79,10 +80,10 @@ func TestMigratorUpDownUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rep.Current != 5 || rep.Target != 5 || rep.Pending() != 0 {
+	if rep.Current != 6 || rep.Target != 6 || rep.Pending() != 0 {
 		t.Fatalf("after up = %+v", rep)
 	}
-	for _, tbl := range []string{"accounts", "characters", "spell_protos", "item_instances", "banks", "ledger", "kills", "bans", "mutes"} {
+	for _, tbl := range []string{"accounts", "characters", "spell_protos", "item_instances", "banks", "ledger", "kills", "bans", "mutes", "pending_deaths", "item_pk_protections"} {
 		if !tablePresent(t, m.db, tbl) {
 			t.Fatalf("table %s missing after up", tbl)
 		}
@@ -97,29 +98,32 @@ func TestMigratorUpDownUp(t *testing.T) {
 		t.Fatalf("second up: %v", err)
 	}
 	rep, _ = m.Status(ctx)
-	if rep.Current != 5 || rep.Pending() != 0 {
+	if rep.Current != 6 || rep.Pending() != 0 {
 		t.Fatalf("after second up = %+v", rep)
 	}
 
-	// Down rolls back exactly one (5), then up restores it.
+	// Down rolls back exactly one (6), then up restores it.
 	if err := m.Down(ctx); err != nil {
 		t.Fatalf("down: %v", err)
 	}
 	rep, _ = m.Status(ctx)
-	if rep.Current != 4 || rep.Pending() != 1 {
+	if rep.Current != 5 || rep.Pending() != 1 {
 		t.Fatalf("after down = %+v", rep)
 	}
-	if tablePresent(t, m.db, "ledger") {
-		t.Fatal("ledger survives down")
+	if tablePresent(t, m.db, "pending_deaths") {
+		t.Fatal("pending_deaths survives down")
 	}
-	if !tablePresent(t, m.db, "banks") {
-		t.Fatal("banks lost by down")
+	if tablePresent(t, m.db, "item_pk_protections") {
+		t.Fatal("item_pk_protections survives down")
+	}
+	if !tablePresent(t, m.db, "ledger") {
+		t.Fatal("ledger lost by down")
 	}
 	if err := m.Up(ctx); err != nil {
 		t.Fatalf("re-up: %v", err)
 	}
 	rep, _ = m.Status(ctx)
-	if rep.Current != 5 || rep.Pending() != 0 {
+	if rep.Current != 6 || rep.Pending() != 0 {
 		t.Fatalf("after re-up = %+v", rep)
 	}
 }
@@ -146,7 +150,7 @@ func TestMigratorNoWorkingDirectory(t *testing.T) {
 		t.Fatalf("up outside repo: %v", err)
 	}
 	rep, err := m.Status(ctx)
-	if err != nil || rep.Current != 5 || len(rep.Entries) != 5 {
+	if err != nil || rep.Current != 6 || len(rep.Entries) != 6 {
 		t.Fatalf("report = %+v, err = %v", rep, err)
 	}
 }

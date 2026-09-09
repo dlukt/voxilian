@@ -244,7 +244,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   NO live mutation, NO Store/PG, NO corpse DB row, NO gateway/proto,
   NO Underworld teleport, NO respawn, NO opcode 120, NO migration.
   Spec: §9.5 (frozen v0.3.33), meridian59 §9.5.
-- [ ] **M5-T5b1a** Durable death schema + SQL primitives (depends on
+- [x] **M5-T5b1a** Durable death schema + SQL primitives (depends on
   T5a; spec §9.5.8a): ONE narrow goose migration
   `0006_death_persistence.sql` (`pending_deaths` keyed by character:
   effective cost 0..100, whole-second death time, nullable corpse FK

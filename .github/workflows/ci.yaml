@@ -78,7 +78,7 @@ jobs:
       - run: cd /tmp && ./voxilian migrate status
       - run: cd /tmp && ./voxilian migrate up
       - run: cd /tmp && ./voxilian migrate status | tee /tmp/vox-status.txt
-      - run: grep -q 'current=5 target=5 pending=0' /tmp/vox-status.txt
+      - run: grep -q 'current=6 target=6 pending=0' /tmp/vox-status.txt
 
   # GHCR publish, gated on all validation jobs above. Trusted pushes to
   # main only — PRs build the image in `docker` without pushing.
