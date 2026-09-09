@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.34 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.35 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -7941,7 +7941,10 @@ M5-T5 is FIVE tasks (this section is their shared boundary):
   §8.1/§8.3 rules): one atomic critical Store operation conceptually
   `CommitDeathEntry(ctx, plan)` covering pending-death recovery state,
   character immediate death state, corpse row, droppable item relocation,
-  PK-drop metadata, advancement immediate reset/halve, kill/ledger audit —
+  PK-drop metadata, advancement immediate reset/halve, and the existing
+  kills audit row when the resolved killer fits the existing
+  character/mob identity domain. NO death/drop ledger row is written:
+  T5b1b invents no ledger kind (§9.5.8a is binding) —
   plus stale/crash/commit-ambiguity proof. Depends on T5b1a.
 - **T5b2 — durable delayed Underworld-exit penalties** (§9.5.11–§9.5.13):
   one SEPARATE atomic critical Store operation conceptually
@@ -8631,6 +8634,14 @@ arithmetic).
    survives it.
 
 ## 14. Version history
+
+- v0.3.35: documentation consistency correction only (no schema or
+  implemented-behavior change): §9.5.1 T5b1b ownership now states the
+  §9.5.8a decision verbatim — the atomic death-entry transaction covers
+  the existing kills audit row only when the resolved killer fits the
+  existing character/mob identity domain, and writes NO death/drop
+  ledger row (no invented ledger kind). The older "kill/ledger audit"
+  phrasing contradicted §9.5.8a and is removed.
 
 - v0.3.33: freeze M5 soldier-shield death outcome (normative §9.5.14):
   source `Player.Killed` invokes the currently-used `SoldierShield`

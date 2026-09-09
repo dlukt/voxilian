@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.18)
+# Voxilian Backend — Implementation Plan (v1.19)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.34).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.35).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -262,7 +262,9 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   character immediate death state, corpse row (generated ID composed
   inside the txn — never fabricated by sim), droppable item
   relocation, PK-drop metadata persistence, advancement immediate
-  reset/halve, kill/ledger audit rows in the same txn; deterministic
+  reset/halve, the existing kills audit row in the same txn when the
+  resolved killer fits the existing character/mob identity domain; no
+  death/drop ledger row; deterministic
   lock/CAS order (character root first, item roots ascending ItemID);
   replay rejection via the `pending_deaths` PK mapped to
   `ErrDeathAlreadyPending`; stale-revision/crash/commit-ambiguity
@@ -440,6 +442,15 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.19: documentation consistency correction only (no scope or
+  dependency change): M5-T5b1b task text now states the §9.5.8a audit
+  rule verbatim — the existing kills audit row in the same txn only
+  when the resolved killer fits the existing character/mob identity
+  domain, and no death/drop ledger row. The older "kill/ledger audit
+  rows" phrasing contradicted the frozen ledger decision. Checkbox
+  state unchanged: T5a/T5b1a `[x]`, T5b1b/T5b2/T5c/T6/T7 and M5 exit
+  `[ ]`.
 
 - v1.18: split M5-T5b1 into schema-first T5b1a (durable death schema +
   SQL primitives) + transactional T5b1b (atomic `CommitDeathEntry`)
