@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -872,4 +873,180 @@ func sameCharacter(a, b gen.Character) bool {
 func sameItemInstance(a, b gen.ItemInstance) bool {
 	return a.ID == b.ID && a.Revision == b.Revision && a.Qty == b.Qty &&
 		a.Hits == b.Hits && string(a.Enchants) == string(b.Enchants)
+}
+
+// TestCommitDeathEntryHostileDeathTime proves a hostile death-time
+// scalar can never silently become a different durable timestamp: the
+// maximum int64 death time plus an ordinary corpse lifetime overflows
+// the Unix-microsecond domain, so the PUBLIC operation rejects it
+// with ErrInvalidDeathEntry before any PG mutation, with no panic
+// and no stale-metric increment.
+func TestCommitDeathEntryHostileDeathTime(t *testing.T) {
+	f := newDeathFixture(t)
+	ctx := context.Background()
+	beforeLoc := readLoc(t, f.q, f.itemA)
+
+	req := DeathEntryRequest{
+		Character:          f.deathCharSnapshot(0),
+		DeathPosX:          deathPosX,
+		DeathPosY:          deathPosY,
+		DeathPosZ:          deathPosZ,
+		EffectiveDeathCost: 100,
+		DeathTimeSeconds:   math.MaxInt64,
+		CorpseLifetime:     deathCorpseLifetime,
+		Items:              []DeathEntryItem{{Snapshot: f.deathGroundItem(f.itemA, 0), PKProtectionDuration: deathPKDuration}},
+		Killer:             &DeathEntryKiller{Kind: DeathEntryKillerCharacter, CharacterID: f.killerCharID},
+	}
+	res, err := f.st.CommitDeathEntry(ctx, req)
+	if !errors.Is(err, ErrInvalidDeathEntry) {
+		t.Fatalf("err = %v, want ErrInvalidDeathEntry", err)
+	}
+	if !isZeroDeathResult(res) {
+		t.Fatalf("result = %+v, want zero", res)
+	}
+	if got := readRoot(t, f.q, f.victimID); got.Revision != 0 {
+		t.Fatalf("character moved: %+v", got)
+	}
+	if got := readItem(t, f.q, f.itemA); got.Revision != 0 {
+		t.Fatalf("item moved: %+v", got)
+	}
+	if afterLoc := readLoc(t, f.q, f.itemA); afterLoc != beforeLoc {
+		t.Fatalf("location moved: %+v vs %+v", afterLoc, beforeLoc)
+	}
+	if n := deathCount(t, f, `SELECT COUNT(*) FROM corpses WHERE character_id = $1`, f.victimID); n != 0 {
+		t.Fatalf("corpses = %d, want 0", n)
+	}
+	if _, err := f.q.GetPendingDeathByCharacter(ctx, f.victimID); !isNoRows(err) {
+		t.Fatalf("pending err = %v, want NoRows", err)
+	}
+	if _, err := f.q.GetItemPKProtection(ctx, f.itemA); !isNoRows(err) {
+		t.Fatalf("protection err = %v, want NoRows", err)
+	}
+	if n := deathCount(t, f, `SELECT COUNT(*) FROM kills WHERE victim_character_id = $1`, f.victimID); n != 0 {
+		t.Fatalf("kills = %d, want 0", n)
+	}
+	if n := deathCount(t, f, `SELECT COUNT(*) FROM ledger`); n != 0 {
+		t.Fatalf("ledger rows = %d, want 0", n)
+	}
+	if got := f.staleCount("character"); got != 0 {
+		t.Fatalf("character stale = %v, want 0", got)
+	}
+	if got := f.staleCount("item"); got != 0 {
+		t.Fatalf("item stale = %v, want 0", got)
+	}
+}
+
+// TestCommitDeathEntryPKExpiryOverflow proves validation checks EVERY
+// persisted derived timestamp, not only the corpse expiry: the death
+// time sits at the safe upper boundary for the corpse lifetime, but
+// the larger PK-protection duration overflows the Unix-microsecond
+// domain, so the request is rejected before PG mutation.
+func TestCommitDeathEntryPKExpiryOverflow(t *testing.T) {
+	f := newDeathFixture(t)
+	ctx := context.Background()
+	corpseMicros := int64(deathCorpseLifetime) / 1000
+	baseSec := (math.MaxInt64 - corpseMicros) / unixMicrosPerSecond
+	// Sanity: the corpse expiry itself is still representable.
+	if _, err := deathExpiryTime(baseSec, deathCorpseLifetime); err != nil {
+		t.Fatalf("corpse boundary should fit: %v", err)
+	}
+	// Two extra seconds push the protection expiry past MaxInt64.
+	overflowPK := deathCorpseLifetime + 2*time.Second
+	if _, err := deathExpiryTime(baseSec, overflowPK); !errors.Is(err, ErrInvalidDeathEntry) {
+		t.Fatalf("helper err = %v, want ErrInvalidDeathEntry", err)
+	}
+
+	req := DeathEntryRequest{
+		Character:          f.deathCharSnapshot(0),
+		DeathPosX:          deathPosX,
+		DeathPosY:          deathPosY,
+		DeathPosZ:          deathPosZ,
+		EffectiveDeathCost: 100,
+		DeathTimeSeconds:   baseSec,
+		CorpseLifetime:     deathCorpseLifetime,
+		Items:              []DeathEntryItem{{Snapshot: f.deathGroundItem(f.itemA, 0), PKProtectionDuration: overflowPK}},
+		Killer:             &DeathEntryKiller{Kind: DeathEntryKillerCharacter, CharacterID: f.killerCharID},
+	}
+	res, err := f.st.CommitDeathEntry(ctx, req)
+	if !errors.Is(err, ErrInvalidDeathEntry) {
+		t.Fatalf("err = %v, want ErrInvalidDeathEntry", err)
+	}
+	if !isZeroDeathResult(res) {
+		t.Fatalf("result = %+v, want zero", res)
+	}
+	if got := readRoot(t, f.q, f.victimID); got.Revision != 0 {
+		t.Fatalf("character moved: %+v", got)
+	}
+	if got := readItem(t, f.q, f.itemA); got.Revision != 0 {
+		t.Fatalf("item moved: %+v", got)
+	}
+	if n := deathCount(t, f, `SELECT COUNT(*) FROM corpses WHERE character_id = $1`, f.victimID); n != 0 {
+		t.Fatalf("corpses = %d, want 0", n)
+	}
+	if _, err := f.q.GetPendingDeathByCharacter(ctx, f.victimID); !isNoRows(err) {
+		t.Fatalf("pending err = %v, want NoRows", err)
+	}
+	if _, err := f.q.GetItemPKProtection(ctx, f.itemA); !isNoRows(err) {
+		t.Fatalf("protection err = %v, want NoRows", err)
+	}
+	if n := deathCount(t, f, `SELECT COUNT(*) FROM kills WHERE victim_character_id = $1`, f.victimID); n != 0 {
+		t.Fatalf("kills = %d, want 0", n)
+	}
+	if n := deathCount(t, f, `SELECT COUNT(*) FROM ledger`); n != 0 {
+		t.Fatalf("ledger rows = %d, want 0", n)
+	}
+	if got := f.staleCount("character"); got != 0 {
+		t.Fatalf("character stale = %v, want 0", got)
+	}
+	if got := f.staleCount("item"); got != 0 {
+		t.Fatalf("item stale = %v, want 0", got)
+	}
+}
+
+// TestDeathExpiryTimeBoundary unit-tests the checked helper's exact
+// arithmetic edge: a final Unix-microsecond scalar of exactly
+// MaxInt64 is accepted with an exact round-trip, one microsecond
+// more is rejected, ordinary production values match time.Add
+// exactly, sub-microsecond remainders truncate as the codec encodes,
+// and negative inputs are rejected.
+func TestDeathExpiryTimeBoundary(t *testing.T) {
+	// Exact top of the int64 microsecond domain.
+	base := int64(math.MaxInt64) / unixMicrosPerSecond
+	dur := time.Duration(int64(math.MaxInt64)%unixMicrosPerSecond) * time.Microsecond
+	got, err := deathExpiryTime(base, dur)
+	if err != nil {
+		t.Fatalf("max scalar: %v", err)
+	}
+	if micros := got.UnixMicro(); micros != math.MaxInt64 {
+		t.Fatalf("round-trip = %d, want MaxInt64", micros)
+	}
+	if _, err := deathExpiryTime(base, dur+time.Microsecond); !errors.Is(err, ErrInvalidDeathEntry) {
+		t.Fatalf("max+1 err = %v, want ErrInvalidDeathEntry", err)
+	}
+
+	// Ordinary production values are unchanged vs time.Add.
+	ordinary, err := deathExpiryTime(deathTimeSeconds, deathCorpseLifetime)
+	if err != nil {
+		t.Fatalf("ordinary: %v", err)
+	}
+	want := time.Unix(deathTimeSeconds, 0).UTC().Add(deathCorpseLifetime)
+	if !ordinary.Equal(want) {
+		t.Fatalf("ordinary = %v, want %v", ordinary, want)
+	}
+
+	// Sub-microsecond remainder truncates like the codec.
+	trunc, err := deathExpiryTime(100, 1500*time.Nanosecond)
+	if err != nil {
+		t.Fatalf("trunc: %v", err)
+	}
+	if micros := trunc.UnixMicro(); micros != 100*unixMicrosPerSecond+1 {
+		t.Fatalf("trunc = %d, want 100000001", micros)
+	}
+
+	if _, err := deathExpiryTime(-1, time.Second); !errors.Is(err, ErrInvalidDeathEntry) {
+		t.Fatalf("negative base err = %v, want ErrInvalidDeathEntry", err)
+	}
+	if _, err := deathExpiryTime(1, -time.Second); !errors.Is(err, ErrInvalidDeathEntry) {
+		t.Fatalf("negative duration err = %v, want ErrInvalidDeathEntry", err)
+	}
 }

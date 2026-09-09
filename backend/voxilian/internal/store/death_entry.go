@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -104,6 +105,51 @@ type DeathEntryResult struct {
 	ItemRevisions     []DeathEntryItemRevision
 }
 
+// Unix-microsecond bounds for the persisted timestamptz path. The
+// pgx v5.10.0 binary TimestamptzCodec encodes finite timestamps as a
+// signed int64 microsecond scalar (Unix seconds * 1e6 plus fractional
+// microseconds, relative to a fixed Unix->Y2K offset) using unchecked
+// arithmetic — so the death transaction must prove representability
+// itself before a time.Time is ever constructed or sent.
+const (
+	unixMicrosPerSecond = int64(1_000_000)
+	unixNanosPerMicro   = int64(1_000)
+)
+
+// deathExpiryTime derives baseSec + d as an exact expiry time.Time,
+// proving first with checked integer arithmetic that the finite
+// Unix-microsecond scalar the PostgreSQL/pgx timestamptz path encodes
+// fits in a signed int64. Inputs must already satisfy baseSec >= 0
+// and d >= 0 (enforced by request validation); violations here are
+// still reported as ErrInvalidDeathEntry, never a panic.
+//
+// The check accounts for every overflow contributor: the whole
+// seconds carried by the duration, its sub-second remainder
+// (truncated to whole microseconds exactly as the codec encodes it),
+// the Unix seconds -> microseconds multiplication, and the addition
+// of the fractional microseconds. Because the base is non-negative,
+// once the resulting Unix-microsecond value fits int64, the codec's
+// later subtraction of the fixed Unix->Y2K offset is also safe.
+//
+// time.Time.Add is deliberately NOT used to detect overflow: only
+// after the scalar is proven safe is a time.Time constructed from
+// its exact seconds + microseconds decomposition. No calendar upper
+// bound (year 9999 or otherwise) is imposed — rejection is purely
+// about representability of the actual encoded scalar.
+func deathExpiryTime(baseSec int64, d time.Duration) (time.Time, error) {
+	if baseSec < 0 || d < 0 {
+		return time.Time{}, fmt.Errorf("store: commit death entry negative timestamp base=%d duration=%s: %w",
+			baseSec, d, ErrInvalidDeathEntry)
+	}
+	durMicros := int64(d) / unixNanosPerMicro
+	if baseSec > (math.MaxInt64-durMicros)/unixMicrosPerSecond {
+		return time.Time{}, fmt.Errorf("store: commit death entry timestamp overflow base=%d duration=%s: %w",
+			baseSec, d, ErrInvalidDeathEntry)
+	}
+	totalMicros := baseSec*unixMicrosPerSecond + durMicros
+	return time.Unix(totalMicros/unixMicrosPerSecond, (totalMicros%unixMicrosPerSecond)*unixNanosPerMicro).UTC(), nil
+}
+
 // deathCASStale marks which aggregate root CAS missed inside the
 // death transaction so the public boundary can record exactly one
 // stale metric with the right aggregate label. It unwraps to
@@ -188,6 +234,20 @@ func validateDeathEntryRequest(req DeathEntryRequest) error {
 			return invalid("unknown killer kind=%d", uint8(req.Killer.Kind))
 		}
 	}
+	// Derived persisted timestamps must be representable as the finite
+	// Unix-microsecond scalar the timestamptz path encodes; a hostile
+	// base or duration is rejected here, before Begin, with zero PG
+	// mutation and zero stale-metric increment.
+	if _, err := deathExpiryTime(req.DeathTimeSeconds, req.CorpseLifetime); err != nil {
+		return err
+	}
+	for _, it := range req.Items {
+		if it.PKProtectionDuration > 0 {
+			if _, err := deathExpiryTime(req.DeathTimeSeconds, it.PKProtectionDuration); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -225,8 +285,6 @@ func commitDeathEntryTx(ctx context.Context, tx pgx.Tx, req DeathEntryRequest) (
 		return DeathEntryResult{}, fmt.Errorf("store: commit death entry character: %w", err)
 	}
 
-	deathInstant := time.Unix(req.DeathTimeSeconds, 0).UTC()
-
 	items := sortedDeathItems(req.Items)
 	itemRevs := make([]DeathEntryItemRevision, 0, len(items))
 	for _, it := range items {
@@ -241,10 +299,17 @@ func commitDeathEntryTx(ctx context.Context, tx pgx.Tx, req DeathEntryRequest) (
 			return DeathEntryResult{}, fmt.Errorf("store: commit death entry item id=%d: %w", it.Snapshot.ID, err)
 		}
 		if it.PKProtectionDuration > 0 {
+			// Already proven representable by request validation;
+			// re-derived through the same checked helper so
+			// validation and execution cannot drift.
+			protExpires, err := deathExpiryTime(req.DeathTimeSeconds, it.PKProtectionDuration)
+			if err != nil {
+				return DeathEntryResult{}, err
+			}
 			if _, err := q.UpsertItemPKProtection(ctx, gen.UpsertItemPKProtectionParams{
 				ItemID:            it.Snapshot.ID,
 				VictimCharacterID: req.Character.ID,
-				ExpiresAt:         pgtype.Timestamptz{Time: deathInstant.Add(it.PKProtectionDuration), Valid: true},
+				ExpiresAt:         pgtype.Timestamptz{Time: protExpires, Valid: true},
 			}); err != nil {
 				return DeathEntryResult{}, fmt.Errorf("store: commit death entry item id=%d PK protection: %w", it.Snapshot.ID, err)
 			}
@@ -252,12 +317,16 @@ func commitDeathEntryTx(ctx context.Context, tx pgx.Tx, req DeathEntryRequest) (
 		itemRevs = append(itemRevs, DeathEntryItemRevision{ItemID: it.Snapshot.ID, Revision: rev})
 	}
 
+	corpseExpires, err := deathExpiryTime(req.DeathTimeSeconds, req.CorpseLifetime)
+	if err != nil {
+		return DeathEntryResult{}, err
+	}
 	corpse, err := q.InsertCorpse(ctx, gen.InsertCorpseParams{
 		CharacterID: req.Character.ID,
 		PosX:        req.DeathPosX,
 		PosY:        req.DeathPosY,
 		PosZ:        req.DeathPosZ,
-		ExpiresAt:   pgtype.Timestamptz{Time: deathInstant.Add(req.CorpseLifetime), Valid: true},
+		ExpiresAt:   pgtype.Timestamptz{Time: corpseExpires, Valid: true},
 	})
 	if err != nil {
 		return DeathEntryResult{}, fmt.Errorf("store: commit death entry corpse: %w", err)
