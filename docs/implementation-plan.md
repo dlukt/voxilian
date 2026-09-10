@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.21)
+# Voxilian Backend — Implementation Plan (v1.22)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.37).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.38).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -281,14 +281,20 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   proof per §8.1/§8.3. Spec: §9.5.1, §9.5.10, §9.5.10a.
 - [ ] **M5-T5b2b** Exactly-once Underworld-exit penalty consumption
   (depends on T5a + T5b1b + T5b2a): ONE separate atomic critical
-  Store operation conceptually `CommitDeathPenalties(ctx, plan)`
-  taking a COMPLETE already-resolved post-penalty CharacterSnapshot,
-  CASing the character root FIRST, verifying the pending death still
-  exists and matches the planned effective cost, persisting
-  vitals/flags/spell/skill child state through
-  `saveCharacterSnapshotTx`, deleting `pending_deaths` in the SAME
-  transaction, committing once, writing ZERO ledger rows; no
-  separate ability CAS; penalties-exactly-once, never-skip,
+  Store operation conceptually `CommitDeathPenalties(ctx, req)`
+  taking a COMPLETE already-resolved post-penalty CharacterSnapshot
+  plus the raw durable `ExpectedPendingCost`
+  (`DeathPenaltyInput.PendingCost`, NOT `DeathPenaltyPlan.ScaledCost`).
+  Binding order: validate, Begin, `saveCharacterSnapshotTx` exactly
+  ONCE (character root CAS FIRST internally, then complete spell/skill
+  replacement), `GetPendingDeathByCharacter`, verify
+  `pending.effective_cost == ExpectedPendingCost`,
+  `DeletePendingDeathByCharacter` in the SAME transaction, commit
+  once; success ALWAYS deletes the pending row (no `ClearPending`
+  flag); `corpse_id` set/NULL and `portal_used` false/true are NOT
+  rejection conditions; Store runs no T5a mechanics and imports no
+  sim; writing ZERO ledger rows and ZERO kills rows; no separate
+  ability CAS; penalties-exactly-once, never-skip,
   stale/crash/commit-ambiguity proof per §8.1/§8.3.
   Spec: §9.5.1, §9.5.11–§9.5.14, §9.5.11a.
 - [ ] **M5-T5c** Live runtime + transport death integration (depends on
@@ -456,6 +462,20 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.22: freeze M5 death-penalty consumption ordering (docs only,
+  spec v0.3.38 §9.5.11a; no scope or dependency change): binding
+  T5b2b Store order is validate, Begin, `saveCharacterSnapshotTx`
+  exactly ONCE (root CAS FIRST internally), `GetPendingDeathByCharacter`,
+  raw-cost verification (`ExpectedPendingCost` =
+  `DeathPenaltyInput.PendingCost`, NOT `DeathPenaltyPlan.ScaledCost`),
+  same-txn `DeletePendingDeathByCharacter`, commit once; no manual
+  pre-CAS, no helper split; pre-verification state tentative with
+  atomic rollback; `corpse_id` set/NULL and `portal_used` false/true
+  are not exit gates; Store knows no `DeathPenaltyPlan` (no sim
+  import); success always consumes pending (no `ClearPending` flag).
+  Checkbox state unchanged: T5a/T5b1a/T5b1b/T5b2a `[x]`,
+  T5b2b/T5c/T6/T7 and M5 exit `[ ]`.
 
 - v1.21: split M5-T5b2 into T5b2a (durable Portal-of-Life state
   transition) + T5b2b (exactly-once Underworld-exit penalty

@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.37 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.38 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -8465,14 +8465,63 @@ PK re-evaluation is async and does not feed this check).
 #### 9.5.11a Durable Underworld-exit penalties (T5b2b future contract, binding)
 
 T5b2b is NOT implemented here; this freezes only enough to remove
-ambiguity for the following task. T5b2b will take a COMPLETE
-already-resolved post-penalty CharacterSnapshot, CAS the character
-root FIRST, verify the pending death still exists and matches the
-planned effective cost, persist vitals/flags/spell/skill child
-state through `saveCharacterSnapshotTx`, delete `pending_deaths`
-in the SAME transaction, commit once, and write ZERO ledger rows.
-No separate ability CAS exists. No T5b2b implementation belongs in
-T5b2a.
+ambiguity for the following task. The Store operation takes a COMPLETE
+already-resolved post-penalty CharacterSnapshot plus the raw durable
+pending cost (`ExpectedPendingCost`, i.e. the
+`DeathPenaltyInput.PendingCost` used to build the T5a penalty plan —
+NOT `DeathPenaltyPlan.ScaledCost`), and executes ONE transaction in
+this binding order:
+
+```text
+validate request
+Begin
+saveCharacterSnapshotTx(...)   // called exactly ONCE; character root
+                               // CAS FIRST internally, then complete
+                               // spell replacement, then complete skill
+                               // replacement
+GetPendingDeathByCharacter
+verify pending.effective_cost == ExpectedPendingCost
+DeletePendingDeathByCharacter
+Commit once
+```
+
+The root CAS MUST NOT be performed manually before calling
+`saveCharacterSnapshotTx` (that would double-CAS / double-advance the
+root), and the helper MUST NOT be split merely to interpose the
+pending read between its root CAS and child replacement. All
+character/child changes before the pending verification are only
+TENTATIVE inside the PostgreSQL transaction: an absent pending row, a
+cost mismatch, a delete/composition failure, or a commit failure rolls
+everything back atomically with no partial post-penalty character
+state surviving. The FIRST durable root mutation is the character CAS
+inside `saveCharacterSnapshotTx`, satisfying the §9.5.8a aggregate
+rule.
+
+Cost identity (binding): verification compares against the raw
+`PendingCost`. Example: durable pending cost 90 with
+still-newbie + non-murderer scaling to `ScaledCost` 30 verifies
+`== 90`, never `== 30`.
+
+Exit gates (binding): neither `corpse_id` (still referencing the
+corpse OR already NULL after corpse expiry) nor `portal_used` (false
+OR true) is a rejection condition for T5b2b. The phase authority is
+pending-row existence plus the raw-cost match; T5b2b consumes that
+pending phase regardless of corpse lifetime.
+
+Mechanics ownership (binding): T5a remains the mechanics owner.
+T5c/runtime later loads the pending death, runs `PlanDeathPenalties`,
+applies the pure result to authoritative runtime state, builds the
+COMPLETE resulting CharacterSnapshot, and passes the raw pre-scaling
+pending cost to Store. Store persists the already-resolved snapshot
+and consumes the pending row; it runs no RNG, HP/ability/newbie-scaling
+calculation, flag interpretation, PK reevaluation, or guild operation,
+and imports no `internal/sim`.
+
+Consumption (binding): there is no `ClearPending` request boolean — a
+successful commit ALWAYS deletes the pending row (T5a guarantees a
+valid penalty plan has `ClearPending=true`). The operation writes ZERO
+ledger rows and ZERO kills rows. No separate ability CAS exists. No
+T5b2b implementation belongs in T5b2a.
 
 #### 9.5.12 Delayed BaseMaxHP penalty (T5a composes T4a)
 
@@ -8783,6 +8832,23 @@ arithmetic).
    survives it.
 
 ## 14. Version history
+
+- v0.3.38: freeze M5 death-penalty consumption ordering (docs only;
+  no schema/query change). §9.5.11a now states the binding T5b2b Store
+  order (validate, Begin, `saveCharacterSnapshotTx` exactly ONCE with
+  its internal root-CAS-first, `GetPendingDeathByCharacter`, verify
+  `pending.effective_cost == ExpectedPendingCost`,
+  `DeletePendingDeathByCharacter`, commit once; no manual pre-CAS, no
+  helper split; pre-verification state is tentative and rolls back
+  atomically); freezes the raw-cost identity (`ExpectedPendingCost` =
+  `DeathPenaltyInput.PendingCost`, NOT `DeathPenaltyPlan.ScaledCost`;
+  90-vs-30 newcomer example); clarifies Underworld exit does not gate
+  on `corpse_id` (set or NULL) or `portal_used` (false or true);
+  confirms Store knows no `DeathPenaltyPlan` (T5a owns mechanics,
+  T5c/runtime resolves, Store persists + consumes, no `internal/sim`
+  import); confirms success always consumes pending (no `ClearPending`
+  flag). Checkbox state unchanged: T5a/T5b1a/T5b1b `[x]`,
+  T5b2a/T5b2b/T5c/T6/T7 and M5 exit `[ ]`.
 
 - v0.3.37: split M5 durable death phase-two into T5b2a (durable
   Portal-of-Life state transition) + T5b2b (exactly-once
