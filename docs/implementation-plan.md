@@ -279,7 +279,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   `portal_used = false`; expired/NULL or different corpse rejected);
   zero ledger rows, zero kill rows; stale/crash/commit-ambiguity
   proof per §8.1/§8.3. Spec: §9.5.1, §9.5.10, §9.5.10a.
-- [ ] **M5-T5b2b** Exactly-once Underworld-exit penalty consumption
+- [x] **M5-T5b2b** Exactly-once Underworld-exit penalty consumption
   (depends on T5a + T5b1b + T5b2a): ONE separate atomic critical
   Store operation conceptually `CommitDeathPenalties(ctx, req)`
   taking a COMPLETE already-resolved post-penalty CharacterSnapshot

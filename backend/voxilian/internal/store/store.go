@@ -31,6 +31,7 @@ type Store interface {
 	ListLiveCharacters(ctx context.Context, accountID int64) ([]LiveCharacter, error)
 	CommitDeathEntry(ctx context.Context, req DeathEntryRequest) (DeathEntryResult, error)
 	CommitPortalOfLife(ctx context.Context, req PortalOfLifeRequest) (PortalOfLifeResult, error)
+	CommitDeathPenalties(ctx context.Context, req DeathPenaltiesRequest) (DeathPenaltiesResult, error)
 }
 
 // BankSnapshot is the complete bank write: composite identity plus the
