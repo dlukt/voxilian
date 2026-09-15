@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.22)
+# Voxilian Backend — Implementation Plan (v1.23)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.38).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.39).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -297,19 +297,49 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   ability CAS; penalties-exactly-once, never-skip,
   stale/crash/commit-ambiguity proof per §8.1/§8.3.
   Spec: §9.5.1, §9.5.11–§9.5.14, §9.5.11a.
-- [ ] **M5-T5c** Live runtime + transport death integration (depends on
-  T5b1b + T5b2a + T5b2b + T4b2): zero-HP → death orchestration on the sim owner
-  (composing LoseHealth's ZeroHP hook), dead/Underworld lifecycle state,
-  resolved world-target/placement seams (no hard-coded Underworld
-  coordinates), rest/regen cancellation/composition with §9.4b runtime,
-  C→S 120 RespawnAck handling, S→C 214 Death / 215 Respawn transport,
-  reconnect/crash recovery through the durable pending-death state,
-  final end-to-end death lifecycle proof. Spec: §9.5.1, §9.5.15,
-  §9.5.16.
+- [ ] **M5-T5c1** Multi-root critical Saver coordination (depends on
+  the existing Saver/persistence foundation): the generic
+  Store-agnostic `internal/sim` Saver primitive that owns the gates
+  of MULTIPLE already-tracked aggregate roots simultaneously while
+  ONE caller-supplied callback executes the underlying critical
+  transaction. Canonical `AggregateKey.Less` gate order, no
+  caller-slice reorder, execution-time revision capture, one
+  critical dirty generation per participant, `pending.gen <=
+  critical` supersession with newer-pending retention, conservative
+  post-invocation error rule (ANY callback error reconcile-blocks
+  ALL participants, cause + `ErrSaverReconcileRequired`), no
+  blanket block before invocation, `MaxInt64` fail-closed, exact
+  `expected+1` result validation, canonical result order, no new
+  metric, no PG I/O. NO Store/persist/PG/gateway/proto/death-state/
+  recovery-API work (those are T5c2–T5c4). Spec: §8.3.17, §9.5.1a.
+- [ ] **M5-T5c2** Death persistence adapters + materialized recovery
+  (depends on T5b1b + T5b2a + T5b2b + T5c1): `persist` adapters for
+  `CommitDeathEntry` / `CommitPortalOfLife` / `CommitDeathPenalties`
+  mapping execution-time Saver revisions into Store request
+  `ExpectedRevision` fields, plus the materialized recovery/read
+  seams required after stale, callback error / commit ambiguity,
+  reconnect, or restart. The ONLY T5c layer that may add Store read
+  APIs if required. Spec: §9.5.1, §9.5.1a, §9.5.8a, §9.5.10a,
+  §9.5.11a.
+- [ ] **M5-T5c3** Sim-owner death lifecycle + resolved placement
+  (depends on T5a + T4b2 + T5c2): durable `CharacterID` association
+  with player runtime, typed player initialization, zero-HP → death
+  state-machine orchestration, dead / awaiting-respawn / Underworld
+  lifecycle, resolved newbie-home / Underworld placement (no
+  hard-coded Underworld coordinates), rest/regen cancellation and
+  reinitialization, T5a plan composition. Spec: §9.5.1, §9.5.1a,
+  §9.5.15.
+- [ ] **M5-T5c4** Gateway death wire/state integration + reconnect E2E
+  (depends on T5c3 + the existing M4 gateway/presence/fanout
+  foundation): gateway/state-machine routing, rate-gated C→S 120
+  handling, critical S→C 214 / 215 delivery,
+  session/Presence/NetEntityID composition, reconnect/end-to-end
+  proof reusing the existing 120/214/215 codecs (no second
+  protocol). Spec: §9.5.1, §9.5.1a, §9.5.16.
 - [ ] **M5-T6** Personal/world-light intents: `115 rest`, `116 eat` (hunger/vigor effects), `105 use` (skill/item dispatch incl. Second Wind), `119 safety_toggle`, `117/118 → 209` chat (+channel rules, length caps, rate limits). Owner of these opcodes: this task, no other. Spec: §6.3, §9.
 - [ ] **M5-T7** Authoritative attack/cast runtime integration (depends on
   M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a,   M5-T4b1, M5-T4b2,
-  M5-T5-complete (T5a+T5b1a+T5b1b+T5b2a+T5b2b+T5c), M5-T6). Owns real C→S 103
+  M5-T5-complete (T5a+T5b1a+T5b1b+T5b2a+T5b2b+T5c1+T5c2+T5c3+T5c4), M5-T6). Owns real C→S 103
   attack routing, real C→S 104 cast routing, typed sim-owner combat
   commands, composition of T1/T2/T3a/T3b mechanics, authoritative T4
   HP/mana/vigor mutation, T5 death handoff, T6 safety/personal-state
@@ -430,9 +460,12 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M5-T5b1b | M5-T5b1a | `backend/voxilian/{queries,internal/store,internal/persist}` (atomic immediate death entry; no new migration) |
 | M5-T5b2a | M5-T5a, M5-T5b1b | `backend/voxilian/{queries,internal/store}` (durable Portal lowers-only transition; no new migration) |
 | M5-T5b2b | M5-T5a, M5-T5b1b, M5-T5b2a | `backend/voxilian/{queries,internal/store,internal/persist}` (durable delayed penalties; no second migration unless audit requires) |
-| M5-T5c | M5-T5b1b, M5-T5b2a, M5-T5b2b, M5-T4b2 | `backend/voxilian/internal/{sim,gateway}` (live death orchestration, 120/214/215, recovery) |
+| M5-T5c1 | existing Saver/persistence foundation | `backend/voxilian/internal/sim` (generic multi-root critical Saver coordination only: no Store/persist/PG/gateway/proto/death-state/recovery work) |
+| M5-T5c2 | M5-T5b1b, M5-T5b2a, M5-T5b2b, M5-T5c1 | `backend/voxilian/internal/persist` + `internal/store` reads if required (death persistence adapters + materialized recovery) |
+| M5-T5c3 | M5-T5a, M5-T4b2, M5-T5c2 | `backend/voxilian/internal/sim` (sim-owner death lifecycle + resolved placement) |
+| M5-T5c4 | M5-T5c3 + existing M4 gateway/presence/fanout foundation | `backend/voxilian/internal/{sim,gateway}` (death wire/state integration + reconnect E2E, existing 120/214/215 codecs) |
 | M5-T6 | M4-T1, M4-T2 | `backend/voxilian/internal/sim` + gateway only for its own listed personal intents |
-| M5-T7 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2, M5-T5a, M5-T5b1a, M5-T5b1b, M5-T5b2a, M5-T5b2b, M5-T5c, M5-T6 | `backend/voxilian/internal/{sim,gateway}` (authoritative 103/104 runtime integration) |
+| M5-T7 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2, M5-T5a, M5-T5b1a, M5-T5b1b, M5-T5b2a, M5-T5b2b, M5-T5c1, M5-T5c2, M5-T5c3, M5-T5c4, M5-T6 | `backend/voxilian/internal/{sim,gateway}` (authoritative 103/104 runtime integration) |
 | M6-T1…T3 | M5-T1…T5 | `backend/voxilian/internal/sim` (progression) |
 | M7-T1 | M9-T1 (seed pipeline) + M1-T6b | `backend/voxilian/internal/sim`, `seed/` fixtures |
 | M7-T2a…c, T3, T4 | M4-T1…T3a, M1-T7b | `backend/voxilian/internal/sim` |
@@ -456,12 +489,28 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 106/107/108/109 get/drop/put/give | M7-T4 | world items |
 | 110–113 offer/counter/accept/cancel | M8-T1 | trade machine |
 | 114 buy | M8-T2 | vendor listings |
-| 120 respawn_ack | M5-T5c | death pipeline live integration |
+| 120 respawn_ack | M5-T5c4 | death pipeline live integration |
 | 121–123 char CRUD, 126 leave | M3-T3b | lifecycle |
 | 124 enter_world | M3-T4a baseline, M3-T4b takeover | lifecycle |
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.23: freeze M5 death runtime integration layers (docs only,
+  spec v0.3.39 §9.5.1a + §8.3.17; no scope grab, split only):
+  replace the single M5-T5c with T5c1 (multi-root critical Saver
+  coordination, `internal/sim`, Store-agnostic, no PG I/O; depends
+  on the existing Saver/persistence foundation) + T5c2 (death
+  persistence adapters + materialized recovery; depends on T5b1b +
+  T5b2a + T5b2b + T5c1; ONLY layer that may add Store read APIs) +
+  T5c3 (sim-owner death lifecycle + resolved placement; depends on
+  T5a + T4b2 + T5c2) + T5c4 (gateway death wire/state integration
+  + reconnect E2E on the existing 120/214/215 codecs; depends on
+  T5c3 + M4 gateway/presence/fanout); M5-T5-complete is now
+  T5a+T5b1a+T5b1b+T5b2a+T5b2b+T5c1+T5c2+T5c3+T5c4; M5-T7 depends on
+  the new complete T5 set; opcode 120 ownership moves to M5-T5c4.
+  Checkbox state unchanged: T5a/T5b1a/T5b1b/T5b2a/T5b2b `[x]`,
+  T5c1/T5c2/T5c3/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v1.22: freeze M5 death-penalty consumption ordering (docs only,
   spec v0.3.38 §9.5.11a; no scope or dependency change): binding

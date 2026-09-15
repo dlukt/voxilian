@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.38 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.39 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -4489,6 +4489,23 @@ production changes, migrations/queries/generated code, or new
 dependencies. `persist` production code MUST NOT import
 pgx/generated sqlc; tests may use pgx/raw SQL for fixtures only.
 
+#### 8.3.17 Multi-root critical Saver coordination (T5c1, frozen v0.3.39)
+
+T5c1 adds the generic multi-root critical primitive frozen in
+§9.5.1a to the `internal/sim` Saver. It owns the gates of
+MULTIPLE already-tracked aggregate roots simultaneously while ONE
+caller-supplied callback executes the underlying critical
+persistence transaction, using canonical `AggregateKey.Less` gate
+order, execution-time revision capture, per-participant critical
+dirty generations, and the conservative post-invocation error
+rule (ANY callback error reconcile-blocks ALL participants with
+the cause plus `ErrSaverReconcileRequired` discoverable; NOTHING
+before callback invocation blanket-blocks). The primitive is
+Store-agnostic, performs NO PG I/O itself, adds NO new metric,
+and contains NO death-specific, gateway, proto, or
+recovery-query logic. Full semantics are normative in §9.5.1a;
+this section records only the Saver ownership placement.
+
 ## 9. Gameplay services (what sim MUST enforce; numbers in `meridian59.md`)
 
 - Creation: `122 character_create` validates slot 0/1 (+ transactional
@@ -7930,7 +7947,9 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
 
 #### 9.5.1 Ownership split and the two-phase lifecycle
 
-M5-T5 is SIX tasks (this section is their shared boundary):
+M5-T5 is NINE tasks (this section is their shared boundary; the
+former single T5c is split into T5c1–T5c4, frozen v0.3.39 in
+§9.5.1a):
 
 - **T5a — pure/source-faithful death mechanics and immutable plans**
   (§9.5.4–§9.5.14 pure surface; §9.5.17 non-scope).
@@ -7958,13 +7977,33 @@ M5-T5 is SIX tasks (this section is their shared boundary):
   verification against the planned effective cost, child state
   persistence, and pending-row deletion in the same transaction.
   Depends on T5a + T5b1b + T5b2a.
-- **T5c — live runtime + transport integration**: zero-HP → death
-  orchestration, dead/Underworld state, resolved world-target seams
-  (§9.5.15), rest/regen cancellation/composition, C→S 120, S→C 214/215,
-  reconnect/crash recovery, end-to-end lifecycle proof. Depends on
-  T5b1b + T5b2a + T5b2b + T4b2.
+- **T5c1 — multi-root critical Saver coordination** (§8.3.17):
+  the generic Store-agnostic `internal/sim` Saver primitive that
+  atomically advances MULTIPLE already-tracked aggregate roots
+  through ONE caller-supplied critical persistence callback.
+  Depends on the existing Saver/persistence foundation only.
+- **T5c2 — death persistence adapters + materialized recovery**:
+  `persist` adapters for `CommitDeathEntry` / `CommitPortalOfLife` /
+  `CommitDeathPenalties` mapping execution-time Saver revisions into
+  Store `ExpectedRevision` fields, plus the materialized recovery/read
+  seams required after stale, callback error / commit ambiguity,
+  reconnect, or restart. The ONLY layer that may add Store read APIs
+  if required. Depends on T5b1b + T5b2a + T5b2b + T5c1.
+- **T5c3 — sim-owner death lifecycle + resolved placement**: durable
+  `CharacterID` association with player runtime, typed player
+  initialization, zero-HP → death state-machine orchestration, dead /
+  awaiting-respawn / Underworld lifecycle, resolved newbie-home /
+  Underworld placement (no hard-coded Underworld coordinates),
+  rest/regen cancellation and reinitialization, T5a plan composition.
+  Depends on T5a + T4b2 + T5c2.
+- **T5c4 — gateway death wire/state integration + reconnect E2E**:
+  gateway/state-machine routing, rate-gated C→S 120 handling, critical
+  S→C 214 / 215 delivery, session/Presence/NetEntityID composition,
+  reconnect/end-to-end proof reusing the existing 120/214/215 codecs
+  (no second protocol). Depends on T5c3 + the existing M4
+  gateway/presence/fanout foundation.
 
-M5-T5-complete is `T5a + T5b1a + T5b1b + T5b2a + T5b2b + T5c`.
+M5-T5-complete is `T5a + T5b1a + T5b1b + T5b2a + T5b2b + T5c1 + T5c2 + T5c3 + T5c4`.
 
 Ledger contract (binding on T5b2a/T5b2b): Portal-of-Life writes ZERO
 ledger rows. Underworld-exit death penalties write ZERO ledger rows.
@@ -7990,6 +8029,151 @@ critical transactions; NO database transaction remains open between them.
 The old phrase "single-txn state+ledger" means each phase's own mutation
 is atomic with its audit rows (§8.1) — never one transaction spanning the
 lifecycle.
+
+#### 9.5.1a M5 death runtime integration layers (T5c split, frozen v0.3.39)
+
+The former single T5c crossed four distinct ownership layers, so it
+is split into T5c1–T5c4 with the dependencies frozen in §9.5.1.
+This section freezes the persistence-coordination contract (T5c1)
+and the high-level boundaries of T5c2–T5c4. T5c1 performs NO PG
+I/O directly, adds NO Store/persist production code, NO
+PostgreSQL, NO migration, NO sqlc change, NO gateway/proto work,
+NO `CharacterID` on `sim.entity`, NO death lifecycle state, and
+NO snapshot load/recovery APIs — those belong to T5c2–T5c4.
+
+T5c1 ownership (binding): T5c1 adds the generic Saver primitive
+required for a critical PG transaction that atomically advances
+MULTIPLE already-tracked aggregate roots (e.g. a death entry
+touching one character root plus zero-or-more item roots). It
+belongs in `internal/sim` because the Saver owns tracked
+aggregate identities, known persisted revisions, per-key write
+gates, dirty generations, pending snapshot ownership, and
+reconcile-blocked state. The primitive itself is Store-agnostic:
+`internal/sim` MUST NOT import `store`, `persist`, `pgx`,
+`sqlc/gen`, or Prometheus. A caller-supplied callback performs
+the actual critical persistence. No death-specific logic belongs
+in the Saver.
+
+Why ordinary WriteThrough is insufficient (binding): running the
+multi-root Store transaction (e.g. `CommitDeathEntry` atomically
+CASing the character root plus item A/B roots) outside Saver
+ownership would race periodic/manual/critical single-root Saver
+writes, while calling single-root `WriteThrough` separately per
+root would destroy the atomic Store transaction. Therefore all
+participating Saver gates MUST be owned simultaneously while ONE
+caller callback executes the underlying critical transaction.
+
+Canonical multi-root gate ordering (binding): all participant
+keys are sorted using the existing `AggregateKey.Less` ordering
+(Kind ascending, ID ascending, Scope lexical ascending) before
+gates are acquired. Input order never determines lock order. The
+caller's input slice is never reordered in place. Duplicate
+participant keys are invalid. Each per-key gate is acquired in
+canonical order and every acquired gate is released on every exit
+path (preferably reverse order), so overlapping critical sets
+cannot deadlock.
+
+Execution-time revisions (binding): the Saver remains the
+revision owner. The caller MUST NOT supply expected revisions.
+Only after ALL participant gates are owned does the Saver
+snapshot each participant's current authoritative known persisted
+revision and supply those revisions to the callback — the
+multi-root equivalent of existing single-root `WriteThrough`.
+Expected revisions are never captured before gate ownership.
+
+Critical generation / pending-snapshot semantics (binding): once
+all gates are owned and all participants are revalidated, the
+Saver allocates one new dirty generation per participant (its
+critical generation) before invoking the callback. On success,
+`pending.gen <= critical generation` is superseded by the
+committed critical full state while `pending.gen > critical
+generation` is retained — mirroring ordinary `WriteThrough`, so
+a `MarkDirty` arriving while the callback runs survives. The T5c
+runtime carries the additional caller contract that the owning
+gameplay layer serializes/freezes the affected gameplay
+aggregates from capture of the critical full-state request until
+the critical callback completes. The Saver itself does NOT become
+a gameplay mutex; no entity/item locks are invented in T5c1.
+
+Critical error rule (binding): once the caller callback has been
+INVOKED, an error cannot in general be classified by the generic
+Saver as definitely-rolled-back vs
+commit-acknowledgement-lost-after-commit. The generic safe rule
+is therefore: ANY callback error after invocation advances NO
+known revision, clears NO pre-existing pending snapshot, clears
+inflight markers, reconcile-blocks ALL participants, and returns
+an error preserving the callback's original cause AND
+discoverable with `errors.Is(..., ErrSaverReconcileRequired)`
+(including when the cause contains `ErrSnapshotStale`, context
+cancellation, or operation-specific semantic errors). This
+conservative rule is deliberate: a later owner performs complete
+materialized-state reconciliation for every affected participant
+before mutation resumes. No transaction retry occurs inside the
+Saver; no outbox, no guessed rollback, no guessed commit.
+
+Errors before callback invocation (binding): failures BEFORE the
+callback runs (malformed/duplicate/empty key set, nil callback,
+unknown participant, already reconcile-blocked participant,
+context cancellation while acquiring gates or after gates but
+before the callback, dirty-generation exhaustion,
+`known == math.MaxInt64`) run NO callback, attempt NO
+transaction, and do NOT blanket reconcile-block otherwise
+healthy participants merely because no critical persistence was
+attempted. Existing error domains are preserved where sensible.
+
+Callback contract (binding), conceptually:
+
+```go
+type AggregateRevision struct {
+    Key      AggregateKey
+    Revision int64
+}
+
+type CriticalSetWrite func(
+    ctx context.Context,
+    expected []AggregateRevision,
+) ([]AggregateRevision, error)
+```
+
+`expected` is canonical by `AggregateKey.Less` (a fresh slice;
+callback mutation of it cannot alter Saver state). The callback
+result may arrive in arbitrary order but MUST contain EXACTLY
+one result per participant (no missing/extra/duplicate key) with
+`returnedRevision == expectedRevision + 1` for every
+participant. Malformed success results after callback invocation
+are commit-ambiguous: reconcile-block ALL participants, advance
+nothing, retain pending, and return zero/empty success output
+with an error discoverable as BOTH `ErrSaverRevisionInvariant`
+AND `ErrSaverReconcileRequired`. On fully valid results, under
+one short metadata mutex, every participant advances to its
+returned revision with `inflight = false`, pending cleared iff
+`pending.gen <= critical generation` (retained otherwise), so no
+participant temporarily appears advanced while another keeps its
+old revision; the public success result is normalized to
+canonical key order. No new metric is added in T5c1 and existing
+`vox_saver_lag_seconds` semantics are unchanged.
+
+T5c2 ownership (frozen boundary only): `persist` adapters for
+`CommitDeathEntry` / `CommitPortalOfLife` / `CommitDeathPenalties`
+(execution-time Saver revisions map to Store request
+`ExpectedRevision` fields) plus the materialized recovery/read
+seams required after stale, callback error / commit ambiguity,
+reconnect, or restart. Store read APIs may be added here if
+required — never in T5c1.
+
+T5c3 ownership (frozen boundary only): durable `CharacterID`
+association with player runtime, typed player initialization,
+zero-HP → death state-machine orchestration, dead /
+awaiting-respawn / Underworld lifecycle, resolved newbie-home /
+Underworld placement, rest/regen cancellation and
+reinitialization, T5a plan composition. No hard-coded Underworld
+coordinates.
+
+T5c4 ownership (frozen boundary only): gateway/state-machine
+routing, rate-gated C→S 120 handling, critical S→C 214 / 215
+delivery, session/Presence/NetEntityID composition,
+reconnect/end-to-end proof reusing the existing 120/214/215
+codecs. No second protocol.
 
 #### 9.5.2 Death disposition: avoided vs cheap vs normal (frozen)
 
@@ -8628,7 +8812,7 @@ early-return takes precedence so it is not over-constrained.
 No RID_UNDERWORLD, no Meridian row/column coordinates, no invented
 Voxilian coordinates in T5 tasks. Newbie-range deaths respawn at the
 resolved newbie-home placement; other deaths at the resolved
-Underworld-placement seam; both are T5c live-integration inputs (M10-T2b
+Underworld-placement seam; both are T5c3 live-integration inputs (M10-T2b
 authors the real classic Underworld source). T5a performs NO world
 lookup.
 
@@ -8636,7 +8820,7 @@ lookup.
 
 The frozen codecs stand: C→S `120 respawn_ack {}`; S→C `214 death {victim
 u32}`; S→C `215 respawn {pos}` (§6.3). No second death wire protocol.
-T5a touches no proto/gateway code. T5c owns routing/state-machine
+T5a touches no proto/gateway code. T5c4 owns routing/state-machine
 integration incl. opcode 120 handling (rate-gated then delegated per
 §7.3.2 until then).
 
@@ -8832,6 +9016,32 @@ arithmetic).
    survives it.
 
 ## 14. Version history
+
+- v0.3.39: freeze M5 death runtime integration layers (docs only;
+  no schema/query/code change). Split the former single T5c into
+  T5c1 (multi-root critical Saver coordination, `internal/sim`,
+  Store-agnostic, no PG I/O) + T5c2 (death persistence adapters +
+  materialized recovery) + T5c3 (sim-owner death lifecycle +
+  resolved placement) + T5c4 (gateway death wire/state integration
+  + reconnect E2E); dependencies T5c1 <- Saver foundation,
+  T5c2 <- T5b1b + T5b2a + T5b2b + T5c1, T5c3 <- T5a + T4b2 + T5c2,
+  T5c4 <- T5c3 + M4 gateway/presence/fanout; M5-T5-complete is now
+  T5a+T5b1a+T5b1b+T5b2a+T5b2b+T5c1+T5c2+T5c3+T5c4 (new §9.5.1a,
+  revised §9.5.1, new §8.3.17, §9.5.15 ownership -> T5c3, §9.5.16
+  ownership -> T5c4). §9.5.1a freezes the T5c1 Saver contract:
+  simultaneous multi-root gate ownership under one caller callback
+  (ordinary per-root WriteThrough insufficient), canonical
+  `AggregateKey.Less` gate order with caller-slice immutability,
+  execution-time revision capture, per-participant critical dirty
+  generations with `pending.gen <= critical` supersession,
+  conservative post-invocation error rule (ANY callback error ->
+  no revision advance, no pending clear, blanket reconcile-block
+  with cause + `ErrSaverReconcileRequired`), no blanket block
+  before invocation, `MaxInt64` fail-closed, exact
+  `expected+1` result validation, atomic multi-participant
+  bookkeeping, canonical result order, no new metric. Checkbox
+  state unchanged: T5a/T5b1a/T5b1b/T5b2a/T5b2b `[x]`,
+  T5c1/T5c2/T5c3/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v0.3.38: freeze M5 death-penalty consumption ordering (docs only;
   no schema/query change). §9.5.11a now states the binding T5b2b Store
