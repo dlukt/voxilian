@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.39 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.40 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -7947,9 +7947,10 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
 
 #### 9.5.1 Ownership split and the two-phase lifecycle
 
-M5-T5 is NINE tasks (this section is their shared boundary; the
+M5-T5 is TEN tasks (this section is their shared boundary; the
 former single T5c is split into T5c1–T5c4, frozen v0.3.39 in
-§9.5.1a):
+§9.5.1a, and T5c2 is further split into T5c2a+T5c2b, frozen
+v0.3.40 in §9.5.1b):
 
 - **T5a — pure/source-faithful death mechanics and immutable plans**
   (§9.5.4–§9.5.14 pure surface; §9.5.17 non-scope).
@@ -7982,20 +7983,29 @@ former single T5c is split into T5c1–T5c4, frozen v0.3.39 in
   atomically advances MULTIPLE already-tracked aggregate roots
   through ONE caller-supplied critical persistence callback.
   Depends on the existing Saver/persistence foundation only.
-- **T5c2 — death persistence adapters + materialized recovery**:
-  `persist` adapters for `CommitDeathEntry` / `CommitPortalOfLife` /
-  `CommitDeathPenalties` mapping execution-time Saver revisions into
-  Store `ExpectedRevision` fields, plus the materialized recovery/read
-  seams required after stale, callback error / commit ambiguity,
-  reconnect, or restart. The ONLY layer that may add Store read APIs
-  if required. Depends on T5b1b + T5b2a + T5b2b + T5c1.
+- **T5c2a — materialized death recovery reads + reload adapters**
+  (§9.5.1b): Store read-only recovery loaders returning the
+  COMPLETE death-relevant aggregate state (character root + full
+  spells/skills + pending-death child; item root + full location +
+  PK-protection child) inside ONE `REPEATABLE READ, READ ONLY`
+  transaction each, plus `persist` staged `sim.ReloadFunc`
+  adapters bridging them into the existing `ReconcileSaver`.
+  Depends on T5b1b + T5b2a + T5b2b. No new migration, query, or
+  generated code.
+- **T5c2b — critical death persistence adapters** (§9.5.1b): the
+  `persist` write adapters executing `CommitDeathEntry` /
+  `CommitPortalOfLife` / `CommitDeathPenalties` through
+  `sim.Saver.WriteCriticalSet`, mapping execution-time Saver
+  revisions into Store request `ExpectedRevision` fields. Depends
+  on T5c1 + T5c2a + the existing T5b1b/T5b2a/T5b2b Store
+  transactions.
 - **T5c3 — sim-owner death lifecycle + resolved placement**: durable
   `CharacterID` association with player runtime, typed player
   initialization, zero-HP → death state-machine orchestration, dead /
   awaiting-respawn / Underworld lifecycle, resolved newbie-home /
   Underworld placement (no hard-coded Underworld coordinates),
   rest/regen cancellation and reinitialization, T5a plan composition.
-  Depends on T5a + T4b2 + T5c2.
+  Depends on T5a + T4b2 + T5c2a + T5c2b.
 - **T5c4 — gateway death wire/state integration + reconnect E2E**:
   gateway/state-machine routing, rate-gated C→S 120 handling, critical
   S→C 214 / 215 delivery, session/Presence/NetEntityID composition,
@@ -8003,7 +8013,7 @@ former single T5c is split into T5c1–T5c4, frozen v0.3.39 in
   (no second protocol). Depends on T5c3 + the existing M4
   gateway/presence/fanout foundation.
 
-M5-T5-complete is `T5a + T5b1a + T5b1b + T5b2a + T5b2b + T5c1 + T5c2 + T5c3 + T5c4`.
+M5-T5-complete is `T5a + T5b1a + T5b1b + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3 + T5c4`.
 
 Ledger contract (binding on T5b2a/T5b2b): Portal-of-Life writes ZERO
 ledger rows. Underworld-exit death penalties write ZERO ledger rows.
@@ -8153,13 +8163,19 @@ old revision; the public success result is normalized to
 canonical key order. No new metric is added in T5c1 and existing
 `vox_saver_lag_seconds` semantics are unchanged.
 
-T5c2 ownership (frozen boundary only): `persist` adapters for
-`CommitDeathEntry` / `CommitPortalOfLife` / `CommitDeathPenalties`
-(execution-time Saver revisions map to Store request
-`ExpectedRevision` fields) plus the materialized recovery/read
-seams required after stale, callback error / commit ambiguity,
-reconnect, or restart. Store read APIs may be added here if
-required — never in T5c1.
+T5c2a ownership (frozen in §9.5.1b): Store read-only recovery
+loaders plus `persist` staged reload adapters. The ONLY T5c layer
+that may add Store read APIs if required — never T5c1, and T5c2a
+itself needs none (existing generated queries suffice).
+
+T5c2b ownership (frozen boundary only): the `persist` write
+adapters executing `CommitDeathEntry` / `CommitPortalOfLife` /
+`CommitDeathPenalties` through `sim.Saver.WriteCriticalSet`.
+Portal and DeathPenalties are one-root critical transactions but
+still use `WriteCriticalSet` with a one-key participant set so
+the conservative post-callback commit-ambiguity rule applies
+uniformly. T5c2a MUST NOT implement them; the existing Store
+write transactions are unchanged.
 
 T5c3 ownership (frozen boundary only): durable `CharacterID`
 association with player runtime, typed player initialization,
@@ -8174,6 +8190,141 @@ routing, rate-gated C→S 120 handling, critical S→C 214 / 215
 delivery, session/Presence/NetEntityID composition,
 reconnect/end-to-end proof reusing the existing 120/214/215
 codecs. No second protocol.
+
+#### 9.5.1b M5 materialized death recovery (T5c2a, frozen v0.3.40)
+
+T5c2 is split because recovery correctness must be established
+before write orchestration can safely depend on it, and because
+the existing write snapshots are NOT by themselves complete
+recovery shapes: `pending_deaths` is mutable CHILD STATE of the
+character aggregate and `item_pk_protections` is mutable CHILD
+STATE of the item aggregate. Recovery of those roots for
+death/runtime purposes MUST therefore include those children; a
+`CharacterSnapshot`-only or `ItemSnapshot`-only reload is
+forbidden for the death reconciliation path.
+
+Character death-recovery shape (binding), conceptually:
+
+```go
+type PendingDeathSnapshot struct {
+    CharacterID      int64
+    EffectiveCost    int16
+    DeathTimeSeconds int64
+    CorpseID         *int64
+    PortalUsed       bool
+}
+
+type DeathCharacterRecoverySnapshot struct {
+    Character CharacterSnapshot
+    Pending   *PendingDeathSnapshot
+}
+```
+
+`Character` is the COMPLETE mutable character aggregate snapshot
+already defined (ID, persisted revision in `ExpectedRevision`,
+Karma, PosX/Y/Z, Vitals, Advancement, Flags, complete Spells,
+complete Skills — no name/face/hometown/base-stats/account/
+session/NetEntityID/regen-metadata expansion; T5c2a is not a
+world-entry loader redesign). `Pending` nil means no
+`pending_deaths` row; non-nil is the exact currently
+materialized pending-death child state. `pending_deaths.created_at`
+is operational only and is NOT included. `CorpseID` non-nil is
+the current FK association; nil means the pending death survives
+while the corpse has expired/been deleted. The corpse ROW is
+never loaded into the character recovery shape: corpse is not a
+CAS child of the character aggregate and remains independently
+mutable through expiry.
+
+Item death-recovery shape (binding), conceptually:
+
+```go
+type ItemPKProtectionSnapshot struct {
+    ItemID            int64
+    VictimCharacterID int64
+    ExpiresAt         time.Time
+}
+
+type DeathItemRecoverySnapshot struct {
+    Item         ItemSnapshot
+    PKProtection *ItemPKProtectionSnapshot
+}
+```
+
+`Item` is the complete item root (persisted revision in
+`ExpectedRevision`, Qty, Hits, Enchants, complete
+`ItemLocationSnapshot`). `PKProtection` nil means no
+`item_pk_protections` row; non-nil is the exact materialized
+protection child. No killer identity is invented; no expiry
+interpretation or enforcement happens here — an
+expired-but-not-yet-cleaned protection row still round-trips
+exactly. This is a pure materialized-state read: no death
+mechanics, no Portal/penalty calculation, no corpse/protection/
+pending mutation, no auto-creation.
+
+Point-in-time consistency (binding): each complete recovery read
+executes inside ONE PostgreSQL `REPEATABLE READ, READ ONLY`
+transaction — character recovery spans `characters`,
+`character_spells`, `character_skills`, `pending_deaths`; item
+recovery spans `item_instances`, `item_locations`,
+`item_pk_protections`. A plain `READ COMMITTED` multi-statement
+read could observe mixed committed snapshots and is unacceptable
+for aggregate replacement. No `FOR UPDATE`, no advisory lock, no
+mutation, no stale metric. The transaction returns either one
+internally coherent committed aggregate snapshot or an error
+with zero recovery result — never partially loaded state.
+
+Live-row and child semantics (binding): recovery is for a live
+gameplay character, and `GetCharacterByID` also sees soft-deleted
+rows, so `characters.deleted_at IS NOT NULL` is not loadable for
+gameplay recovery — it fails with the repository's existing
+missing-row convention (an error wrapping `pgx.ErrNoRows`),
+never a zero-valued snapshot and never a resurrection. Missing
+character root, missing item root, or missing item location
+likewise fail the whole load with zero result: an item root with
+no location is an incomplete/corrupt materialized aggregate and
+no `Kind = 0` location is fabricated. Optional-child absence is
+not an error: no `pending_deaths` row yields `Pending = nil`; no
+`item_pk_protections` row yields `PKProtection = nil`.
+
+Query reuse (binding): T5c2a composes the existing generated
+queries `GetCharacterByID`, `ListCharacterSpells`,
+`ListCharacterSkills`, `GetPendingDeathByCharacter`,
+`GetItemInstanceByID`, `GetItemLocationByItemID`,
+`GetItemPKProtection`. No new migration, no new SQL query, no
+generated sqlc change, no raw production SQL (tests may use raw
+SQL for fixture corruption/concurrency proof, as elsewhere).
+`ExpectedRevision` in each returned root snapshot MUST equal the
+actual persisted root revision, making the snapshots
+authoritative/candidate-revision-bearing for reconciliation.
+
+`persist` reload adapters (binding): narrow loader interfaces
+(structurally satisfied by `*store.PGStore`) plus staged reload
+factories returning `sim.ReloadFunc` for each family. SELECT/load
+runs first into temporary Store-domain values with NO live
+gameplay mutation during the load; `ReloadCandidate.Revision` is
+the loaded `Character.ExpectedRevision` / `Item.ExpectedRevision`;
+`ReloadCandidate.Apply` performs the caller's complete in-memory
+replacement only AFTER `sim.ReconcileState` validates the
+candidate revision. The staged candidate MUST own immutable
+copies (reusing the exact deep-copy rules of
+`NewCharacterSnapshotJob` / `NewItemSnapshotJob`: Vitals,
+Advancement, Spells, Skills, Enchants, every location pointer
+target, the optional pending struct + `CorpseID` target, the
+optional protection struct) so a hostile/fake loader mutating
+its buffers after return cannot alter what `Apply` receives. The
+existing `persist.ReconcileSaver` is reused unchanged as the
+Saver + `ReconcileState` bridge. No `DeathReconcileState`, no
+multi-root reconciliation primitive, no automatic polling, no
+background reload worker — T5c3 serializes the gameplay
+participants while performing all required per-aggregate
+reconciliation.
+
+Corpse-race boundary (binding): a recovered non-nil
+`Pending.CorpseID` is a point-in-time snapshot; the corpse may
+expire immediately afterward. Recovery never locks or pins the
+corpse. Future Portal execution stays authoritative via the
+existing Store transaction (corpse mismatch / NULL, portal
+already used, no pending death).
 
 #### 9.5.2 Death disposition: avoided vs cheap vs normal (frozen)
 
@@ -9016,6 +9167,32 @@ arithmetic).
    survives it.
 
 ## 14. Version history
+
+- v0.3.40: freeze M5 materialized death recovery (docs only; no
+  schema/query/code change). Split T5c2 into T5c2a (materialized
+  death recovery reads + reload adapters; depends on T5b1b + T5b2a
+  + T5b2b) + T5c2b (critical death persistence adapters through
+  `Saver.WriteCriticalSet`, incl. one-key sets for Portal/
+  DeathPenalties; depends on T5c1 + T5c2a + the T5b Store
+  transactions); T5c3 now depends on T5a + T4b2 + T5c2a + T5c2b;
+  M5-T5-complete is now
+  T5a+T5b1a+T5b1b+T5b2a+T5b2b+T5c1+T5c2a+T5c2b+T5c3+T5c4 (new
+  §9.5.1b, revised §9.5.1/§9.5.1a). §9.5.1b freezes the T5c2a
+  contract: `pending_deaths` is character-aggregate child state
+  and `item_pk_protections` is item-aggregate child state, so
+  death reconciliation MUST reload the composite shapes (complete
+  root + full children + optional child, `created_at` excluded,
+  corpse row never embedded); each read runs in ONE `REPEATABLE
+  READ, READ ONLY` transaction (no `FOR UPDATE`, no lock, no
+  mutation, no stale metric); soft-deleted characters fail with
+  the `pgx.ErrNoRows` convention; missing root/location fails the
+  whole load while optional-child absence yields nil; existing
+  generated queries are reused (`ExpectedRevision` equals the
+  persisted revision); `persist` staged `ReloadFunc` adapters own
+  immutable copies and reuse `ReconcileSaver` unchanged; recovery
+  never pins the corpse. Checkbox state unchanged:
+  T5a/T5b1a/T5b1b/T5b2a/T5b2b/T5c1 `[x]`,
+  T5c2a/T5c2b/T5c3/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v0.3.39: freeze M5 death runtime integration layers (docs only;
   no schema/query/code change). Split the former single T5c into
