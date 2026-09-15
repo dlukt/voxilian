@@ -39,8 +39,8 @@ func openPG(t *testing.T) (*pgxpool.Pool, *gen.Queries) {
 		t.Fatal(err)
 	}
 	dir := filepath.Join(simtest.RepoRoot(t), "backend", "voxilian", "migrations")
-	if err := goose.UpTo(sqldb, dir, 5); err != nil {
-		t.Fatalf("migrate to 5: %v", err)
+	if err := goose.UpTo(sqldb, dir, 6); err != nil {
+		t.Fatalf("migrate to 6: %v", err)
 	}
 	pool, err := pgxpool.New(context.Background(), pg.DSN)
 	if err != nil {

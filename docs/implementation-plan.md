@@ -323,7 +323,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   existing `ReconcileSaver` bridge. No new migration, query, or
   generated code; no death write adapters. Spec: §9.5.1b, §8.1,
   §8.3.12–§8.3.13.
-- [ ] **M5-T5c2b** Critical death persistence adapters (depends on
+- [x] **M5-T5c2b** Critical death persistence adapters (depends on
   T5c1 + T5c2a + the existing T5b1b/T5b2a/T5b2b Store
   transactions): the `persist` write adapters executing
   `CommitDeathEntry` / `CommitPortalOfLife` /
