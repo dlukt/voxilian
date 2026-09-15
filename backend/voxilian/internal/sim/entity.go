@@ -106,6 +106,20 @@ type entity struct {
 	characterID CharacterID
 	vitals      PlayerVitals
 
+	// Player life state + death attempt epoch (spec §9.5.1f,
+	// M5-T5c3c1): the owner-local immediate-death lifecycle gate.
+	// lifeState is PlayerLifeAlive for every successfully
+	// created/attached player; generic entities carry the zero
+	// value, which is meaningless for them (PlayerLifeStateOf
+	// reports them as non-players). deathEpoch counts
+	// successfully begun real-death persistence attempts for this
+	// entity (0 until the first begin); it rides this SAME entity
+	// object and disappears with it on removal — EntityIDs are
+	// never reused, so epochs never leak across entities. Neither
+	// field is persisted or sent on the wire.
+	lifeState  PlayerLifeState
+	deathEpoch uint64
+
 	// Player-owned ephemeral vitals runtime metadata (spec §9.4b.10,
 	// v0.3.31): installed atomically with the vitals at attach/add
 	// (§9.4b.3a), never persisted (§9.4b.9), and riding this SAME

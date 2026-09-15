@@ -57,7 +57,7 @@ import (
 // Owner-local: call only from the sim owner goroutine (Run/Step)
 // or in Step-driven tests.
 func (e *Engine) PlayerQuiesceForDeath(id EntityID) error {
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolvePlayerAnyLife(id)
 	if err != nil {
 		return err
 	}
@@ -146,7 +146,7 @@ func (e *Engine) PlayerInstallPostDeathState(id EntityID, placement world.Vec3, 
 	if err := runtimeInputs.Validate(); err != nil {
 		return EntitySnapshot{}, err
 	}
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolvePlayerAnyLife(id)
 	if err != nil {
 		return EntitySnapshot{}, err
 	}

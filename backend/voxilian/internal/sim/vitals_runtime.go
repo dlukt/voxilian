@@ -342,7 +342,7 @@ func (e *Engine) PlayerSetVitalsRuntimeInputs(id EntityID, inputs PlayerVitalsRu
 	if err := inputs.Validate(); err != nil {
 		return err
 	}
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolveActivePlayer(id)
 	if err != nil {
 		return err
 	}
@@ -396,7 +396,7 @@ func (ent *entity) runtimeSnapshotValue() PlayerVitalsRuntimeSnapshot {
 // Owner-local: call only from the sim owner goroutine (Run/Step) or in
 // Step-driven tests.
 func (e *Engine) PlayerStartResting(id EntityID) error {
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolveActivePlayer(id)
 	if err != nil {
 		return err
 	}
@@ -413,7 +413,7 @@ func (e *Engine) PlayerStartResting(id EntityID) error {
 // Owner-local: call only from the sim owner goroutine (Run/Step) or in
 // Step-driven tests.
 func (e *Engine) PlayerStopResting(id EntityID) error {
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolveActivePlayer(id)
 	if err != nil {
 		return err
 	}
@@ -425,7 +425,7 @@ func (e *Engine) PlayerStopResting(id EntityID) error {
 // deadline's presence (spec §9.4b.13) — no independent boolean can
 // disagree with the slot.
 func (e *Engine) PlayerIsResting(id EntityID) (bool, error) {
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolvePlayerAnyLife(id)
 	if err != nil {
 		return false, err
 	}
@@ -440,7 +440,7 @@ func (e *Engine) PlayerIsResting(id EntityID) (bool, error) {
 // Owner-local: call only from the sim owner goroutine (Run/Step) or in
 // Step-driven tests.
 func (e *Engine) PlayerMarkActedSinceEntry(id EntityID) error {
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolveActivePlayer(id)
 	if err != nil {
 		return err
 	}
@@ -457,7 +457,7 @@ func (e *Engine) PlayerMarkActedSinceEntry(id EntityID) error {
 // Owner-local: call only from the sim owner goroutine (Run/Step) or in
 // Step-driven tests.
 func (e *Engine) PlayerApplyEntryActedPolicy(id EntityID, shouldReset bool) error {
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolveActivePlayer(id)
 	if err != nil {
 		return err
 	}
@@ -481,7 +481,7 @@ func (e *Engine) PlayerApplyEntryActedPolicy(id EntityID, shouldReset bool) erro
 // Owner-local: call only from the sim owner goroutine (Run/Step) or in
 // Step-driven tests.
 func (e *Engine) PlayerUpdateStomach(id EntityID) (PlayerVitals, error) {
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolveActivePlayer(id)
 	if err != nil {
 		return PlayerVitals{}, err
 	}

@@ -352,7 +352,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   state. No PG/persist/store/gateway/proto work. Spec: §9.5.1d +
   §9.5.1e (frozen T5c3b API + `NewVigor` source correction:
   post-death rest stays absent).
-- [ ] **M5-T5c3c1** Immediate-death lifecycle gate + attempt
+- [x] **M5-T5c3c1** Immediate-death lifecycle gate + attempt
   correlation (depends on T5c3a + T5c3b; `internal/sim` only):
   explicit player life-state gate (`Alive` / `DeathPersisting` /
   `AwaitingRespawn`), one correlated immediate-death persistence

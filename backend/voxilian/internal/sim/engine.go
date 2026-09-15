@@ -198,7 +198,13 @@ func (e *Engine) Step() {
 		if update, emit := e.stepEntity(ent, tick); emit && e.movement != nil {
 			e.movement.OnMovement(update)
 		}
-		if ent.isPlayer {
+		if ent.isPlayer && ent.lifeState != PlayerLifeDeathPersisting {
+			// A DeathPersisting player has no armed deadlines
+			// (begin canceled them) and MUST remain quiescent:
+			// skip the vitals runtime while history sampling
+			// below still continues at the unchanged position
+			// (spec §9.5.1f). AwaitingRespawn players keep the
+			// normal internal health/mana runtime.
 			e.stepPlayerVitalsRuntime(ent, tick)
 		}
 		ent.history.Append(PositionSample{Tick: tick, Position: ent.position})
@@ -422,11 +428,23 @@ func (e *Engine) observe(a MovementAnomaly) {
 // in Step-driven tests. Concurrent gateway callers use EnqueueMove.
 func (e *Engine) SubmitMove(id EntityID, intent MoveIntent) (MoveDisposition, error) {
 	if rec, ok := e.registry.migrations[id]; ok {
+		// A locked migrating player rejects before any queue
+		// mutation or frontier advance (spec §9.5.1f).
+		if rec.entity.isPlayer && rec.entity.lifeState != PlayerLifeAlive {
+			return MoveAccepted, fmt.Errorf("%w: id %d migrating life %d", ErrPlayerNotAlive, uint64(id), uint8(rec.entity.lifeState))
+		}
 		return e.submitMigrating(rec, intent)
 	}
 	ent, err := e.registry.lookup(id)
 	if err != nil {
 		return MoveAccepted, err
+	}
+	// A locked resident player rejects before consuming the new
+	// movement InputSeq or mutating any gameplay state: sequence
+	// anchors are neither cleared nor advanced (spec §9.5.1f).
+	// Generic entities are unaffected.
+	if ent.isPlayer && ent.lifeState != PlayerLifeAlive {
+		return MoveAccepted, fmt.Errorf("%w: id %d life %d", ErrPlayerNotAlive, uint64(id), uint8(ent.lifeState))
 	}
 	if intent.Yaw > MaxYaw {
 		return MoveAccepted, fmt.Errorf("%w: yaw %d", ErrInvalidMoveYaw, intent.Yaw)
@@ -540,8 +558,18 @@ func (e *Engine) RemoveEntity(id EntityID) error {
 }
 
 // SetPosition updates an entity's position within its cell, or returns
-// ErrCellHandoffRequired with zero mutation across cells.
+// ErrCellHandoffRequired with zero mutation across cells. A locked
+// (DeathPersisting/AwaitingRespawn) player rejects with
+// ErrPlayerNotAlive before any mutation (spec §9.5.1f); generic
+// entities and Alive players keep the existing behavior.
 func (e *Engine) SetPosition(id EntityID, pos world.Vec3) error {
+	if _, migrating := e.registry.migrations[id]; !migrating {
+		if ent, err := e.registry.lookup(id); err == nil {
+			if ent.isPlayer && ent.lifeState != PlayerLifeAlive {
+				return fmt.Errorf("%w: id %d life %d", ErrPlayerNotAlive, uint64(id), uint8(ent.lifeState))
+			}
+		}
+	}
 	return e.registry.SetPosition(id, pos)
 }
 

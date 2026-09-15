@@ -33,4 +33,23 @@ var (
 	// includes RESIDENT and MIGRATING. Zero mutation, and no EntityID
 	// is consumed by the rejected add.
 	ErrCharacterAlreadyActive = errors.New("sim: character already active")
+	// ErrPlayerNotAlive marks an ordinary gameplay mutation/input
+	// targeting a player whose life state is DeathPersisting or
+	// AwaitingRespawn (spec §9.5.1f, M5-T5c3c1). Zero mutation:
+	// rejected before any gameplay state changes and before any
+	// movement InputSeq is consumed.
+	ErrPlayerNotAlive = errors.New("sim: player not alive")
+	// ErrPlayerNotDead marks a begin-death request while the
+	// authoritative vitals HP != 0 (spec §9.5.1f, M5-T5c3c1). Zero
+	// mutation.
+	ErrPlayerNotDead = errors.New("sim: player not dead")
+	// ErrDeathAttemptMismatch marks a post-death completion whose
+	// token does not match the entity's current character, epoch,
+	// or life state (spec §9.5.1f, M5-T5c3c1). Zero mutation.
+	ErrDeathAttemptMismatch = errors.New("sim: death attempt mismatch")
+	// ErrDeathAttemptExhausted marks a begin-death request whose
+	// per-entity death epoch cannot advance without wrapping
+	// (already math.MaxUint64; spec §9.5.1f, M5-T5c3c1). Zero
+	// mutation: the epoch does not advance.
+	ErrDeathAttemptExhausted = errors.New("sim: death attempt exhausted")
 )

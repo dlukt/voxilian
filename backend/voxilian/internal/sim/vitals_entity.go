@@ -186,23 +186,12 @@ func (e *Engine) PlayerVitalsOf(id EntityID) (PlayerVitals, bool, error) {
 	return ent.vitals, true, nil
 }
 
-// resolvePlayer resolves a live RESIDENT player entity for owner-local
-// mutation (spec §9.4b.5): MIGRATING ownership fails with zero mutation
-// (ErrCellHandoffRequired, mirroring SetPosition), unknown IDs report
-// ErrEntityNotFound, and generic entities ErrEntityNotPlayer.
-func (e *Engine) resolvePlayer(id EntityID) (*entity, error) {
-	if _, migrating := e.registry.migrations[id]; migrating {
-		return nil, fmt.Errorf("%w: id %d migrating", ErrCellHandoffRequired, uint64(id))
-	}
-	ent, err := e.registry.lookup(id)
-	if err != nil {
-		return nil, err
-	}
-	if !ent.isPlayer {
-		return nil, fmt.Errorf("%w: id %d", ErrEntityNotPlayer, uint64(id))
-	}
-	return ent, nil
-}
+// resolvePlayerAnyLife / resolveActivePlayer live in
+// death_lifecycle.go (spec §9.5.1f): the former is the resident
+// player regardless of life state (T5c3b primitives + begin/
+// completion transitions), the latter adds the Alive gate that
+// EVERY ordinary owner-local Player* gameplay mutation below
+// resolves through.
 
 // commitVitals stores a successful mutation's result and fires the
 // dirty/event seam exactly once iff the value really changed
@@ -237,7 +226,7 @@ func (e *Engine) commitVitals(ent *entity, after PlayerVitals) error {
 // reconciles per NewHealth from the current tick (spec §9.4b.11).
 // Owner-local.
 func (e *Engine) PlayerLoseHealth(id EntityID, amount int, decay bool) (PlayerVitals, HealthLossResult, error) {
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolveActivePlayer(id)
 	if err != nil {
 		return PlayerVitals{}, HealthLossResult{}, err
 	}
@@ -257,7 +246,7 @@ func (e *Engine) PlayerLoseHealth(id EntityID, amount int, decay bool) (PlayerVi
 // After a successful commit the health deadline reconciles per
 // NewHealth (spec §9.4b.11). Owner-local.
 func (e *Engine) PlayerGainHealthNormal(id EntityID, amount int) (PlayerVitals, int, error) {
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolveActivePlayer(id)
 	if err != nil {
 		return PlayerVitals{}, 0, err
 	}
@@ -277,7 +266,7 @@ func (e *Engine) PlayerGainHealthNormal(id EntityID, amount int) (PlayerVitals, 
 // delta is negative. After a successful commit the health deadline
 // reconciles per NewHealth (spec §9.4b.11). Owner-local.
 func (e *Engine) PlayerGainHealthOvercap(id EntityID, amount int) (PlayerVitals, int, error) {
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolveActivePlayer(id)
 	if err != nil {
 		return PlayerVitals{}, 0, err
 	}
@@ -300,7 +289,7 @@ func (e *Engine) PlayerGainHealthOvercap(id EntityID, amount int) (PlayerVitals,
 // checked explicitly like every other wrapper even though the bounded
 // result is always Validate-valid. Owner-local.
 func (e *Engine) PlayerAdjustBaseMaxHP(id EntityID, amount, effectiveStamina int) (PlayerVitals, int, error) {
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolveActivePlayer(id)
 	if err != nil {
 		return PlayerVitals{}, 0, err
 	}
@@ -321,7 +310,7 @@ func (e *Engine) PlayerAdjustBaseMaxHP(id EntityID, amount, effectiveStamina int
 // cancel it (equality reached), or keep the exact existing due.
 // Owner-local.
 func (e *Engine) PlayerAdjustMaxHP(id EntityID, amount int) (PlayerVitals, int, error) {
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolveActivePlayer(id)
 	if err != nil {
 		return PlayerVitals{}, 0, err
 	}
@@ -341,7 +330,7 @@ func (e *Engine) PlayerAdjustMaxHP(id EntityID, amount int) (PlayerVitals, int, 
 // commit the mana deadline reconciles per NewMana (spec §9.4b.12).
 // Owner-local.
 func (e *Engine) PlayerLoseMana(id EntityID, amount int) (PlayerVitals, int, error) {
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolveActivePlayer(id)
 	if err != nil {
 		return PlayerVitals{}, 0, err
 	}
@@ -361,7 +350,7 @@ func (e *Engine) PlayerLoseMana(id EntityID, amount int) (PlayerVitals, int, err
 // (Mana above MaxMana). After a successful commit the mana deadline
 // reconciles per NewMana (spec §9.4b.12). Owner-local.
 func (e *Engine) PlayerGainMana(id EntityID, amount int, capped bool) (PlayerVitals, int, error) {
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolveActivePlayer(id)
 	if err != nil {
 		return PlayerVitals{}, 0, err
 	}
@@ -382,7 +371,7 @@ func (e *Engine) PlayerGainMana(id EntityID, amount int, capped bool) (PlayerVit
 // bit-identical live state and no event. After a successful commit the
 // mana deadline reconciles per NewMana (spec §9.4b.12). Owner-local.
 func (e *Engine) PlayerAdjustMaxMana(id EntityID, amount int) (PlayerVitals, int, error) {
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolveActivePlayer(id)
 	if err != nil {
 		return PlayerVitals{}, 0, err
 	}
@@ -400,7 +389,7 @@ func (e *Engine) PlayerAdjustMaxMana(id EntityID, amount int) (PlayerVitals, int
 // PlayerApplyExertion applies the §9.4.19 general accumulator
 // (including the strict >20000 conversion boundary). Owner-local.
 func (e *Engine) PlayerApplyExertion(id EntityID, amount int64, setToThreshold bool) (PlayerVitals, error) {
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolveActivePlayer(id)
 	if err != nil {
 		return PlayerVitals{}, err
 	}
@@ -420,7 +409,7 @@ func (e *Engine) PlayerApplyExertion(id EntityID, amount int64, setToThreshold b
 // decides WHEN recovery events fire; Second Wind blocking stays T6.
 // Owner-local.
 func (e *Engine) PlayerApplyRestExertion(id EntityID, amount int64, roomMultiplier int) (PlayerVitals, error) {
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolveActivePlayer(id)
 	if err != nil {
 		return PlayerVitals{}, err
 	}
@@ -437,7 +426,7 @@ func (e *Engine) PlayerApplyRestExertion(id EntityID, amount int64, roomMultipli
 // PlayerSetRestThreshold applies the §9.4.20 explicit 10..100 threshold
 // domain (no silent clamp). Owner-local.
 func (e *Engine) PlayerSetRestThreshold(id EntityID, threshold int) (PlayerVitals, error) {
-	ent, err := e.resolvePlayer(id)
+	ent, err := e.resolveActivePlayer(id)
 	if err != nil {
 		return PlayerVitals{}, err
 	}
