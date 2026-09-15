@@ -341,7 +341,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   through handoff, identity cleanup on entity removal. No death
   state, relocation, persistence, recovery, Saver calls, Store
   types, gateway wiring, or protocol. Spec: §9.5.1d.
-- [ ] **M5-T5c3b** Death-safe relocation + runtime quiesce/
+- [x] **M5-T5c3b** Death-safe relocation + runtime quiesce/
   reinitialization (depends on T5c3a + T5a + T4b2; `internal/sim`
   only): owner-local primitives for death transitions — resolved
   placement acceptance as `world.Vec3` (no hard-coded Underworld/

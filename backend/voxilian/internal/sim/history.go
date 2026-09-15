@@ -67,3 +67,16 @@ func (h *positionHistory) Latest() (PositionSample, bool) {
 	}
 	return h.buf[(h.start+h.count-1)%len(h.buf)], true
 }
+
+// Reset discards all retained samples, preserving the allocated
+// ring capacity (spec §9.5.1e): a successful death/respawn
+// placement is a discontinuous authoritative remap, so pre-death
+// rewind history MUST be invalidated — future lag compensation
+// must never rewind a post-death player into positions belonging
+// to the previous life. No sample is synthesized here; the NEXT
+// normal Engine.Step appends the first destination-side sample
+// under the existing §5.2.6 tick-end rule.
+func (h *positionHistory) Reset() {
+	h.start = 0
+	h.count = 0
+}
