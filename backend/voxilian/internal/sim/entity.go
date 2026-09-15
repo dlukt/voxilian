@@ -19,6 +19,21 @@ type EntityID uint64
 // InvalidEntityID is the reserved zero value; it never names an entity.
 const InvalidEntityID EntityID = 0
 
+// CharacterID is the durable player-character identity bound to a
+// live player entity (spec §9.5.1d, M5-T5c3a).
+//
+//   - InvalidCharacterID (0) marks generic/non-player entities and is
+//     never bound to a player.
+//   - Every player entity carries a CharacterID > 0.
+//
+// This is NOT EntityID, NOT session.ID, NOT accountID, and NOT a
+// session-local NetEntityID: none of those domains is overloaded.
+type CharacterID int64
+
+// InvalidCharacterID is the reserved zero value: generic entities
+// carry it, and player creation/attach rejects it.
+const InvalidCharacterID CharacterID = 0
+
 // EntitySnapshot is the immutable inspection copy of a live entity
 // (spec §5.2.5/§5.3.7). Returning a snapshot MUST NOT allow mutation
 // of live sim state: it carries values only, no pointers into the
@@ -28,9 +43,12 @@ const InvalidEntityID EntityID = 0
 // M5-T4b1 classification flag (spec §9.4b.2): false for every generic
 // M4 entity. The vitals VALUE itself is inspected separately
 // (PlayerVitalsOf) so a valid player with zero-valued vitals fields is
-// never confused with a non-player.
+// never confused with a non-player. CharacterID is the durable
+// player-character identity (spec §9.5.1d): InvalidCharacterID for
+// every generic entity, the bound durable ID for every player.
 type EntitySnapshot struct {
 	ID                    EntityID
+	CharacterID           CharacterID
 	Position              world.Vec3
 	Cell                  world.CellCoord
 	Yaw                   uint16
@@ -46,7 +64,8 @@ type EntitySnapshot struct {
 
 // entity is the M4-T1 base entity (identity, authoritative position,
 // current cell, position history) extended with ONLY movement-owned
-// state (spec §5.3.7) and player-owned vitals state (spec §9.4b.2).
+// state (spec §5.3.7), player-owned vitals state (spec §9.4b.2), and
+// the durable player CharacterID (spec §9.5.1d).
 // No combat, inventory, velocity, or other gameplay fields before their
 // owning tasks. Only the single sim writer mutates it: no per-entity
 // lock.
@@ -79,8 +98,13 @@ type entity struct {
 	// (spec §9.4b.2); vitals is meaningful only when isPlayer holds.
 	// The value copy rules of §9.4b.3 apply: attach stores a copy and
 	// inspection returns copies, so no caller can alias live state.
-	isPlayer bool
-	vitals   PlayerVitals
+	// characterID is the durable player identity (spec §9.5.1d):
+	// InvalidCharacterID while generic, the bound durable ID while
+	// a player. It rides this SAME entity object through cell
+	// handoff — never removed, recreated, or rebound.
+	isPlayer    bool
+	characterID CharacterID
+	vitals      PlayerVitals
 
 	// Player-owned ephemeral vitals runtime metadata (spec §9.4b.10,
 	// v0.3.31): installed atomically with the vitals at attach/add
@@ -118,6 +142,7 @@ type entity struct {
 func (e *entity) snapshot() EntitySnapshot {
 	return EntitySnapshot{
 		ID:                    e.id,
+		CharacterID:           e.characterID,
 		Position:              e.position,
 		Cell:                  e.cell,
 		Yaw:                   e.yaw,

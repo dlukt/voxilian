@@ -23,4 +23,14 @@ var (
 	// never reused and the reserved zero ID is never issued; the failed
 	// add mutates nothing. Match with errors.Is.
 	ErrEntityIDExhausted = errors.New("sim: entity ID exhausted")
+	// ErrInvalidCharacterID marks a player add/attach with a
+	// non-durable identity (spec §9.5.1d): only CharacterID > 0 may
+	// bind to a player entity. Zero mutation.
+	ErrInvalidCharacterID = errors.New("sim: invalid character ID")
+	// ErrCharacterAlreadyActive marks a player add/attach whose
+	// CharacterID is already bound to another live entity
+	// (spec §9.5.1d): one-live-entity-per-CharacterID, where live
+	// includes RESIDENT and MIGRATING. Zero mutation, and no EntityID
+	// is consumed by the rejected add.
+	ErrCharacterAlreadyActive = errors.New("sim: character already active")
 )

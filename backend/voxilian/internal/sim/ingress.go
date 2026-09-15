@@ -33,9 +33,9 @@ var (
 )
 
 // ingressCommand is the private typed command union the owner
-// mailbox carries (spec §5.2.10): exactly add, remove, and move.
-// Gateway-facing code can never submit arbitrary closures: there is
-// no func(*Engine) command.
+// mailbox carries (spec §5.2.10): exactly generic add, player add,
+// remove, and move. Gateway-facing code can never submit arbitrary
+// closures: there is no func(*Engine) command.
 type ingressCommand interface {
 	// execute runs the command on the sim owner goroutine and
 	// delivers its definitive result. It never blocks on the caller:
@@ -63,6 +63,27 @@ func (c ingressAdd) execute(e *Engine) {
 }
 
 func (c ingressAdd) fail(err error) {
+	c.res <- ingressAddResult{err: err}
+}
+
+// ingressAddPlayer is the typed player-add owner command
+// (spec §9.5.1d): it carries already-resolved creation values only —
+// no lookup, no recovery — and the owner executes the normal
+// AddPlayerEntity path.
+type ingressAddPlayer struct {
+	characterID   CharacterID
+	pos           world.Vec3
+	vitals        PlayerVitals
+	runtimeInputs PlayerVitalsRuntimeInputs
+	res           chan ingressAddResult
+}
+
+func (c ingressAddPlayer) execute(e *Engine) {
+	snap, err := e.AddPlayerEntity(c.characterID, c.pos, c.vitals, c.runtimeInputs)
+	c.res <- ingressAddResult{snap: snap, err: err}
+}
+
+func (c ingressAddPlayer) fail(err error) {
 	c.res <- ingressAddResult{err: err}
 }
 
@@ -122,11 +143,32 @@ func (s *ingressState) claimRun() error {
 	return nil
 }
 
-// EnqueueAddEntity submits an entity add through the sim owner
+// EnqueueAddEntity submits a generic entity add through the sim owner
 // (spec §5.2.10). It is safe to call from non-sim goroutines while
 // Run is active and returns the real owner-local EntitySnapshot.
+// Generic entities only: players use EnqueueAddPlayerEntity.
 func (e *Engine) EnqueueAddEntity(ctx context.Context, pos world.Vec3) (EntitySnapshot, error) {
 	cmd := ingressAdd{pos: pos, res: make(chan ingressAddResult, 1)}
+	if err := e.admit(ctx, cmd); err != nil {
+		return EntitySnapshot{}, err
+	}
+	// Admitted commands are authoritative: later caller cancellation
+	// does NOT retract them, so the caller waits for the exact
+	// command's definitive result (never an ambiguous maybe).
+	res := <-cmd.res
+	return res.snap, res.err
+}
+
+// EnqueueAddPlayerEntity submits a typed player add through the sim
+// owner (spec §9.5.1d). It uses the SAME bounded mailbox and admission
+// rules as every other ingress command and returns the real
+// owner-local EntitySnapshot: admitted commands are authoritative and
+// the owner invokes the normal AddPlayerEntity path (same validation,
+// duplicate-binding, and all-or-nothing semantics). Existing
+// EnqueueAddEntity stays available for generic entities; no gateway
+// wiring happens here.
+func (e *Engine) EnqueueAddPlayerEntity(ctx context.Context, characterID CharacterID, pos world.Vec3, vitals PlayerVitals, runtimeInputs PlayerVitalsRuntimeInputs) (EntitySnapshot, error) {
+	cmd := ingressAddPlayer{characterID: characterID, pos: pos, vitals: vitals, runtimeInputs: runtimeInputs, res: make(chan ingressAddResult, 1)}
 	if err := e.admit(ctx, cmd); err != nil {
 		return EntitySnapshot{}, err
 	}

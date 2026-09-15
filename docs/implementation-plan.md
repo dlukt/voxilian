@@ -332,7 +332,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   execution-time Saver revisions into Store request
   `ExpectedRevision` fields. Spec: §9.5.1, §9.5.1a, §9.5.1b,
   §9.5.1c, §9.5.8a, §9.5.10a, §9.5.11a.
-- [ ] **M5-T5c3a** Player runtime identity + typed owner ingress
+- [x] **M5-T5c3a** Player runtime identity + typed owner ingress
   (depends on the T4b1/T4b2 value domains it composes; `internal/sim`
   only): durable `CharacterID` association on the live player entity,
   one-live-entity-per-`CharacterID` invariant (live incl. `MIGRATING`),

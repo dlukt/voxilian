@@ -59,29 +59,42 @@ type PlayerVitalsObserverFunc func(PlayerVitalsEvent)
 // OnPlayerVitalsChange implements PlayerVitalsObserver.
 func (f PlayerVitalsObserverFunc) OnPlayerVitalsChange(ev PlayerVitalsEvent) { f(ev) }
 
-// AddPlayerEntity inserts a player entity carrying authoritative vitals
-// (spec §9.4b.3 + §9.4b.3a): validates the vitals AND the T4b2 runtime
-// inputs FIRST (an invalid value of either consumes no EntityID and
-// mutates nothing), then performs the ordinary generic add (same
-// all-or-nothing position/ID-exhaustion semantics) and installs a VALUE
-// COPY of the vitals plus the player classification plus the ATOMIC
-// §9.4b.9 initial runtime state (fresh acted flag, no rest deadline,
-// stomach anchored at the current tick, health armed iff HP != MaxHP &&
-// HP > 0, mana armed iff Mana != MaxMana — from the current tick using
-// the supplied inputs), sampling VolumeFlagsAt at the initial position
-// like AddEntity. The caller's vitals/inputs are never aliased; no
-// default Stamina/Mysticism is invented.
+// AddPlayerEntity inserts a player entity carrying the durable
+// CharacterID identity plus authoritative vitals (spec §9.5.1d +
+// §9.4b.3 + §9.4b.3a): the CharacterID validates FIRST (an invalid
+// ID consumes no EntityID and mutates nothing), then the vitals AND
+// the T4b2 runtime inputs (an invalid value of either consumes no
+// EntityID and mutates nothing), then the duplicate live-binding
+// check (a CharacterID already bound to a live resident or
+// migrating entity fails with ErrCharacterAlreadyActive, consuming
+// no EntityID and mutating nothing), then the ordinary generic add
+// (same all-or-nothing position/ID-exhaustion semantics: a failed
+// position add leaves no identity binding behind), and finally the
+// atomic install of the VALUE COPY of the vitals plus the player
+// classification plus the durable CharacterID binding plus the
+// ATOMIC §9.4b.9 initial runtime state (fresh acted flag, no rest
+// deadline, stomach anchored at the current tick, health armed iff
+// HP != MaxHP && HP > 0, mana armed iff Mana != MaxMana — from the
+// current tick using the supplied inputs), sampling VolumeFlagsAt
+// at the initial position like AddEntity. The caller's
+// vitals/inputs are never aliased; no default Stamina/Mysticism is
+// invented. No Store/gateway type appears.
 //
 // Owner-local: call only from the sim owner goroutine (Run/Step) or in
-// Step-driven tests. Concurrent gateway callers keep using
-// EnqueueAddEntity (generic); the typed concurrent player-add command is
-// deferred to the gateway world-entry composition task (spec §9.4b.3).
-func (e *Engine) AddPlayerEntity(pos world.Vec3, vitals PlayerVitals, runtimeInputs PlayerVitalsRuntimeInputs) (EntitySnapshot, error) {
+// Step-driven tests. Concurrent gateway callers use
+// EnqueueAddPlayerEntity; EnqueueAddEntity stays generic-only.
+func (e *Engine) AddPlayerEntity(characterID CharacterID, pos world.Vec3, vitals PlayerVitals, runtimeInputs PlayerVitalsRuntimeInputs) (EntitySnapshot, error) {
+	if characterID <= InvalidCharacterID {
+		return EntitySnapshot{}, fmt.Errorf("%w: %d", ErrInvalidCharacterID, int64(characterID))
+	}
 	if err := vitals.Validate(); err != nil {
 		return EntitySnapshot{}, err
 	}
 	if err := runtimeInputs.Validate(); err != nil {
 		return EntitySnapshot{}, err
+	}
+	if live, ok := e.registry.liveEntityForCharacter(characterID); ok {
+		return EntitySnapshot{}, fmt.Errorf("%w: character %d on entity %d", ErrCharacterAlreadyActive, int64(characterID), uint64(live))
 	}
 	snap, err := e.registry.AddEntity(pos)
 	if err != nil {
@@ -92,24 +105,34 @@ func (e *Engine) AddPlayerEntity(pos world.Vec3, vitals PlayerVitals, runtimeInp
 		return EntitySnapshot{}, fmt.Errorf("sim: entity %d vanished after add: %w", uint64(snap.ID), err)
 	}
 	ent.isPlayer = true
+	ent.characterID = characterID
 	ent.vitals = vitals
 	ent.volumeFlags = e.collision.VolumeFlagsAt(pos)
 	e.initPlayerRuntime(ent, runtimeInputs)
+	e.registry.characters[characterID] = ent.id
 	return ent.snapshot(), nil
 }
 
 // AttachPlayerVitals converts an existing generic entity into a player
-// entity carrying a validated VALUE COPY of vitals plus the atomic
-// §9.4b.9/§9.4b.3a initial runtime state over the validated runtime
-// inputs. Unknown IDs report ErrEntityNotFound, already-player entities
-// ErrEntityAlreadyPlayer, and MIGRATING ownership fails with zero
+// entity bound to the durable CharacterID plus a validated VALUE COPY
+// of vitals plus the atomic §9.4b.9/§9.4b.3a initial runtime state
+// over the validated runtime inputs. Invalid CharacterIDs fail with
+// zero mutation; unknown IDs report ErrEntityNotFound,
+// already-player entities ErrEntityAlreadyPlayer, a CharacterID
+// already bound to another live entity ErrCharacterAlreadyActive
+// with zero mutation, and MIGRATING ownership fails with zero
 // mutation (the quiesced entity accepts no source-side gameplay
 // mutation, §5.4.2). No event fires: classification is not a vitals
-// state change (§9.4b.6).
+// state change (§9.4b.6). On success the classification +
+// CharacterID + vitals/runtime state + identity index install
+// atomically from the owner's perspective.
 //
 // Owner-local: call only from the sim owner goroutine (Run/Step) or in
 // Step-driven tests.
-func (e *Engine) AttachPlayerVitals(id EntityID, vitals PlayerVitals, runtimeInputs PlayerVitalsRuntimeInputs) error {
+func (e *Engine) AttachPlayerVitals(id EntityID, characterID CharacterID, vitals PlayerVitals, runtimeInputs PlayerVitalsRuntimeInputs) error {
+	if characterID <= InvalidCharacterID {
+		return fmt.Errorf("%w: %d", ErrInvalidCharacterID, int64(characterID))
+	}
 	if err := vitals.Validate(); err != nil {
 		return err
 	}
@@ -126,9 +149,14 @@ func (e *Engine) AttachPlayerVitals(id EntityID, vitals PlayerVitals, runtimeInp
 	if ent.isPlayer {
 		return fmt.Errorf("%w: id %d", ErrEntityAlreadyPlayer, uint64(id))
 	}
+	if live, ok := e.registry.liveEntityForCharacter(characterID); ok {
+		return fmt.Errorf("%w: character %d on entity %d", ErrCharacterAlreadyActive, int64(characterID), uint64(live))
+	}
 	ent.isPlayer = true
+	ent.characterID = characterID
 	ent.vitals = vitals
 	e.initPlayerRuntime(ent, runtimeInputs)
+	e.registry.characters[characterID] = ent.id
 	return nil
 }
 

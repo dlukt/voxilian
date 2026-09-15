@@ -62,7 +62,7 @@ func addDamagedPlayer(t *testing.T, e *Engine, pos world.Vec3) EntityID {
 	t.Helper()
 	v := testVitals()
 	v.HP = 10
-	snap, err := e.AddPlayerEntity(pos, v, testRuntimeInputs())
+	snap, err := e.AddPlayerEntity(testCharacterID(), pos, v, testRuntimeInputs())
 	if err != nil {
 		t.Fatalf("AddPlayerEntity: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestRuntimeAddInitialization(t *testing.T) {
 	e := newPlayerEngine(t, nil)
 	bad := testRuntimeInputs()
 	bad.RestRecoveryMultiplier = 9
-	if _, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, testVitals(), bad); !errors.Is(err, ErrInvalidVitals) {
+	if _, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, testVitals(), bad); !errors.Is(err, ErrInvalidVitals) {
 		t.Fatalf("AddPlayerEntity(invalid inputs) err = %v", err)
 	}
 	if e.EntityCount() != 0 {
@@ -224,7 +224,7 @@ func TestRuntimeAddInitialization(t *testing.T) {
 
 	// Fresh full 20/20 HP + full Mana: no deadlines, fresh runtime state.
 	e2 := newPlayerEngine(t, nil)
-	full, err := e2.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, testVitals(), testRuntimeInputs())
+	full, err := e2.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, testVitals(), testRuntimeInputs())
 	if err != nil {
 		t.Fatalf("AddPlayerEntity: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestRuntimeAddInitialization(t *testing.T) {
 	v := testVitals()
 	v.HP = 10
 	v.Mana = 5
-	dmg, err := e3.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+	dmg, err := e3.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 	if err != nil {
 		t.Fatalf("AddPlayerEntity: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestRuntimeAddInitialization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AddEntity: %v", err)
 	}
-	if err := e4.AttachPlayerVitals(generic.ID, v, testRuntimeInputs()); err != nil {
+	if err := e4.AttachPlayerVitals(generic.ID, testCharacterID(), v, testRuntimeInputs()); err != nil {
 		t.Fatalf("AttachPlayerVitals: %v", err)
 	}
 	rt4, ok4, _ := e4.PlayerVitalsRuntimeOf(generic.ID)
@@ -399,7 +399,7 @@ func TestRuntimeDeadlineConversion(t *testing.T) {
 	// Mana over-max branch: fixed BOOST decay 30000 ms -> 600 ticks.
 	over := testVitals()
 	over.Mana = 23
-	overSnap, err := e.AddPlayerEntity(world.Vec3{X: 5, Y: 0, Z: 5}, over, testRuntimeInputs())
+	overSnap, err := e.AddPlayerEntity(CharacterID(8), world.Vec3{X: 5, Y: 0, Z: 5}, over, testRuntimeInputs())
 	if err != nil {
 		t.Fatalf("AddPlayerEntity: %v", err)
 	}
@@ -599,7 +599,7 @@ func TestNewHealthLifecycle(t *testing.T) {
 		e := newPlayerEngine(t, nil)
 		v := testVitals()
 		v.HP = 25 // > Max 20
-		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}
@@ -622,7 +622,7 @@ func TestNewManaLifecycle(t *testing.T) {
 		e := newPlayerEngine(t, nil)
 		v := testVitals()
 		v.Mana = 19
-		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}
@@ -669,7 +669,7 @@ func TestNewManaLifecycle(t *testing.T) {
 		e := newPlayerEngine(t, nil)
 		v := testVitals()
 		v.Mana = 5
-		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}
@@ -690,7 +690,7 @@ func TestNewManaLifecycle(t *testing.T) {
 		e := newPlayerEngine(t, nil)
 		v := testVitals()
 		v.Mana = 23 // > Max 20
-		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}
@@ -735,7 +735,7 @@ func TestPhaseOrderMovementBeforeVitals(t *testing.T) {
 	e := newPlayerEngine(t, nil)
 	v := testVitals()
 	v.Vigor = 9
-	snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+	snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 	if err != nil {
 		t.Fatalf("AddPlayerEntity: %v", err)
 	}
@@ -861,7 +861,7 @@ func TestRestRecoveryGating(t *testing.T) {
 			e := newPlayerEngine(t, rec)
 			v := testVitals()
 			v.Vigor = tc.vigor
-			snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+			snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 			if err != nil {
 				t.Fatalf("AddPlayerEntity: %v", err)
 			}
@@ -901,7 +901,7 @@ func TestRestInputTiming(t *testing.T) {
 		e := newPlayerEngine(t, nil)
 		v := testVitals()
 		v.Vigor = 10
-		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}
@@ -1028,7 +1028,7 @@ func TestAdjustMaxHPNewHealthReconciliation(t *testing.T) {
 		e := newPlayerEngine(t, nil)
 		v := testVitals()
 		v.HP = 25 // legal over-max: attach arms the health slot
-		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}
@@ -1061,7 +1061,7 @@ func TestAdjustMaxHPNewHealthReconciliation(t *testing.T) {
 		v := testVitals()
 		v.HP = 10
 		v.MaxHP = 30 // damaged under a raised max: attach arms the slot
-		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}
@@ -1111,7 +1111,7 @@ func TestAdjustMaxHPNewHealthReconciliation(t *testing.T) {
 			t.Fatalf("no-op adjust moved the deadline: %+v", rt)
 		}
 		// Absent at equality stays absent.
-		full, err := e.AddPlayerEntity(world.Vec3{X: 2, Y: 0, Z: 2}, testVitals(), testRuntimeInputs())
+		full, err := e.AddPlayerEntity(CharacterID(9), world.Vec3{X: 2, Y: 0, Z: 2}, testVitals(), testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}
@@ -1158,7 +1158,7 @@ func TestSlotOrderHealthManaRest(t *testing.T) {
 	v.HP = 10   // health +1
 	v.Mana = 5  // mana +1
 	v.Vigor = 1 // rest: mult 3 -> -30000 crossing -> vigor +3
-	snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+	snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 	if err != nil {
 		t.Fatalf("AddPlayerEntity: %v", err)
 	}
@@ -1369,7 +1369,7 @@ func TestStomachAnchorLifecycle(t *testing.T) {
 		e := newPlayerEngine(t, nil)
 		v := testVitals()
 		v.Stomach = 50
-		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}
@@ -1438,7 +1438,7 @@ func TestStomachAnchorLifecycle(t *testing.T) {
 		e.tick.Store(math.MaxUint32 - 10)
 		v := testVitals()
 		v.Stomach = 50
-		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}
@@ -1498,7 +1498,7 @@ func TestStomachAnchorLifecycle(t *testing.T) {
 		e := newPlayerEngine(t, nil)
 		v := testVitals()
 		v.Stomach = 50
-		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}
@@ -1506,7 +1506,7 @@ func TestStomachAnchorLifecycle(t *testing.T) {
 		if err := e.RemoveEntity(snap.ID); err != nil {
 			t.Fatalf("RemoveEntity: %v", err)
 		}
-		reSnap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		reSnap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("re-add: %v", err)
 		}
@@ -1531,7 +1531,7 @@ func TestRuntimeHandoffNoDoubleFire(t *testing.T) {
 	e := newPlayerEngine(t, rec)
 	v := testVitals()
 	v.HP = 10
-	snap, err := e.AddPlayerEntity(world.Vec3{X: 31.9, Y: 0, Z: 0.5}, v, testRuntimeInputs())
+	snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 31.9, Y: 0, Z: 0.5}, v, testRuntimeInputs())
 	if err != nil {
 		t.Fatalf("AddPlayerEntity: %v", err)
 	}
@@ -1591,7 +1591,7 @@ func TestRuntimeDirtyObserver(t *testing.T) {
 		v.HP = 10
 		v.Mana = 5
 		v.Vigor = 1
-		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}
@@ -1639,7 +1639,7 @@ func TestRuntimeDirtyObserver(t *testing.T) {
 		v := testVitals()
 		v.HP = 10
 		v.Stomach = 50
-		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}

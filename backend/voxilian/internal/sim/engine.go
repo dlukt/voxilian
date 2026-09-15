@@ -527,7 +527,10 @@ func (e *Engine) AddEntity(pos world.Vec3) (EntitySnapshot, error) {
 	return ent.snapshot(), nil
 }
 
-// RemoveEntity deletes an entity and discards its history.
+// RemoveEntity deletes an entity, discards its history, and frees its
+// CharacterID identity binding when the entity is a player
+// (spec §9.5.1d) so the same CharacterID may be added/attached again
+// under a fresh EntityID.
 //
 // Owner-local: call only from the sim owner goroutine (Run/Step) or
 // in Step-driven tests. Concurrent gateway callers use

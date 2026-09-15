@@ -31,6 +31,11 @@ func testRuntimeInputs() PlayerVitalsRuntimeInputs {
 	return in
 }
 
+// testCharacterID is the canonical durable character identity for
+// single-player tests (every such test owns a fresh engine, so one
+// constant suffices; multi-player tests use distinct literals).
+func testCharacterID() CharacterID { return CharacterID(7) }
+
 // vitalsRecorder captures dirty/event seam deliveries (spec §9.4b.6).
 type vitalsRecorder struct {
 	events []PlayerVitalsEvent
@@ -85,7 +90,7 @@ func TestPlayerVitalsAttachAcceptsValid(t *testing.T) {
 	e := newPlayerEngine(t, nil)
 	v := testVitals()
 	v.HP = 7 // distinctive damaged state
-	snap, err := e.AddPlayerEntity(world.Vec3{X: 3, Y: 0, Z: 4}, v, testRuntimeInputs())
+	snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 3, Y: 0, Z: 4}, v, testRuntimeInputs())
 	if err != nil {
 		t.Fatalf("AddPlayerEntity: %v", err)
 	}
@@ -107,7 +112,7 @@ func TestPlayerVitalsAttachRejectsInvalid(t *testing.T) {
 	e := newPlayerEngine(t, nil)
 	bad := testVitals()
 	bad.Vigor = 0 // outside 1..200
-	if _, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, bad, testRuntimeInputs()); !errors.Is(err, ErrInvalidVitals) {
+	if _, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, bad, testRuntimeInputs()); !errors.Is(err, ErrInvalidVitals) {
 		t.Fatalf("AddPlayerEntity(invalid) err = %v, want ErrInvalidVitals", err)
 	}
 	if e.EntityCount() != 0 {
@@ -123,18 +128,18 @@ func TestPlayerVitalsAttachRejectsInvalid(t *testing.T) {
 	}
 
 	good := testVitals()
-	if err := e.AttachPlayerVitals(snap.ID, good, testRuntimeInputs()); err != nil {
+	if err := e.AttachPlayerVitals(snap.ID, testCharacterID(), good, testRuntimeInputs()); err != nil {
 		t.Fatalf("AttachPlayerVitals: %v", err)
 	}
-	if err := e.AttachPlayerVitals(snap.ID, good, testRuntimeInputs()); !errors.Is(err, ErrEntityAlreadyPlayer) {
+	if err := e.AttachPlayerVitals(snap.ID, testCharacterID(), good, testRuntimeInputs()); !errors.Is(err, ErrEntityAlreadyPlayer) {
 		t.Fatalf("double attach err = %v, want ErrEntityAlreadyPlayer", err)
 	}
 	bad2 := testVitals()
 	bad2.Stomach = 101
-	if err := e.AttachPlayerVitals(snap.ID, bad2, testRuntimeInputs()); !errors.Is(err, ErrInvalidVitals) {
+	if err := e.AttachPlayerVitals(snap.ID, testCharacterID(), bad2, testRuntimeInputs()); !errors.Is(err, ErrInvalidVitals) {
 		t.Fatalf("AttachPlayerVitals(invalid) err = %v, want ErrInvalidVitals", err)
 	}
-	if err := e.AttachPlayerVitals(999, good, testRuntimeInputs()); !errors.Is(err, ErrEntityNotFound) {
+	if err := e.AttachPlayerVitals(999, testCharacterID(), good, testRuntimeInputs()); !errors.Is(err, ErrEntityNotFound) {
 		t.Fatalf("AttachPlayerVitals(unknown) err = %v, want ErrEntityNotFound", err)
 	}
 	// The failed re-attach attempts left the original value untouched.
@@ -146,7 +151,7 @@ func TestPlayerVitalsAttachRejectsInvalid(t *testing.T) {
 func TestPlayerVitalsNoCallerAliasing(t *testing.T) {
 	e := newPlayerEngine(t, nil)
 	v := testVitals()
-	snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+	snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 	if err != nil {
 		t.Fatalf("AddPlayerEntity: %v", err)
 	}
@@ -166,7 +171,7 @@ func TestPlayerVitalsNoCallerAliasing(t *testing.T) {
 func TestPlayerVitalsZeroFieldsArePlayerVitals(t *testing.T) {
 	e := newPlayerEngine(t, nil)
 	v := testVitals() // Stomach 0, Exertion 0: legal creation values
-	snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+	snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 	if err != nil {
 		t.Fatalf("AddPlayerEntity: %v", err)
 	}
@@ -348,7 +353,7 @@ func TestPlayerVitalsMutationsComposeT4a(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newPlayerEngine(t, nil)
-			snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, tc.v, testRuntimeInputs())
+			snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, tc.v, testRuntimeInputs())
 			if err != nil {
 				t.Fatalf("AddPlayerEntity: %v", err)
 			}
@@ -385,7 +390,7 @@ func TestPlayerVitalsExertionStrictBoundary(t *testing.T) {
 	} {
 		e := newPlayerEngine(t, nil)
 		v := testVitals()
-		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}
@@ -409,7 +414,7 @@ func TestPlayerVitalsFailedMutationLeavesEntityUnchanged(t *testing.T) {
 	rec := &vitalsRecorder{}
 	e.vitalsObs = rec
 	v := testVitals()
-	snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+	snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 	if err != nil {
 		t.Fatalf("AddPlayerEntity: %v", err)
 	}
@@ -491,7 +496,7 @@ func TestPlayerVitalsDirtySeam(t *testing.T) {
 		e := newPlayerEngine(t, rec)
 		v := testVitals()
 		v.HP = 10
-		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}
@@ -517,7 +522,7 @@ func TestPlayerVitalsDirtySeam(t *testing.T) {
 		rec := &vitalsRecorder{}
 		e := newPlayerEngine(t, rec)
 		v := testVitals() // HP == Max == 20
-		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}
@@ -537,7 +542,7 @@ func TestPlayerVitalsDirtySeam(t *testing.T) {
 	t.Run("failure fires nothing", func(t *testing.T) {
 		rec := &vitalsRecorder{}
 		e := newPlayerEngine(t, rec)
-		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, testVitals(), testRuntimeInputs())
+		snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, testVitals(), testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}
@@ -550,7 +555,7 @@ func TestPlayerVitalsDirtySeam(t *testing.T) {
 	})
 	t.Run("nil observer is a no-op", func(t *testing.T) {
 		e := newPlayerEngine(t, nil)
-		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, testVitals(), testRuntimeInputs())
+		snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, testVitals(), testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}
@@ -590,7 +595,7 @@ func TestPlayerVitalsRunGate(t *testing.T) {
 		v := testVitals()
 		v.Vigor = tc.vigor
 		e := newPlayerEngine(t, nil)
-		snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+		snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 		if err != nil {
 			t.Fatalf("AddPlayerEntity: %v", err)
 		}
@@ -606,7 +611,7 @@ func TestPlayerVitalsRunGateDoesNotConsultInjectedGate(t *testing.T) {
 		Clock: newManualClock(), RNG: newTestRNG(2), RunGate: gate,
 	})
 	v := testVitals() // vigor 100
-	snap, err := e.AddPlayerEntity(world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+	snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
 	if err != nil {
 		t.Fatalf("AddPlayerEntity: %v", err)
 	}
@@ -647,7 +652,7 @@ func TestPlayerVitalsHandoffPreservation(t *testing.T) {
 	v.HP = 7
 	v.Mana = 11
 	v.Exertion = -4242
-	snap, err := e.AddPlayerEntity(world.Vec3{X: 31.9, Y: 0, Z: 0.5}, v, testRuntimeInputs())
+	snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 31.9, Y: 0, Z: 0.5}, v, testRuntimeInputs())
 	if err != nil {
 		t.Fatalf("AddPlayerEntity: %v", err)
 	}
@@ -703,5 +708,286 @@ func TestGenericHandoffKeepsClassification(t *testing.T) {
 	}
 	if _, ok, err := e.PlayerVitalsOf(snap.ID); err != nil || ok {
 		t.Fatalf("generic handoff produced vitals: %v,%v", ok, err)
+	}
+}
+
+// ---------------------------------------------------------------- M5-T5c3a player runtime identity (spec §9.5.1d)
+
+func TestPlayerCharacterGenericHasNoIdentity(t *testing.T) {
+	e := newPlayerEngine(t, nil)
+	snap, err := e.AddEntity(world.Vec3{X: 1, Y: 0, Z: 1})
+	if err != nil {
+		t.Fatalf("AddEntity: %v", err)
+	}
+	if snap.IsPlayer {
+		t.Fatalf("generic add classified as player")
+	}
+	if snap.CharacterID != InvalidCharacterID {
+		t.Fatalf("generic snapshot CharacterID = %d, want 0", int64(snap.CharacterID))
+	}
+}
+
+func TestPlayerCharacterBinding(t *testing.T) {
+	e := newPlayerEngine(t, nil)
+	v := testVitals()
+	v.HP = 7 // distinctive damaged state
+	in := testRuntimeInputs()
+	snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 3, Y: 0, Z: 4}, v, in)
+	if err != nil {
+		t.Fatalf("AddPlayerEntity: %v", err)
+	}
+	if !snap.IsPlayer {
+		t.Fatalf("player add not classified")
+	}
+	if snap.CharacterID != testCharacterID() {
+		t.Fatalf("snapshot CharacterID = %d, want %d", int64(snap.CharacterID), int64(testCharacterID()))
+	}
+	if got, ok, err := e.PlayerVitalsOf(snap.ID); err != nil || !ok || got != v {
+		t.Fatalf("PlayerVitalsOf = %+v,%v,%v; want %+v,true,nil", got, ok, err, v)
+	}
+	if rt, ok, err := e.PlayerVitalsRuntimeOf(snap.ID); err != nil || !ok || rt.Inputs != in {
+		t.Fatalf("PlayerVitalsRuntimeOf = %+v,%v,%v; want inputs %+v", rt, ok, err, in)
+	}
+}
+
+func TestPlayerCharacterInvalidIDConsumesNothing(t *testing.T) {
+	for _, bad := range []CharacterID{InvalidCharacterID, CharacterID(-3)} {
+		e := newPlayerEngine(t, nil)
+		if _, err := e.AddPlayerEntity(bad, world.Vec3{X: 1, Y: 0, Z: 1}, testVitals(), testRuntimeInputs()); !errors.Is(err, ErrInvalidCharacterID) {
+			t.Fatalf("AddPlayerEntity(%d) err = %v, want ErrInvalidCharacterID", int64(bad), err)
+		}
+		if n := e.EntityCount(); n != 0 {
+			t.Fatalf("invalid CharacterID mutated registry: count %d", n)
+		}
+		snap, err := e.AddEntity(world.Vec3{X: 1, Y: 0, Z: 1})
+		if err != nil {
+			t.Fatalf("AddEntity: %v", err)
+		}
+		if snap.ID != 1 {
+			t.Fatalf("first allocated ID = %d, want 1 (no ID consumed by rejection)", snap.ID)
+		}
+		// Attach with an invalid CharacterID is equally inert.
+		if err := e.AttachPlayerVitals(snap.ID, bad, testVitals(), testRuntimeInputs()); !errors.Is(err, ErrInvalidCharacterID) {
+			t.Fatalf("AttachPlayerVitals(%d) err = %v, want ErrInvalidCharacterID", int64(bad), err)
+		}
+		if got, err := e.Entity(snap.ID); err != nil || got.IsPlayer || got.CharacterID != InvalidCharacterID {
+			t.Fatalf("failed attach mutated entity: %+v,%v", got, err)
+		}
+	}
+}
+
+func TestPlayerCharacterDuplicateConsumesNoEntityID(t *testing.T) {
+	e := newPlayerEngine(t, nil)
+	v := testVitals()
+	first, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, v, testRuntimeInputs())
+	if err != nil {
+		t.Fatalf("first AddPlayerEntity: %v", err)
+	}
+	before, err := e.Entity(first.ID)
+	if err != nil {
+		t.Fatalf("Entity: %v", err)
+	}
+	beforeVitals, _, _ := e.PlayerVitalsOf(first.ID)
+	if _, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 9, Y: 0, Z: 9}, testVitals(), testRuntimeInputs()); !errors.Is(err, ErrCharacterAlreadyActive) {
+		t.Fatalf("duplicate add err = %v, want ErrCharacterAlreadyActive", err)
+	}
+	// The first entity is bit-identical: no snapshot or vitals change.
+	after, err := e.Entity(first.ID)
+	if err != nil {
+		t.Fatalf("Entity: %v", err)
+	}
+	if after != before {
+		t.Fatalf("duplicate add mutated first entity: %+v vs %+v", after, before)
+	}
+	if got, _, _ := e.PlayerVitalsOf(first.ID); got != beforeVitals {
+		t.Fatalf("duplicate add mutated first vitals: %+v", got)
+	}
+	// No second EntityID was consumed: the next generic add is ID 2.
+	gen, err := e.AddEntity(world.Vec3{X: 2, Y: 0, Z: 2})
+	if err != nil {
+		t.Fatalf("AddEntity: %v", err)
+	}
+	if gen.ID != 2 {
+		t.Fatalf("next EntityID = %d, want 2 (duplicate consumed nothing)", gen.ID)
+	}
+	// A failed position add leaves no identity binding behind: the
+	// same CharacterID stays usable afterwards.
+	fresh := CharacterID(11)
+	if _, err := e.AddPlayerEntity(fresh, world.Vec3{X: 1e300, Y: 0, Z: 0}, testVitals(), testRuntimeInputs()); !errors.Is(err, ErrInvalidPosition) {
+		t.Fatalf("bad-position add err = %v, want ErrInvalidPosition", err)
+	}
+	if _, err := e.AddPlayerEntity(fresh, world.Vec3{X: 4, Y: 0, Z: 4}, testVitals(), testRuntimeInputs()); err != nil {
+		t.Fatalf("re-add after failed position: %v", err)
+	}
+}
+
+func TestPlayerCharacterRemoveThenReAdd(t *testing.T) {
+	e := newPlayerEngine(t, nil)
+	first, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, testVitals(), testRuntimeInputs())
+	if err != nil {
+		t.Fatalf("AddPlayerEntity: %v", err)
+	}
+	if err := e.RemoveEntity(first.ID); err != nil {
+		t.Fatalf("RemoveEntity: %v", err)
+	}
+	second, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 5, Y: 0, Z: 5}, testVitals(), testRuntimeInputs())
+	if err != nil {
+		t.Fatalf("re-add after remove: %v", err)
+	}
+	if second.ID == first.ID {
+		t.Fatalf("re-add reused EntityID %d", second.ID)
+	}
+	if !second.IsPlayer || second.CharacterID != testCharacterID() {
+		t.Fatalf("re-add snapshot = %+v, want player with character %d", second, int64(testCharacterID()))
+	}
+	// The identity points only to the new live entity: the old ID is
+	// gone and the duplicate guard names the new one.
+	if _, err := e.Entity(first.ID); !errors.Is(err, ErrEntityNotFound) {
+		t.Fatalf("removed entity still visible: %v", err)
+	}
+	if _, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 6, Y: 0, Z: 6}, testVitals(), testRuntimeInputs()); !errors.Is(err, ErrCharacterAlreadyActive) {
+		t.Fatalf("third add err = %v, want ErrCharacterAlreadyActive", err)
+	}
+	// Unknown removal disturbs no identity mapping.
+	if err := e.RemoveEntity(999); !errors.Is(err, ErrEntityNotFound) {
+		t.Fatalf("unknown remove err = %v, want ErrEntityNotFound", err)
+	}
+	if got, err := e.Entity(second.ID); err != nil || got.CharacterID != testCharacterID() {
+		t.Fatalf("unknown remove disturbed identity: %+v,%v", got, err)
+	}
+}
+
+func TestPlayerCharacterAttachBindsIdentity(t *testing.T) {
+	e := newPlayerEngine(t, nil)
+	gen, err := e.AddEntity(world.Vec3{X: 1, Y: 0, Z: 1})
+	if err != nil {
+		t.Fatalf("AddEntity: %v", err)
+	}
+	v := testVitals()
+	if err := e.AttachPlayerVitals(gen.ID, testCharacterID(), v, testRuntimeInputs()); err != nil {
+		t.Fatalf("AttachPlayerVitals: %v", err)
+	}
+	snap, err := e.Entity(gen.ID)
+	if err != nil {
+		t.Fatalf("Entity: %v", err)
+	}
+	if !snap.IsPlayer || snap.CharacterID != testCharacterID() {
+		t.Fatalf("attached snapshot = %+v, want player with character %d", snap, int64(testCharacterID()))
+	}
+	if got, ok, err := e.PlayerVitalsOf(gen.ID); err != nil || !ok || got != v {
+		t.Fatalf("PlayerVitalsOf = %+v,%v,%v", got, ok, err)
+	}
+	// Removal frees the attached binding too.
+	if err := e.RemoveEntity(gen.ID); err != nil {
+		t.Fatalf("RemoveEntity: %v", err)
+	}
+	if _, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 2, Y: 0, Z: 2}, testVitals(), testRuntimeInputs()); err != nil {
+		t.Fatalf("re-add after attached remove: %v", err)
+	}
+}
+
+func TestPlayerCharacterAttachDuplicateIsInert(t *testing.T) {
+	e := newPlayerEngine(t, nil)
+	a, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, testVitals(), testRuntimeInputs())
+	if err != nil {
+		t.Fatalf("add A: %v", err)
+	}
+	b, err := e.AddEntity(world.Vec3{X: 2, Y: 0, Z: 2})
+	if err != nil {
+		t.Fatalf("add B: %v", err)
+	}
+	beforeB, err := e.Entity(b.ID)
+	if err != nil {
+		t.Fatalf("Entity B: %v", err)
+	}
+	beforeA, _, _ := e.PlayerVitalsOf(a.ID)
+	if err := e.AttachPlayerVitals(b.ID, testCharacterID(), testVitals(), testRuntimeInputs()); !errors.Is(err, ErrCharacterAlreadyActive) {
+		t.Fatalf("attach duplicate err = %v, want ErrCharacterAlreadyActive", err)
+	}
+	// Zero mutation on both sides.
+	afterB, err := e.Entity(b.ID)
+	if err != nil {
+		t.Fatalf("Entity B: %v", err)
+	}
+	if afterB != beforeB || afterB.IsPlayer || afterB.CharacterID != InvalidCharacterID {
+		t.Fatalf("failed attach mutated B: %+v vs %+v", afterB, beforeB)
+	}
+	if _, ok, err := e.PlayerVitalsOf(b.ID); err != nil || ok {
+		t.Fatalf("failed attach gave B vitals: %v,%v", ok, err)
+	}
+	if got, _, _ := e.PlayerVitalsOf(a.ID); got != beforeA {
+		t.Fatalf("failed attach mutated A vitals: %+v", got)
+	}
+}
+
+func TestPlayerCharacterHandoffPreservesIdentity(t *testing.T) {
+	e := newPlayerEngine(t, nil)
+	v := testVitals()
+	v.HP = 7
+	snap, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 31.9, Y: 0, Z: 0.5}, v, testRuntimeInputs())
+	if err != nil {
+		t.Fatalf("AddPlayerEntity: %v", err)
+	}
+	if got := runForwardSpeed(t, e, snap.ID); got != RunSpeedWire {
+		t.Fatalf("player failed to run toward boundary: %d", got)
+	}
+	after, err := e.Entity(snap.ID)
+	if err != nil {
+		t.Fatalf("Entity: %v", err)
+	}
+	if after.Cell.X == snap.Cell.X {
+		t.Fatalf("entity did not cross a cell boundary: %v", after.Cell)
+	}
+	if after.ID != snap.ID {
+		t.Fatalf("handoff changed EntityID %d -> %d", snap.ID, after.ID)
+	}
+	if after.CharacterID != testCharacterID() || !after.IsPlayer {
+		t.Fatalf("handoff lost identity: %+v", after)
+	}
+	// The identity still binds the same live entity: no duplicate is
+	// possible after the move.
+	if _, err := e.AddPlayerEntity(testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, testVitals(), testRuntimeInputs()); !errors.Is(err, ErrCharacterAlreadyActive) {
+		t.Fatalf("post-handoff duplicate err = %v, want ErrCharacterAlreadyActive", err)
+	}
+
+	// While MIGRATING the entity is still the live entity for
+	// duplicate detection: drive an explicit quiesced transfer and
+	// prove the binding holds mid-migration.
+	mig, err := e.AddPlayerEntity(CharacterID(21), world.Vec3{X: 10, Y: 0, Z: 10}, testVitals(), testRuntimeInputs())
+	if err != nil {
+		t.Fatalf("add migrating candidate: %v", err)
+	}
+	ent, err := e.registry.lookup(mig.ID)
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	final := world.Vec3{X: 33.0, Y: 0, Z: 10.0}
+	dest, err := world.CellForPosition(final)
+	if err != nil {
+		t.Fatalf("CellForPosition: %v", err)
+	}
+	tok, err := e.registry.beginHandoff(mig.ID, OwnerRef{Cell: ent.cell, Generation: ent.generation}, dest, final)
+	if err != nil {
+		t.Fatalf("beginHandoff: %v", err)
+	}
+	if _, err := e.AddPlayerEntity(CharacterID(21), world.Vec3{X: 1, Y: 0, Z: 1}, testVitals(), testRuntimeInputs()); !errors.Is(err, ErrCharacterAlreadyActive) {
+		t.Fatalf("mid-migration duplicate err = %v, want ErrCharacterAlreadyActive", err)
+	}
+	if _, err := e.registry.commitHandoff(tok); err != nil {
+		t.Fatalf("commitHandoff: %v", err)
+	}
+	installed, err := e.Entity(mig.ID)
+	if err != nil {
+		t.Fatalf("Entity: %v", err)
+	}
+	if installed.ID != mig.ID || installed.CharacterID != CharacterID(21) || !installed.IsPlayer {
+		t.Fatalf("commit lost identity: %+v", installed)
+	}
+	// Removing the migrated player frees the binding.
+	if err := e.RemoveEntity(mig.ID); err != nil {
+		t.Fatalf("remove migrated: %v", err)
+	}
+	if _, err := e.AddPlayerEntity(CharacterID(21), world.Vec3{X: 1, Y: 0, Z: 1}, testVitals(), testRuntimeInputs()); err != nil {
+		t.Fatalf("re-add after migrated remove: %v", err)
 	}
 }

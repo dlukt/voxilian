@@ -698,3 +698,81 @@ func TestIngressPropertyModel(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------- M5-T5c3a typed player ingress (spec §9.5.1d)
+
+func TestEnqueueAddPlayerRealEngine(t *testing.T) {
+	clk := newManualClock()
+	e := ingressEngine(t, clk, openCollision{})
+	cancel, done := runOwner(t, e, clk)
+	defer stopOwner(t, cancel, done)
+	ctx := context.Background()
+	v := testVitals()
+	v.HP = 7
+	in := testRuntimeInputs()
+	pos := world.Vec3{X: 4, Y: 0, Z: -8}
+	snap, err := e.EnqueueAddPlayerEntity(ctx, testCharacterID(), pos, v, in)
+	if err != nil {
+		t.Fatalf("EnqueueAddPlayerEntity: %v", err)
+	}
+	if snap.ID == InvalidEntityID || !snap.IsPlayer || snap.CharacterID != testCharacterID() {
+		t.Fatalf("snapshot = %+v, want live player with character %d", snap, int64(testCharacterID()))
+	}
+	if snap.Position != pos {
+		t.Fatalf("position = %v, want %v", snap.Position, pos)
+	}
+	if got, ok, err := e.PlayerVitalsOf(snap.ID); err != nil || !ok || got != v {
+		t.Fatalf("PlayerVitalsOf = %+v,%v,%v; want %+v,true,nil", got, ok, err, v)
+	}
+	if rt, ok, err := e.PlayerVitalsRuntimeOf(snap.ID); err != nil || !ok || rt.Inputs != in {
+		t.Fatalf("PlayerVitalsRuntimeOf = %+v,%v,%v; want inputs %+v", rt, ok, err, in)
+	}
+}
+
+func TestEnqueueAddPlayerNotRunning(t *testing.T) {
+	e := ingressEngine(t, newManualClock(), openCollision{})
+	_, err := e.EnqueueAddPlayerEntity(context.Background(), testCharacterID(), world.Vec3{X: 1}, testVitals(), testRuntimeInputs())
+	if !errors.Is(err, ErrEngineNotRunning) {
+		t.Fatalf("err = %v, want ErrEngineNotRunning", err)
+	}
+	if n := e.EntityCount(); n != 0 {
+		t.Fatalf("EntityCount = %d, want 0 (zero mutation)", n)
+	}
+}
+
+func TestEnqueueAddPlayerPreCancelled(t *testing.T) {
+	clk := newManualClock()
+	e := ingressEngine(t, clk, openCollision{})
+	cancel, done := runOwner(t, e, clk)
+	defer stopOwner(t, cancel, done)
+	ctx, stop := context.WithCancel(context.Background())
+	stop()
+	_, err := e.EnqueueAddPlayerEntity(ctx, testCharacterID(), world.Vec3{X: 1}, testVitals(), testRuntimeInputs())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if n := e.EntityCount(); n != 0 {
+		t.Fatalf("EntityCount = %d, want 0 (cancelled call published nothing)", n)
+	}
+}
+
+func TestEnqueueAddPlayerDuplicate(t *testing.T) {
+	clk := newManualClock()
+	e := ingressEngine(t, clk, openCollision{})
+	cancel, done := runOwner(t, e, clk)
+	defer stopOwner(t, cancel, done)
+	ctx := context.Background()
+	first, err := e.EnqueueAddPlayerEntity(ctx, testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, testVitals(), testRuntimeInputs())
+	if err != nil {
+		t.Fatalf("first add: %v", err)
+	}
+	if _, err := e.EnqueueAddPlayerEntity(ctx, testCharacterID(), world.Vec3{X: 9, Y: 0, Z: 9}, testVitals(), testRuntimeInputs()); !errors.Is(err, ErrCharacterAlreadyActive) {
+		t.Fatalf("duplicate err = %v, want ErrCharacterAlreadyActive", err)
+	}
+	if n := e.EntityCount(); n != 1 {
+		t.Fatalf("EntityCount = %d, want 1 (no second entity)", n)
+	}
+	if got, err := e.Entity(first.ID); err != nil || got.CharacterID != testCharacterID() {
+		t.Fatalf("first entity disturbed: %+v,%v", got, err)
+	}
+}

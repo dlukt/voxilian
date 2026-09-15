@@ -22,12 +22,19 @@ type cell struct {
 // quiesced entity object — never a second copy). Every live EntityID
 // has exactly one route: resident XOR migrating. No duplicate state
 // structures may diverge: the cell map owns resident entities, the
-// locator only records which cell owns each ID.
+// locator only records which cell owns each ID. characters is the
+// player-identity index (spec §9.5.1d): CharacterID -> EntityID for
+// live player entities, resident and migrating alike. It is
+// lifecycle/identity metadata only — not Presence, session binding,
+// NetEntityID mapping, or persistent storage. Cell handoff never
+// touches it (the same entity object keeps its binding); only
+// player add/attach install entries and only removal drops them.
 type registry struct {
 	nextEntityID    EntityID
 	cells           map[world.CellCoord]*cell
 	entityCell      map[EntityID]world.CellCoord
 	migrations      map[EntityID]*migrationRecord
+	characters      map[CharacterID]EntityID
 	historyCapacity int
 }
 
@@ -42,6 +49,7 @@ func newRegistry(historyCapacity int) *registry {
 		cells:           make(map[world.CellCoord]*cell),
 		entityCell:      make(map[EntityID]world.CellCoord),
 		migrations:      make(map[EntityID]*migrationRecord),
+		characters:      make(map[CharacterID]EntityID),
 		historyCapacity: historyCapacity,
 	}
 }
@@ -89,15 +97,19 @@ func (r *registry) AddEntity(pos world.Vec3) (EntitySnapshot, error) {
 }
 
 // RemoveEntity deletes the entity from its owning cell, deletes the
-// global locator entry, and discards its history with it (spec
-// §5.2.5/§5.2.6). A migrating entity is removed from its migration
-// record instead (queue and history dropped with it). Empty resident
-// cells are removed: T1 cells represent active sim ownership, not
-// terrain storage. Unknown IDs return ErrEntityNotFound. IDs are
+// global locator entry, drops the CharacterID identity binding when
+// the entity is a player (spec §9.5.1d), and discards its history
+// with it (spec §5.2.5/§5.2.6). A migrating entity is removed from
+// its migration record instead (queue, history, and identity binding
+// dropped with it). Empty resident cells are removed: T1 cells
+// represent active sim ownership, not terrain storage. Unknown IDs
+// return ErrEntityNotFound and disturb no identity mapping. IDs are
 // never reused.
 func (r *registry) RemoveEntity(id EntityID) error {
 	if rec, ok := r.migrations[id]; ok {
-		_ = rec
+		if rec.entity.isPlayer {
+			delete(r.characters, rec.entity.characterID)
+		}
 		delete(r.migrations, id)
 		return nil
 	}
@@ -109,8 +121,12 @@ func (r *registry) RemoveEntity(id EntityID) error {
 	if !ok {
 		return fmt.Errorf("%w: id %d (locator without cell)", ErrEntityNotFound, uint64(id))
 	}
-	if _, ok := c.entities[id]; !ok {
+	ent, ok := c.entities[id]
+	if !ok {
 		return fmt.Errorf("%w: id %d (cell without entity)", ErrEntityNotFound, uint64(id))
+	}
+	if ent.isPlayer {
+		delete(r.characters, ent.characterID)
 	}
 	delete(c.entities, id)
 	delete(r.entityCell, id)
@@ -236,6 +252,16 @@ func (r *registry) EntityCount() int { return len(r.entityCell) + len(r.migratio
 
 // CellCount reports the number of active cells (order-independent).
 func (r *registry) CellCount() int { return len(r.cells) }
+
+// liveEntityForCharacter resolves the identity index (spec §9.5.1d):
+// a CharacterID bound to a live player entity — resident or
+// migrating — reports its EntityID. The index is installed only at
+// successful player add/attach and dropped only at removal, so a hit
+// always names the one live entity for that CharacterID.
+func (r *registry) liveEntityForCharacter(id CharacterID) (EntityID, bool) {
+	ent, ok := r.characters[id]
+	return ent, ok
+}
 
 // lookup returns the live entity pointer for engine-internal mutation.
 // Callers MUST be the single sim writer; the pointer MUST NOT escape to
