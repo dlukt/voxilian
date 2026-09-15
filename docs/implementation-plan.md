@@ -297,7 +297,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   ability CAS; penalties-exactly-once, never-skip,
   stale/crash/commit-ambiguity proof per §8.1/§8.3.
   Spec: §9.5.1, §9.5.11–§9.5.14, §9.5.11a.
-- [ ] **M5-T5c1** Multi-root critical Saver coordination (depends on
+- [x] **M5-T5c1** Multi-root critical Saver coordination (depends on
   the existing Saver/persistence foundation): the generic
   Store-agnostic `internal/sim` Saver primitive that owns the gates
   of MULTIPLE already-tracked aggregate roots simultaneously while
