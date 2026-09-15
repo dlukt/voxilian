@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.43 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.44 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -8025,7 +8025,7 @@ T5c3a+T5c3b+T5c3c+T5c3d, frozen v0.3.43 in §9.5.1d):
   `EnqueueAddPlayerEntity` owner command. `internal/sim` only. No
   death state, no relocation, no persistence, no gateway wiring.
 - **T5c3b — death-safe relocation + runtime quiesce/
-  reinitialization** (§9.5.1d): the owner-local primitives future
+  reinitialization** (§9.5.1d + §9.5.1e): the owner-local primitives future
   death transitions require — resolved placement acceptance as
   `world.Vec3` input (no hard-coded Underworld/newbie-home
   coordinates), atomic explicit same-/cross-cell relocation under
@@ -8682,8 +8682,7 @@ rest/health/mana deadline cancellation for death,
 deterministic runtime reinitialization after accepted
 post-death state, and death-specific state-transition
 primitives. No PG/persist/store/gateway/proto work. The
-exact T5c3b API is frozen by T5c3b's own spec before its
-implementation, not here.
+exact T5c3b API is frozen in §9.5.1e below.
 
 T5c3c — immediate-death async persistence/reconciliation
 state machine (`internal/sim` + `internal/persist`; depends
@@ -8710,6 +8709,162 @@ after commit ambiguity. `internal/persist` is the natural
 existing composition direction because it already imports
 `sim` + `store`. The exact bounded worker/request shapes
 belong to T5c3c's own spec freeze before implementation.
+
+#### 9.5.1e M5 death-safe runtime transition primitives (T5c3b, frozen v0.3.44)
+
+T5c3b is `internal/sim` only. It MUST NOT import `store`,
+`persist`, pgx, sqlc output, `gateway`, `session`, or `proto`.
+No blocking work, no goroutines, no persistence, no wire
+behavior. It adds owner-local primitives that T5c3c/T5c3d later
+compose. Exact Go names may differ slightly where repository
+naming strongly suggests another form, but there MUST be two
+distinct concepts: (1) quiesce while the async death operation
+is outstanding, (2) install already-accepted authoritative
+post-death state. Neither operation touches persistence.
+
+```go
+PlayerQuiesceForDeath(
+    id EntityID,
+) error
+
+PlayerInstallPostDeathState(
+    id EntityID,
+    placement world.Vec3,
+    vitals PlayerVitals,
+    runtimeInputs PlayerVitalsRuntimeInputs,
+) (EntitySnapshot, error)
+```
+
+`PlayerQuiesceForDeath` is owner-local only. Resolution:
+unknown `EntityID` -> `ErrEntityNotFound`; generic entity ->
+`ErrEntityNotPlayer`; `MIGRATING` entity -> the existing
+`ErrCellHandoffRequired`; resident player -> success. All
+failures are zero mutation. Successful quiesce performs only
+ephemeral runtime mutation: `activeHeldDirs = 0`,
+`activeRun = false`, `speed = 0`, the pending move discarded
+(`hasPending = false`, `pending` zero value);
+`healthArmed/manaArmed/restArmed = false` with all due fields
+canonical zero; `actedSinceEntry = false`. It PRESERVES `yaw`,
+`hasAccepted`/`lastAcceptedSeq`, `hasProcessed`/
+`lastProcessedSeq` (old pre-death input sequences MUST NOT
+become valid again after respawn), `EntityID`, `CharacterID`,
+position, cell, ownership generation, current `PlayerVitals`,
+current `PlayerVitalsRuntimeInputs`, the stomach anchor,
+position history, and the recent OpID dedupe cache. It does
+NOT move the entity, change vitals/inputs/`CharacterID`/
+generation, clear sequence anchors/history/recent OpIDs, or
+emit `PlayerVitalsObserver`. Calling quiesce twice on an
+otherwise unchanged resident player MAY be an exact idempotent
+no-op after the first call. Quiescence is a primitive, NOT the
+long-lived lifecycle gate: it introduces no `PlayerLifeState`,
+no dead/persisting enums, no permanent movement rejection, and
+no async-operation ownership. T5c3c owns the state machine
+that prevents new gameplay from resuming while persistence is
+outstanding.
+
+`PlayerInstallPostDeathState` receives ALREADY RESOLVED
+values: `placement`, `PlayerVitals`,
+`PlayerVitalsRuntimeInputs`. It performs no world-content
+lookup, no newbie/Underworld decision, no T5a calculation, no
+persistence check, and no Store call. Binding caller contract:
+T5c3c/T5c3d may call this only after the supplied state has
+become authoritative via successful critical persistence OR
+authoritative materialized-state reconciliation. T5c3b itself
+cannot verify PostgreSQL acceptance.
+
+Before ANY mutation it validates: `placement` is valid
+`world.CellForPosition` input; `vitals.Validate()`;
+`runtimeInputs.Validate()`; entity exists; entity is a
+player; entity is `RESIDENT`, not `MIGRATING`. The
+destination cell is determined before mutation. Any
+validation/resolution error leaves bit-identical entity
+position/cell/generation, movement state, vitals, runtime
+metadata, history, `CharacterID` binding, and recent OpIDs:
+no partial install is allowed.
+
+The placement is a trusted resolved explicit remap, NOT
+ordinary movement: no walk/run integration, no path through
+intermediate positions, no `SolidAt` movement-collision
+validation, no coordinate clamp/snap — only normal
+world-position validity applies. Destination `VolumeFlags`
+MUST be re-sampled with the existing
+`CollisionWorld.VolumeFlagsAt(placement)` after successful
+relocation. Same-cell placement changes position directly
+with ownership generation unchanged (same `EntityID`, same
+`CharacterID`). Cross-cell placement reuses the EXISTING
+ownership machinery — conceptually `beginHandoff` +
+`commitHandoff`, or one narrow shared helper built from
+them: same entity object, same `EntityID`, same
+`CharacterID`, generation exactly +1, destination resident
+at completion, no remove/re-add, no identity-index churn, no
+duplicate entity. If handoff cannot begin (including
+ownership-generation exhaustion): error with zero install
+mutation. If local commit unexpectedly fails after begin:
+`abortHandoff`, restore exact source ownership/position,
+return error, install no vitals/runtime/history. No second
+ownership-transfer implementation may be invented.
+
+A death remap is NOT entity recreation. Successful install
+preserves `EntityID`, `CharacterID`, the recent cross-cell
+OpID dedupe cache, `yaw`, `hasAccepted`/`lastAcceptedSeq`,
+and `hasProcessed`/`lastProcessedSeq` (retries of pre-death
+movement/cross-cell operations must not become fresh merely
+because the player died); only current movement control is
+cleared.
+
+A successful death/respawn placement is a discontinuous
+authoritative remap and MUST invalidate pre-death rewind
+history: on SUCCESSFUL install the entity's retained
+position-history ring is cleared, preserving its allocated
+capacity, with NO synthesized out-of-`Step` sample, so
+`History(id)` is empty immediately after install (even for
+same-cell placement). The NEXT normal `Engine.Step` appends
+the first destination-side sample under the existing §5.2.6
+tick-end rule. Quiesce alone does NOT clear history.
+
+After relocation succeeds, the supplied validated
+`PlayerVitals` installs as the authoritative live value:
+the complete supplied value, no ordinary mutation helpers,
+no T5a rerun, no deltas against the old HP=0 state.
+`PlayerInstallPostDeathState` does NOT fire
+`PlayerVitalsObserver` — the supplied state was already
+accepted by the critical death persistence/recovery path,
+and re-emitting it through the ordinary dirty/event seam
+could schedule a redundant second persistence write. T5c4
+owns wire presentation of the death/respawn transition. No
+other existing owner-local vitals mutation semantics change.
+
+After relocation + vitals installation, the ephemeral
+runtime rebuilds from a clean state at the current Engine
+tick: `runtimeInputs` = supplied value,
+`actedSinceEntry = false`, health/mana slots cleared first
+(`healthArmed/manaArmed = false`, dues 0),
+`restArmed = false`, `restDue = 0`, `stomachAnchorTick` =
+current tick. Then the existing T4b2 creation semantics
+apply FROM THE CURRENT TICK: health arms iff
+`HP != MaxHP && HP > 0` using the current supplied runtime
+inputs; mana arms iff `Mana != MaxMana` using the current
+supplied runtime inputs; rest REMAINS ABSENT — never
+auto-armed. Old health/mana due ticks are never retained.
+Source fidelity (`meridian59.md` §9.5): Meridian death calls
+`NewVigor`, but `NewVigor` only bounds `piVigor` to
+1..`viMax_vigor` and redraws Vigor — it does NOT start a
+rest timer. The T5a post-death Vigor value is already
+source-resolved and `Validate`-clean; do NOT call
+`PlayerStartResting`. A shared internal runtime-reset
+helper between fresh player attach and post-death
+reinitialization is allowed only while preserving every
+existing T4b2 behavior.
+
+After successful `PlayerInstallPostDeathState`, observable
+state MUST be internally coherent in the same owner turn:
+new position/cell, new `VolumeFlags`, new complete vitals,
+new runtime inputs, fresh health/mana deadlines where
+applicable, rest off, `actedSinceEntry` false, stomach
+anchored now, movement stopped, history empty, identity
+preserved. No intermediate public state exists where only
+relocation or only vitals installed; the single-owner model
+is the atomicity boundary.
 
 #### 9.5.2 Death disposition: avoided vs cheap vs normal (frozen)
 
@@ -9671,6 +9826,39 @@ impossible plans).
    survives it.
 
 ## 14. Version history
+
+- v0.3.44: freeze M5 death-safe runtime transition primitives
+  (docs only; no schema/query/code change). Correct the
+  `meridian59.md` §9.5 immediate-death timer wording against
+  the normative upstream source
+  (`Meridian59/Meridian59@095c07b69e957fb5c49593e6ad488b4c64ba088d`,
+  `player.kod`): real death calls `NewHealth`/`NewMana`/
+  `NewVigor`, but `NewVigor` only bounds `piVigor` to
+  1..`viMax_vigor` and redraws Vigor — it creates NO
+  rest/vigor timer. Post-death runtime reinitialization is
+  therefore health deadline recreated per `NewHealth`, mana
+  deadline recreated per `NewMana`, rest deadline ABSENT; the
+  T5a post-death Vigor value is already source-resolved and
+  `Validate`-clean, never `PlayerStartResting`. New §9.5.1e
+  freezes the exact T5c3b API (`PlayerQuiesceForDeath` +
+  `PlayerInstallPostDeathState`, `internal/sim` only with no
+  `store`/`persist`/pgx/sqlc/`gateway`/`session`/`proto`
+  imports): quiesce-only ephemeral runtime mutation with
+  sequence-anchor/history/recent-OpID preservation and no
+  lifecycle gate; caller-authority rule (post-persistence or
+  reconciled state only); all-or-nothing prevalidation;
+  trusted explicit remap (no `SolidAt`, no clamp/snap;
+  same-cell generation unchanged; cross-cell via the
+  EXISTING `beginHandoff`/`commitHandoff` machinery with
+  generation exactly +1); replay/dedupe identity
+  preservation; position-history discontinuity reset
+  (empty immediately after install, capacity preserved);
+  accepted-vitals install with NO `PlayerVitalsObserver`
+  event; runtime rebuild at the current tick with health/
+  mana created from current inputs and rest NEVER
+  auto-armed; single-owner atomicity. Checkbox state
+  unchanged: T5a/T5b1a/T5b1b/T5b2a/T5b2b/T5c1/T5c2a/T5c2b/
+  T5c3a `[x]`, T5c3b/T5c3c/T5c3d/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v0.3.43: freeze M5 async death runtime ownership split (docs
   only; no schema/query/code change). Split the former single

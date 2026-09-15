@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.27)
+# Voxilian Backend — Implementation Plan (v1.28)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.43).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.44).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -349,7 +349,9 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   relocation under existing ownership-generation rules, movement
   quiescence, rest/health/mana deadline cancellation for death,
   deterministic runtime reinitialization after accepted post-death
-  state. No PG/persist/store/gateway/proto work. Spec: §9.5.1d.
+  state. No PG/persist/store/gateway/proto work. Spec: §9.5.1d +
+  §9.5.1e (frozen T5c3b API + `NewVigor` source correction:
+  post-death rest stays absent).
 - [ ] **M5-T5c3c** Immediate-death async persistence/reconciliation
   state machine (depends on T5c3a + T5c3b + T5a + T5c2a + T5c2b;
   `internal/sim` + `internal/persist`): zero-HP handoff, T5a
@@ -542,6 +544,25 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.28: freeze M5 death-safe runtime transition primitives
+  (docs only, spec v0.3.44 new §9.5.1e; no scope or
+  dependency change): correct the `meridian59.md` §9.5
+  immediate-death timer wording against upstream
+  `Meridian59/Meridian59@095c07b` (`player.kod` — real death
+  calls `NewHealth`/`NewMana`/`NewVigor`, but `NewVigor`
+  only bounds/draws Vigor and creates no rest timer, so
+  post-death rest stays absent); freeze the exact T5c3b
+  contract (`PlayerQuiesceForDeath` ephemeral quiesce with
+  sequence-anchor/history/recent-OpID preservation and no
+  lifecycle gate + `PlayerInstallPostDeathState` trusted
+  explicit remap with all-or-nothing validation, existing
+  handoff reuse, history-discontinuity reset, no
+  `PlayerVitalsObserver` event, current-tick health/mana
+  recreation). T5c3b still `internal/sim` only, still
+  depends on T5c3a + T5a + T4b2. Checkbox state unchanged:
+  T5a/T5b1a/T5b1b/T5b2a/T5b2b/T5c1/T5c2a/T5c2b/T5c3a `[x]`,
+  T5c3b/T5c3c/T5c3d/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v1.27: freeze M5 async death runtime ownership split (docs
   only, spec v0.3.43 §9.5.1d; split only): replace the single

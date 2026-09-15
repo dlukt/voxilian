@@ -716,8 +716,12 @@ teleport `RID_NEWB1` directly (NOT the Underworld); else Underworld
 near-square 24/10 fine 38/54. Then vitals: Frenzy death → `HP =
 MaxHealth/2`, `Mana = MaxMana/2`, `Vigor = 100`; ordinary/cheap death
 → `HP = 1`, `Mana = 1`, `Vigor = bound(Vigor/4, 0, 50)` then
-`NewVigor` bounds 1..200 (so the 0 floor becomes 1). All three regen
-timers recreated via `NewHealth/NewMana/NewVigor`. Angel mail: if
+`NewVigor` bounds 1..200 (so the 0 floor becomes 1). Timer
+semantics split per call: `NewHealth` owns the health timer
+(create iff `HP != MaxHP && HP > 0`), `NewMana` owns the mana
+timer (create iff `Mana != MaxMana`); `NewVigor` only bounds
+`piVigor` to 1..`viMax_vigor` and redraws Vigor — it creates NO
+rest/vigor timer. Angel mail: if
 `piDeathCost > 0` AND still-newbie (see below) AND NOT murderer →
 mail + `Mana = MaxMana/2 + 2` (OVERWRITES the earlier mana=1) +
 `NewMana`.
