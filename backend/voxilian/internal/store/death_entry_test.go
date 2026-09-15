@@ -802,6 +802,9 @@ func TestCommitDeathEntryValidation(t *testing.T) {
 		"mob killer char set": func(r *DeathEntryRequest) {
 			r.Killer = &DeathEntryKiller{Kind: DeathEntryKillerMob, CharacterID: 1, MobID: f.killerMobID}
 		},
+		"newbie-home nonzero cost": func(r *DeathEntryRequest) {
+			r.NewbieHomeRespawn = true
+		},
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -1048,5 +1051,242 @@ func TestDeathExpiryTimeBoundary(t *testing.T) {
 	}
 	if _, err := deathExpiryTime(1, -time.Second); !errors.Is(err, ErrInvalidDeathEntry) {
 		t.Fatalf("negative duration err = %v, want ErrInvalidDeathEntry", err)
+	}
+}
+
+// TestCommitDeathEntryNewbieHomeNoPending proves the source-faithful
+// direct newbie-home path (spec §9.5.8b): a cheap real death with
+// NewbieHomeRespawn=true commits the post-death character snapshot
+// (whose durable position already differs from the death position),
+// the caller-resolved ground item relocation, exactly one corpse
+// owned by the victim at the death position, and the kills audit
+// row — with NO pending_deaths row and ZERO ledger rows. The
+// generated corpse ID is still returned after commit.
+func TestCommitDeathEntryNewbieHomeNoPending(t *testing.T) {
+	f := newDeathFixture(t)
+	ctx := context.Background()
+
+	req := DeathEntryRequest{
+		Character:          f.deathCharSnapshot(0),
+		DeathPosX:          deathPosX,
+		DeathPosY:          deathPosY,
+		DeathPosZ:          deathPosZ,
+		EffectiveDeathCost: 0,
+		DeathTimeSeconds:   deathTimeSeconds,
+		CorpseLifetime:     deathCorpseLifetime,
+		NewbieHomeRespawn:  true,
+		Items:              []DeathEntryItem{{Snapshot: f.deathGroundItem(f.itemA, 0)}},
+		Killer:             &DeathEntryKiller{Kind: DeathEntryKillerCharacter, CharacterID: f.killerCharID},
+	}
+	res, err := f.st.CommitDeathEntry(ctx, req)
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if res.CharacterRevision != 1 || res.CorpseID <= 0 {
+		t.Fatalf("result = %+v, want char rev 1 + corpse", res)
+	}
+	if len(res.ItemRevisions) != 1 ||
+		res.ItemRevisions[0] != (DeathEntryItemRevision{ItemID: f.itemA, Revision: 1}) {
+		t.Fatalf("item revisions = %+v, want itemA rev 1", res.ItemRevisions)
+	}
+
+	got := readRoot(t, f.q, f.victimID)
+	if got.Revision != 1 || got.Karma != 11 || got.PosX != 111 || got.PosY != 222 || got.PosZ != 333 || got.Flags != 3 {
+		t.Fatalf("character root = %+v, want post-death home state rev 1", got)
+	}
+	if string(got.Vitals) != `{"hp": 1, "threshold": 80}` && string(got.Vitals) != `{"hp":1,"threshold":80}` {
+		t.Fatalf("vitals = %s", got.Vitals)
+	}
+
+	it := readItem(t, f.q, f.itemA)
+	if it.Revision != 1 || it.Qty != 5 || it.Hits != 77 {
+		t.Fatalf("item = %+v, want rev 1 qty 5 hits 77", it)
+	}
+	loc := readLoc(t, f.q, f.itemA)
+	if loc.Kind != 1 || !loc.PosX.Valid || loc.PosX.Int64 != deathPosX ||
+		!loc.PosY.Valid || loc.PosY.Int64 != deathPosY ||
+		!loc.PosZ.Valid || loc.PosZ.Int64 != deathPosZ {
+		t.Fatalf("item location = %+v, want ground at death pos", loc)
+	}
+	if loc.CorpseID.Valid || loc.CharacterID.Valid || loc.ContainerItemID.Valid ||
+		loc.VaultRegion.Valid || loc.Slot.Valid {
+		t.Fatalf("item location carries non-ground refs: %+v", loc)
+	}
+	if _, err := f.q.GetItemPKProtection(ctx, f.itemA); !isNoRows(err) {
+		t.Fatalf("protection err = %v, want NoRows", err)
+	}
+
+	if n := deathCount(t, f, `SELECT COUNT(*) FROM corpses WHERE character_id = $1`, f.victimID); n != 1 {
+		t.Fatalf("corpses = %d, want exactly 1", n)
+	}
+	corpse, err := f.q.GetCorpseByID(ctx, res.CorpseID)
+	if err != nil {
+		t.Fatalf("get corpse: %v", err)
+	}
+	if corpse.CharacterID != f.victimID || corpse.PosX != deathPosX ||
+		corpse.PosY != deathPosY || corpse.PosZ != deathPosZ {
+		t.Fatalf("corpse = %+v, want victim owner at death pos", corpse)
+	}
+
+	if _, err := f.q.GetPendingDeathByCharacter(ctx, f.victimID); !isNoRows(err) {
+		t.Fatalf("pending err = %v, want NoRows (no pending row on newbie-home path)", err)
+	}
+
+	var killerKind, killerChar, victimChar, kx, ky, kz int64
+	var killCount int
+	row := f.pool.QueryRow(ctx, `SELECT COUNT(*), MIN(killer_kind), MIN(killer_character_id), MIN(victim_character_id), MIN(pos_x), MIN(pos_y), MIN(pos_z) FROM kills WHERE victim_character_id = $1`, f.victimID)
+	if err := row.Scan(&killCount, &killerKind, &killerChar, &victimChar, &kx, &ky, &kz); err != nil {
+		t.Fatal(err)
+	}
+	if killCount != 1 || killerKind != 0 || killerChar != f.killerCharID ||
+		victimChar != f.victimID || kx != deathPosX || ky != deathPosY || kz != deathPosZ {
+		t.Fatalf("kills = count %d kind %d killer %d victim %d pos %d/%d/%d",
+			killCount, killerKind, killerChar, victimChar, kx, ky, kz)
+	}
+	if n := deathCount(t, f, `SELECT COUNT(*) FROM ledger`); n != 0 {
+		t.Fatalf("ledger rows = %d, want 0", n)
+	}
+}
+
+// TestCommitDeathEntryNewbieHomeRejectsExistingPending proves the
+// no-pending path cannot bypass an unresolved previous death: with
+// a seeded ordinary pending row, a newbie-home entry at the CURRENT
+// character revision fails with ErrDeathAlreadyPending (NOT
+// ErrStaleRevision), leaving the character root, pending row,
+// corpse set, item, kill, and ledger state untouched with no stale
+// metric increment.
+func TestCommitDeathEntryNewbieHomeRejectsExistingPending(t *testing.T) {
+	f := newDeathFixture(t)
+	ctx := context.Background()
+	seedCorpse, err := f.q.InsertCorpse(ctx, gen.InsertCorpseParams{
+		CharacterID: f.victimID,
+		ExpiresAt:   pgtype.Timestamptz{Time: time.Now().Add(time.Hour).UTC(), Valid: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed, err := f.q.InsertPendingDeath(ctx, gen.InsertPendingDeathParams{
+		CharacterID:      f.victimID,
+		EffectiveCost:    37,
+		DeathTimeSeconds: 7,
+		CorpseID:         int8(seedCorpse.ID),
+		PortalUsed:       false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeChar := readRoot(t, f.q, f.victimID)
+	beforeA := readItem(t, f.q, f.itemA)
+	beforeALoc := readLoc(t, f.q, f.itemA)
+
+	req := DeathEntryRequest{
+		Character:          f.deathCharSnapshot(0),
+		DeathPosX:          deathPosX,
+		DeathPosY:          deathPosY,
+		DeathPosZ:          deathPosZ,
+		EffectiveDeathCost: 0,
+		DeathTimeSeconds:   deathTimeSeconds,
+		CorpseLifetime:     deathCorpseLifetime,
+		NewbieHomeRespawn:  true,
+		Items:              []DeathEntryItem{{Snapshot: f.deathGroundItem(f.itemA, 0)}},
+		Killer:             &DeathEntryKiller{Kind: DeathEntryKillerCharacter, CharacterID: f.killerCharID},
+	}
+	res, err := f.st.CommitDeathEntry(ctx, req)
+	if !errors.Is(err, ErrDeathAlreadyPending) {
+		t.Fatalf("err = %v, want ErrDeathAlreadyPending", err)
+	}
+	if errors.Is(err, ErrStaleRevision) {
+		t.Fatalf("newbie-home precheck mapped to stale: %v", err)
+	}
+	if !isZeroDeathResult(res) {
+		t.Fatalf("result = %+v, want zero", res)
+	}
+	after, err := f.q.GetPendingDeathByCharacter(ctx, f.victimID)
+	if err != nil || after != seed {
+		t.Fatalf("pending = %+v, %v; want unchanged %+v", after, err, seed)
+	}
+	if afterChar := readRoot(t, f.q, f.victimID); !sameCharacter(afterChar, beforeChar) {
+		t.Fatalf("character moved: %+v vs %+v", afterChar, beforeChar)
+	}
+	if afterItem := readItem(t, f.q, f.itemA); !sameItemInstance(afterItem, beforeA) {
+		t.Fatalf("item moved: %+v vs %+v", afterItem, beforeA)
+	}
+	if afterLoc := readLoc(t, f.q, f.itemA); afterLoc != beforeALoc {
+		t.Fatalf("location moved: %+v vs %+v", afterLoc, beforeALoc)
+	}
+	if n := deathCount(t, f, `SELECT COUNT(*) FROM corpses WHERE character_id = $1`, f.victimID); n != 1 {
+		t.Fatalf("corpses = %d, want exactly the seeded 1", n)
+	}
+	if _, err := f.q.GetItemPKProtection(ctx, f.itemA); !isNoRows(err) {
+		t.Fatalf("protection err = %v, want NoRows", err)
+	}
+	if n := deathCount(t, f, `SELECT COUNT(*) FROM kills WHERE victim_character_id = $1`, f.victimID); n != 0 {
+		t.Fatalf("kills = %d, want 0", n)
+	}
+	if n := deathCount(t, f, `SELECT COUNT(*) FROM ledger`); n != 0 {
+		t.Fatalf("ledger rows = %d, want 0", n)
+	}
+	if got := f.staleCount("character"); got != 0 {
+		t.Fatalf("character stale = %v, want 0", got)
+	}
+	if got := f.staleCount("item"); got != 0 {
+		t.Fatalf("item stale = %v, want 0", got)
+	}
+}
+
+// TestCommitDeathEntryNewbieHomeRejectsNonzeroCost proves the
+// NewbieHomeRespawn validation: true with a nonzero effective cost
+// is ErrInvalidDeathEntry before Begin, with zero result, no PG
+// mutation, and no stale metric increment.
+func TestCommitDeathEntryNewbieHomeRejectsNonzeroCost(t *testing.T) {
+	f := newDeathFixture(t)
+	ctx := context.Background()
+	beforeLoc := readLoc(t, f.q, f.itemA)
+
+	req := DeathEntryRequest{
+		Character:          f.deathCharSnapshot(0),
+		DeathPosX:          deathPosX,
+		DeathPosY:          deathPosY,
+		DeathPosZ:          deathPosZ,
+		EffectiveDeathCost: 1,
+		DeathTimeSeconds:   deathTimeSeconds,
+		CorpseLifetime:     deathCorpseLifetime,
+		NewbieHomeRespawn:  true,
+		Items:              []DeathEntryItem{{Snapshot: f.deathGroundItem(f.itemA, 0)}},
+		Killer:             &DeathEntryKiller{Kind: DeathEntryKillerCharacter, CharacterID: f.killerCharID},
+	}
+	res, err := f.st.CommitDeathEntry(ctx, req)
+	if !errors.Is(err, ErrInvalidDeathEntry) {
+		t.Fatalf("err = %v, want ErrInvalidDeathEntry", err)
+	}
+	if !isZeroDeathResult(res) {
+		t.Fatalf("result = %+v, want zero", res)
+	}
+	if got := readRoot(t, f.q, f.victimID); got.Revision != 0 {
+		t.Fatalf("character moved: %+v", got)
+	}
+	if got := readItem(t, f.q, f.itemA); got.Revision != 0 {
+		t.Fatalf("item moved: %+v", got)
+	}
+	if afterLoc := readLoc(t, f.q, f.itemA); afterLoc != beforeLoc {
+		t.Fatalf("location moved: %+v vs %+v", afterLoc, beforeLoc)
+	}
+	if n := deathCount(t, f, `SELECT COUNT(*) FROM corpses WHERE character_id = $1`, f.victimID); n != 0 {
+		t.Fatalf("corpses = %d, want 0", n)
+	}
+	if _, err := f.q.GetPendingDeathByCharacter(ctx, f.victimID); !isNoRows(err) {
+		t.Fatalf("pending err = %v, want NoRows", err)
+	}
+	if n := deathCount(t, f, `SELECT COUNT(*) FROM kills WHERE victim_character_id = $1`, f.victimID); n != 0 {
+		t.Fatalf("kills = %d, want 0", n)
+	}
+	if n := deathCount(t, f, `SELECT COUNT(*) FROM ledger`); n != 0 {
+		t.Fatalf("ledger rows = %d, want 0", n)
+	}
+	if got := f.staleCount("character"); got != 0 {
+		t.Fatalf("character stale = %v, want 0", got)
+	}
+	if got := f.staleCount("item"); got != 0 {
+		t.Fatalf("item stale = %v, want 0", got)
 	}
 }

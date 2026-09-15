@@ -324,6 +324,49 @@ func TestCommitDeathEntryZeroItems(t *testing.T) {
 	}
 }
 
+// NewbieHomeRespawn is scalar-copied through the immutable
+// capture: the fake Store receives it unchanged while
+// execution-time Saver revisions still overwrite hostile request
+// revisions, and caller immutability holds.
+func TestCommitDeathEntryNewbieHomeRespawnPassthrough(t *testing.T) {
+	s := mustSaverForPersist(t)
+	trackDeathRoots(t, s, 10, map[int64]int64{10: 8})
+	fs := &fakeDeathStore{}
+	req := deathTestReq()
+	req.Items = req.Items[1:]
+	req.EffectiveDeathCost = 0
+	req.NewbieHomeRespawn = true
+	res, err := CommitDeathEntry(context.Background(), s, fs, req)
+	if err != nil {
+		t.Fatalf("CommitDeathEntry: %v", err)
+	}
+	if fs.deathCalls != 1 {
+		t.Fatalf("store calls = %d, want 1", fs.deathCalls)
+	}
+	got := fs.gotDeath[0]
+	if !got.NewbieHomeRespawn {
+		t.Fatalf("NewbieHomeRespawn lost in adapter: %+v", got)
+	}
+	if got.EffectiveDeathCost != 0 {
+		t.Fatalf("EffectiveDeathCost = %d, want 0", got.EffectiveDeathCost)
+	}
+	if got.Character.ExpectedRevision != 10 {
+		t.Fatalf("character ExpectedRevision = %d, want Saver-known 10", got.Character.ExpectedRevision)
+	}
+	if len(got.Items) != 1 || got.Items[0].Snapshot.ExpectedRevision != 8 {
+		t.Fatalf("item revisions = %+v, want item10 rev 8", got.Items)
+	}
+	if res.CharacterRevision != 11 || res.CorpseID != 123 {
+		t.Fatalf("result = %+v, want char rev 11 corpse 123", res)
+	}
+	if req.NewbieHomeRespawn != true || req.Character.ExpectedRevision != 999 {
+		t.Fatal("caller request mutated")
+	}
+	if got := inspectKnown(t, s, sim.AggregateCharacter, 7); got.KnownRevision != 11 || got.Blocked {
+		t.Fatalf("saver char = %+v, want known11 clean", got)
+	}
+}
+
 // Pre-callback Saver rejection: Store MUST NOT be called, the
 // result is zero, and tracked participants stay unblocked.
 func TestCommitDeathAdaptersPreCallbackRejection(t *testing.T) {

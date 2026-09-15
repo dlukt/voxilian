@@ -733,9 +733,16 @@ type PendingDeathPlan struct {
 }
 
 // PlanPendingDeath composes the disposition plan and corpse policy
-// into the pending-death value: avoided deaths have no pending phase;
-// real deaths (cheap AND normal) are pending with their starting cost
-// (cheap = 0) and death-time scalar.
+// into the pending-death value (spec §9.5.8, §9.5.8b): avoided deaths
+// have no pending phase, and neither do real deaths with
+// NewbieHomeRespawn (direct newbie-home route: no Underworld entry,
+// no Underworld.LeaveHold, no delayed ApplyDeathPenalties phase).
+// All other real deaths (cheap AND normal, including cost-zero
+// Underworld cheap deaths) are pending with their starting cost
+// (cheap = 0) and death-time scalar. DeathPhaseNone on the
+// newbie-home path means only "no delayed penalty phase exists" —
+// it is still a real death with a corpse, post-death vitals,
+// death-entry persistence, and optional kill audit.
 func PlanPendingDeath(plan DeathDispositionPlan, corpse CorpsePolicy) (PendingDeathPlan, error) {
 	if err := validateDispositionPlan(plan); err != nil {
 		return PendingDeathPlan{}, err
@@ -746,7 +753,7 @@ func PlanPendingDeath(plan DeathDispositionPlan, corpse CorpsePolicy) (PendingDe
 	if corpse.DeathTimeSeconds < 0 {
 		return PendingDeathPlan{}, fmt.Errorf("sim: death time %d: %w", corpse.DeathTimeSeconds, ErrInvalidDeathTime)
 	}
-	if plan.Disposition == DeathAvoided {
+	if plan.Disposition == DeathAvoided || plan.NewbieHomeRespawn {
 		return PendingDeathPlan{Phase: DeathPhaseNone}, nil
 	}
 	if err := ValidatePendingDeathCost(plan.DeathCost); err != nil {

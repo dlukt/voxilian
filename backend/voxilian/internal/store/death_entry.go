@@ -14,12 +14,14 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-// ErrDeathAlreadyPending reports a death-entry replay: the victim
-// already has a live pending_deaths row, so the new entry is rejected
-// and the whole transaction rolls back. It maps ONLY the
-// pending_deaths_pkey unique violation from the death transaction —
-// never stale revisions, corpse-index, FK, or CHECK failures — and it
-// never increments the stale-revision metric.
+// ErrDeathAlreadyPending reports a death entry that encountered an
+// existing live pending-death phase, whether detected by the
+// pending_deaths PK conflict (Underworld-bound entry replay) or by
+// the explicit newbie-home precheck (a direct newbie-home death
+// must not bypass an outstanding Underworld death). The whole
+// transaction rolls back. It maps ONLY these two detections —
+// never stale revisions, corpse-index, FK, or CHECK failures —
+// and it never increments the stale-revision metric.
 var ErrDeathAlreadyPending = errors.New("death already pending")
 
 // ErrInvalidDeathEntry marks a malformed CommitDeathEntry request
@@ -81,6 +83,19 @@ type DeathEntryRequest struct {
 	DeathTimeSeconds   int64
 
 	CorpseLifetime time.Duration
+
+	// NewbieHomeRespawn is the caller-resolved source-faithful
+	// direct newbie-home fact (spec §9.5.8b): the death room lay in
+	// the resolved newbie range, so the player respawns at the
+	// newbie home with NO Underworld entry and NO delayed
+	// Underworld-exit penalty phase. True suppresses the
+	// pending_deaths insert (character/items/corpse/optional kill
+	// still commit); false preserves current Underworld-bound
+	// semantics. Backward compatible: false is current behavior.
+	// Store performs no coordinate inference — the caller resolves
+	// this from the disposition plan's NewbieHomeRespawn. True
+	// requires EffectiveDeathCost == 0 (validated before Begin).
+	NewbieHomeRespawn bool
 
 	Items []DeathEntryItem
 
@@ -189,6 +204,10 @@ func validateDeathEntryRequest(req DeathEntryRequest) error {
 	if req.CorpseLifetime <= 0 {
 		return invalid("corpse lifetime=%s", req.CorpseLifetime)
 	}
+	if req.NewbieHomeRespawn && req.EffectiveDeathCost != 0 {
+		return invalid("newbie-home respawn with effective cost=%d, want 0",
+			req.EffectiveDeathCost)
+	}
 	seen := make(map[int64]struct{}, len(req.Items))
 	for _, it := range req.Items {
 		id := it.Snapshot.ID
@@ -265,12 +284,17 @@ func sortedDeathItems(items []DeathEntryItem) []DeathEntryItem {
 // already-begun transaction: character root CAS first, item roots in
 // ascending ItemID order (each with its PK-protection upsert inside
 // the same transaction right after its successful item-root CAS),
-// then corpse insert (generated ID), pending-death insert, and the
-// optional kills row — committing exactly once via the caller.
-// Player death items are GROUND locations, so they never need the
-// generated corpse ID. Raw pgx.ErrNoRows from a root CAS surfaces as
-// *deathCASStale for the public boundary to map + count exactly once;
-// every other error passes through unmapped.
+// then corpse insert (generated ID), pending-death insert (skipped
+// for the source-faithful direct newbie-home path, spec §9.5.8b),
+// and the optional kills row — committing exactly once via the
+// caller. For NewbieHomeRespawn=true the transaction instead runs:
+// character root CAS first, explicit pending-row precheck (existing
+// row -> ErrDeathAlreadyPending), item CASes, corpse insert, NO
+// pending insert, optional kill. Player death items are GROUND
+// locations, so they never need the generated corpse ID. Raw
+// pgx.ErrNoRows from a root CAS surfaces as *deathCASStale for the
+// public boundary to map + count exactly once; every other error
+// passes through unmapped.
 func commitDeathEntryTx(ctx context.Context, tx pgx.Tx, req DeathEntryRequest) (DeathEntryResult, error) {
 	q := gen.New(tx)
 
@@ -283,6 +307,24 @@ func commitDeathEntryTx(ctx context.Context, tx pgx.Tx, req DeathEntryRequest) (
 			}
 		}
 		return DeathEntryResult{}, fmt.Errorf("store: commit death entry character: %w", err)
+	}
+
+	if req.NewbieHomeRespawn {
+		// A direct newbie-home death must not bypass an already
+		// outstanding Underworld death: the precheck reuses the
+		// existing generated query (no new SQL, no public
+		// pending-read API). Absence (pgx.ErrNoRows) proceeds;
+		// any other lookup error aborts; an existing row rejects
+		// with ErrDeathAlreadyPending (never stale) and the
+		// tentative character CAS rolls back with the txn.
+		if _, err := q.GetPendingDeathByCharacter(ctx, req.Character.ID); err != nil {
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return DeathEntryResult{}, fmt.Errorf("store: commit death entry newbie-home pending precheck: %w", err)
+			}
+		} else {
+			return DeathEntryResult{}, fmt.Errorf(
+				"store: commit death entry character=%d: %w", req.Character.ID, ErrDeathAlreadyPending)
+		}
 	}
 
 	items := sortedDeathItems(req.Items)
@@ -332,14 +374,16 @@ func commitDeathEntryTx(ctx context.Context, tx pgx.Tx, req DeathEntryRequest) (
 		return DeathEntryResult{}, fmt.Errorf("store: commit death entry corpse: %w", err)
 	}
 
-	if _, err := q.InsertPendingDeath(ctx, gen.InsertPendingDeathParams{
-		CharacterID:      req.Character.ID,
-		EffectiveCost:    req.EffectiveDeathCost,
-		DeathTimeSeconds: req.DeathTimeSeconds,
-		CorpseID:         pgtype.Int8{Int64: corpse.ID, Valid: true},
-		PortalUsed:       false,
-	}); err != nil {
-		return DeathEntryResult{}, fmt.Errorf("store: commit death entry pending death: %w", err)
+	if !req.NewbieHomeRespawn {
+		if _, err := q.InsertPendingDeath(ctx, gen.InsertPendingDeathParams{
+			CharacterID:      req.Character.ID,
+			EffectiveCost:    req.EffectiveDeathCost,
+			DeathTimeSeconds: req.DeathTimeSeconds,
+			CorpseID:         pgtype.Int8{Int64: corpse.ID, Valid: true},
+			PortalUsed:       false,
+		}); err != nil {
+			return DeathEntryResult{}, fmt.Errorf("store: commit death entry pending death: %w", err)
+		}
 	}
 
 	if req.Killer != nil {
@@ -371,16 +415,21 @@ func commitDeathEntryTx(ctx context.Context, tx pgx.Tx, req DeathEntryRequest) (
 }
 
 // CommitDeathEntry atomically persists one immediate death entry
-// (spec §9.5.8a, §8.1/§8.3): the already-resolved post-death
+// (spec §9.5.8a, §9.5.8b, §8.1/§8.3): the already-resolved post-death
 // character snapshot, zero or more caller-resolved ground item
 // relocations at the death position (normal drops and/or the
 // Token-death special relocation, each with optional PK protection),
-// exactly one generated corpse row, the pending-death recovery row,
+// exactly one generated corpse row, the pending-death recovery row
+// (SKIPPED when NewbieHomeRespawn is true: the source-faithful
+// direct newbie-home path has no delayed Underworld-exit phase),
 // and the kills audit row when the killer is auditable. ZERO ledger
 // rows are written. Lock/CAS order is character root first, then
 // item roots ascending ItemID. Any stale root rolls back everything
 // and maps to ErrStaleRevision (counted once); a pending-death PK
-// replay maps to ErrDeathAlreadyPending (never counted as stale).
+// replay maps to ErrDeathAlreadyPending (never counted as stale),
+// as does the newbie-home precheck hitting an existing pending row.
+// A newbie-home request with nonzero cost is ErrInvalidDeathEntry
+// before Begin.
 func (s *PGStore) CommitDeathEntry(ctx context.Context, req DeathEntryRequest) (DeathEntryResult, error) {
 	if err := validateDeathEntryRequest(req); err != nil {
 		return DeathEntryResult{}, err

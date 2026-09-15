@@ -366,3 +366,111 @@ func TestPersistPGDeathLostAckRecovery(t *testing.T) {
 		}
 	}
 }
+
+// Lost-acknowledgement composition proof for the newbie-home path
+// (spec §9.5.8b): this path deliberately leaves NO pending row, so
+// it has no pending-row replay fence — yet recovery still converges
+// without blindly replaying CommitDeathEntry. The real transaction
+// COMMITTED, the adapter saw only the lost ack (zero result, cause
+// + ReconcileRequired, old revisions, all blocked), and explicit
+// T5c2a reconciliation proves the committed state exactly once:
+// character rev 1 at the post-death home position with Pending nil,
+// item rev 1, clean Saver roots, and exactly ONE corpse.
+func TestPersistPGDeathLostAckNewbieHome(t *testing.T) {
+	pool, q := openPG(t)
+	ctx := context.Background()
+	st, err := store.New(pool, newPGRegistry(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	charID := pgAccountChar(t, q, "sub-death-amb-newbie", "AmbiguousNewbie")
+	pgAbilityProtos(t, pool)
+	itemID := pgItemRoot(t, pool, charID)
+	s := mustSaverForPersist(t)
+	if err := s.Track(sim.AggregateKey{Kind: sim.AggregateCharacter, ID: charID}, 0); err != nil {
+		t.Fatal(err)
+	}
+	itemKey := sim.AggregateKey{Kind: sim.AggregateItem, ID: itemID}
+	if err := s.Track(itemKey, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	req := deathPGEntryReq(charID, []int64{itemID})
+	req.EffectiveDeathCost = 0
+	req.NewbieHomeRespawn = true
+	req.Items = []store.DeathEntryItem{deathPGGroundItem(itemID, 0)}
+
+	armed := true
+	wrap := &deathLostAckStore{DeathPersistenceStore: st, armed: &armed}
+	res, err := CommitDeathEntry(ctx, s, wrap, req)
+	if !errors.Is(err, errLostAck) {
+		t.Fatalf("err = %v, want lost-ack cause", err)
+	}
+	if !errors.Is(err, sim.ErrSaverReconcileRequired) {
+		t.Fatalf("err = %v, want ErrSaverReconcileRequired", err)
+	}
+	if errors.Is(err, sim.ErrSnapshotStale) {
+		t.Fatalf("lost ack misclassified as stale: %v", err)
+	}
+	if !isZeroDeathEntryResult(res) {
+		t.Fatalf("result = %+v, want zero", res)
+	}
+	charKey := sim.AggregateKey{Kind: sim.AggregateCharacter, ID: charID}
+	for _, k := range []sim.AggregateKey{charKey, itemKey} {
+		if got, _ := s.Inspect(k); !got.Blocked || got.KnownRevision != 0 {
+			t.Fatalf("participant %v = %+v, want blocked known0", k, got)
+		}
+	}
+
+	// PG proves the first commit happened (no replay used to
+	// discover this): rev 1 at the home position, Pending nil.
+	rec, err := st.LoadDeathCharacterRecovery(ctx, charID)
+	if err != nil {
+		t.Fatalf("character recovery: %v", err)
+	}
+	if rec.Character.ExpectedRevision != 1 {
+		t.Fatalf("character rev = %d, want committed 1", rec.Character.ExpectedRevision)
+	}
+	if rec.Character.PosX != 1 || rec.Character.PosY != 2 || rec.Character.PosZ != 3 {
+		t.Fatalf("character pos = %d/%d/%d, want post-death home 1/2/3",
+			rec.Character.PosX, rec.Character.PosY, rec.Character.PosZ)
+	}
+	if rec.Pending != nil {
+		t.Fatalf("Pending = %+v, want nil for newbie-home path", rec.Pending)
+	}
+	checkGround(t, st, ctx, itemID, 1, false, charID)
+
+	// Test-only PG inspection: exactly ONE new corpse exists for
+	// this committed death (deathPGSetup fixtures create none).
+	var corpses int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM corpses WHERE character_id = $1`, charID).Scan(&corpses); err != nil {
+		t.Fatal(err)
+	}
+	if corpses != 1 {
+		t.Fatalf("corpses = %d, want exactly 1", corpses)
+	}
+
+	// Explicit caller-owned recovery via T5c2a for every
+	// participating root.
+	noopChar := func(store.DeathCharacterRecoverySnapshot) error { return nil }
+	noopItem := func(store.DeathItemRecoverySnapshot) error { return nil }
+	charState, err := sim.NewReconcileState(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ReconcileSaver(ctx, charState, s, charKey, DeathCharacterReload(st, charID, noopChar)); err != nil {
+		t.Fatalf("ReconcileSaver char: %v", err)
+	}
+	itemState, err := sim.NewReconcileState(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ReconcileSaver(ctx, itemState, s, itemKey, DeathItemReload(st, itemID, noopItem)); err != nil {
+		t.Fatalf("ReconcileSaver item: %v", err)
+	}
+	for _, k := range []sim.AggregateKey{charKey, itemKey} {
+		if got, _ := s.Inspect(k); got.Blocked || got.KnownRevision != 1 {
+			t.Fatalf("participant %v = %+v, want clear known1", k, got)
+		}
+	}
+}

@@ -108,8 +108,11 @@ func TestDeathDispositionCheapConditionsIndividually(t *testing.T) {
 		if want := name == "newbie-zone"; p.NewbieHomeRespawn != want {
 			t.Fatalf("%s: NewbieHomeRespawn = %v, want %v", name, p.NewbieHomeRespawn, want)
 		}
-		// Cheap deaths ARE real deaths: pending phase with cost 0 and a
-		// corpse plan.
+		// Cheap deaths ARE real deaths with a corpse plan; the
+		// pending phase depends on the respawn route (spec
+		// §9.5.8b): newbie-zone deaths go directly home (None),
+		// all other cheap deaths go through Underworld (Pending
+		// cost 0).
 		corpse, err := PlanCorpse(4242)
 		if err != nil {
 			t.Fatalf("PlanCorpse: %v", err)
@@ -117,6 +120,12 @@ func TestDeathDispositionCheapConditionsIndividually(t *testing.T) {
 		pend, err := PlanPendingDeath(p, corpse)
 		if err != nil {
 			t.Fatalf("PlanPendingDeath: %v", err)
+		}
+		if name == "newbie-zone" {
+			if pend.Phase != DeathPhaseNone {
+				t.Fatalf("%s: pending plan = %+v, want None", name, pend)
+			}
+			continue
 		}
 		if pend.Phase != DeathPhasePending || pend.EffectiveDeathCost != 0 || pend.DeathTimeSeconds != 4242 {
 			t.Fatalf("%s: pending plan = %+v", name, pend)
@@ -1021,32 +1030,56 @@ func TestDeathPendingPlanMatrix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("corpse: %v", err)
 	}
+	// Binding matrix (spec §9.5.8b): avoided and every real death
+	// with NewbieHomeRespawn are None; all other real deaths
+	// (including cost-zero Underworld cheap deaths) are Pending.
+	// Composed through the real planners, never impossible plans.
+	cases := []struct {
+		name      string
+		ctx       DeathContext
+		wantPhase DeathPhase
+		wantCost  int
+	}{
+		{"avoided", DeathContext{PrisonRoom: true}, DeathPhaseNone, 0},
+		{"cheap newbie-zone", DeathContext{NewbieZoneDeath: true}, DeathPhaseNone, 0},
+		{"cheap newbie-zone + token", DeathContext{NewbieZoneDeath: true, CarriesToken: true}, DeathPhaseNone, 0},
+		{"cheap newbie-zone + frenzy", DeathContext{NewbieZoneDeath: true, FrenzyActive: true}, DeathPhaseNone, 0},
+		{"cheap frenzy only", DeathContext{FrenzyActive: true}, DeathPhasePending, 0},
+		{"cheap newbie-honor only", DeathContext{NewbieHonor: true}, DeathPhasePending, 0},
+		{"cheap token only", DeathContext{CarriesToken: true}, DeathPhasePending, 0},
+		{"normal", DeathContext{}, DeathPhasePending, 90},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			plan := mustPlan(t, 90, c.ctx, false)
+			pend, err := PlanPendingDeath(plan, corpse)
+			if err != nil {
+				t.Fatalf("pending: %v", err)
+			}
+			if pend.Phase != c.wantPhase {
+				t.Fatalf("phase = %v, want %v (plan %+v)", pend.Phase, c.wantPhase, plan)
+			}
+			if c.wantPhase == DeathPhasePending {
+				if pend.EffectiveDeathCost != c.wantCost ||
+					pend.DeathTimeSeconds != 999 || pend.Corpse.DeathTimeSeconds != 999 {
+					t.Fatalf("pending = %+v, want cost %d time 999", pend, c.wantCost)
+				}
+			} else if pend.EffectiveDeathCost != 0 || pend.DeathTimeSeconds != 0 {
+				t.Fatalf("none-phase carries state: %+v", pend)
+			}
+		})
+	}
+	// The newbie-home real death still requires a valid corpse
+	// plan: a foreign corpse policy is rejected even on this path.
+	newbie := mustPlan(t, 90, DeathContext{NewbieZoneDeath: true}, false)
+	if !newbie.NewbieHomeRespawn || newbie.Disposition != DeathCheap {
+		t.Fatalf("newbie plan = %+v, want cheap + respawn", newbie)
+	}
+	if _, err := PlanPendingDeath(newbie, CorpsePolicy{LifetimeMs: 1, NoStealMs: 1, DeathTimeSeconds: 1}); !errors.Is(err, ErrInvalidDeathInput) {
+		t.Fatalf("foreign corpse: err = %v", err)
+	}
+	// Foreign corpse policy is rejected on the normal path too.
 	normal := mustPlan(t, 90, DeathContext{}, false)
-	pend, err := PlanPendingDeath(normal, corpse)
-	if err != nil {
-		t.Fatalf("normal pending: %v", err)
-	}
-	if pend.Phase != DeathPhasePending || pend.EffectiveDeathCost != 90 ||
-		pend.DeathTimeSeconds != 999 || pend.Corpse.DeathTimeSeconds != 999 {
-		t.Fatalf("normal pending: %+v", pend)
-	}
-	cheap := mustPlan(t, 90, DeathContext{FrenzyActive: true}, false)
-	pendCheap, err := PlanPendingDeath(cheap, corpse)
-	if err != nil {
-		t.Fatalf("cheap pending: %v", err)
-	}
-	if pendCheap.Phase != DeathPhasePending || pendCheap.EffectiveDeathCost != 0 {
-		t.Fatalf("cheap pending: %+v", pendCheap)
-	}
-	avoided := mustPlan(t, 90, DeathContext{PrisonRoom: true}, false)
-	pendNone, err := PlanPendingDeath(avoided, corpse)
-	if err != nil {
-		t.Fatalf("avoided pending: %v", err)
-	}
-	if pendNone.Phase != DeathPhaseNone {
-		t.Fatalf("avoided pending: %+v", pendNone)
-	}
-	// Foreign corpse policy is rejected.
 	if _, err := PlanPendingDeath(normal, CorpsePolicy{LifetimeMs: 1, NoStealMs: 1, DeathTimeSeconds: 1}); !errors.Is(err, ErrInvalidDeathInput) {
 		t.Fatalf("foreign corpse: err = %v", err)
 	}

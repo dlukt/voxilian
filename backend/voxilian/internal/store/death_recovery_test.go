@@ -442,3 +442,60 @@ func TestDeathRecoveryNoStaleMetric(t *testing.T) {
 		t.Fatalf("item stale %v -> %v across reads", beforeItem, got)
 	}
 }
+
+// TestLoadDeathCharacterRecoveryNewbieHomeNilPending proves the
+// T5c2a recovery shape after a committed newbie-home death (spec
+// §9.5.8b): Pending == nil while the returned Character snapshot
+// carries the committed post-death root revision/state, and a
+// participating item recovers its exact committed state/revision.
+// No recovery production change was needed.
+func TestLoadDeathCharacterRecoveryNewbieHomeNilPending(t *testing.T) {
+	f := newDeathFixture(t)
+	ctx := context.Background()
+	res, err := f.st.CommitDeathEntry(ctx, DeathEntryRequest{
+		Character:          recoveryCharSnapshot(f, 0),
+		DeathPosX:          deathPosX,
+		DeathPosY:          deathPosY,
+		DeathPosZ:          deathPosZ,
+		EffectiveDeathCost: 0,
+		DeathTimeSeconds:   deathTimeSeconds,
+		CorpseLifetime:     deathCorpseLifetime,
+		NewbieHomeRespawn:  true,
+		Items: []DeathEntryItem{
+			{Snapshot: f.deathGroundItem(f.itemA, 0), PKProtectionDuration: 0},
+		},
+		Killer: &DeathEntryKiller{Kind: DeathEntryKillerCharacter, CharacterID: f.killerCharID},
+	})
+	if err != nil {
+		t.Fatalf("commit newbie-home death: %v", err)
+	}
+	if res.CharacterRevision != 1 || res.CorpseID <= 0 {
+		t.Fatalf("result = %+v, want rev 1 + corpse", res)
+	}
+	got, err := f.st.LoadDeathCharacterRecovery(ctx, f.victimID)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	checkRecoveryCharacter(t, f, got, 1)
+	if got.Pending != nil {
+		t.Fatalf("Pending = %+v, want nil for newbie-home path", got.Pending)
+	}
+	item, err := f.st.LoadDeathItemRecovery(ctx, f.itemA)
+	if err != nil {
+		t.Fatalf("load item: %v", err)
+	}
+	if item.Item.ExpectedRevision != 1 || item.Item.Qty != 5 || item.Item.Hits != 77 {
+		t.Fatalf("item = %+v, want rev 1 qty 5 hits 77", item.Item)
+	}
+	loc := item.Item.Location
+	if loc.Kind != 1 || loc.PosX == nil || *loc.PosX != deathPosX ||
+		loc.PosY == nil || *loc.PosY != deathPosY || loc.PosZ == nil || *loc.PosZ != deathPosZ {
+		t.Fatalf("item location = %+v, want ground death pos", loc)
+	}
+	if item.PKProtection != nil {
+		t.Fatalf("protection = %+v, want nil", item.PKProtection)
+	}
+	if n := deathCount(t, f, `SELECT COUNT(*) FROM corpses WHERE character_id = $1`, f.victimID); n != 1 {
+		t.Fatalf("corpses = %d, want 1", n)
+	}
+}
