@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.25)
+# Voxilian Backend — Implementation Plan (v1.26)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.41).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.42).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -507,6 +507,30 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.26: freeze M5 newbie-home no-pending death path (docs
+  only, spec v0.3.42 §9.5.8b; no scope or dependency change):
+  a real death with `NewbieHomeRespawn == true` keeps its
+  corpse plan, post-death vitals, death-entry character
+  persistence, optional token relocation, and optional kill
+  audit, but `PlanPendingDeath` returns `DeathPhaseNone`
+  (no delayed Underworld penalty phase) and `CommitDeathEntry`
+  writes NO `pending_deaths` row; all other real deaths
+  (incl. cost-zero Underworld cheap deaths) stay
+  `DeathPhasePending`. `DeathEntryRequest` gains one
+  caller-resolved `NewbieHomeRespawn bool` (`true` requires
+  `EffectiveDeathCost == 0`, else `ErrInvalidDeathEntry`
+  before Begin); the newbie-home transaction CASes the
+  character root first, prechecks the pending row via the
+  existing generated query (existing row →
+  `ErrDeathAlreadyPending`, never stale), then items/corpse/
+  optional kill with no pending insert; commit-ambiguity
+  recovery stays materialized-state-only with no blind replay
+  (T5c2a `Pending == nil` is correct for this path); T5c2b
+  scalar capture unchanged; T5c3 remains blocked with no
+  runtime/gateway/proto work. Checkbox state unchanged:
+  T5a/T5b1a/T5b1b/T5b2a/T5b2b/T5c1/T5c2a/T5c2b `[x]`,
+  T5c3/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v1.25: freeze M5 critical death persistence adapters (docs
   only, spec v0.3.41 §9.5.1c; no scope or dependency change):

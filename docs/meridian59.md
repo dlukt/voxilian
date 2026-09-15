@@ -710,15 +710,32 @@ shield AND `IsEnemyAttack(killer)`: rank 1..3 → shield deleted; rank
 (item mutation itself is future integration; the plan carries the full
 outcome).
 
-**Immediate vitals + teleport:** `UserGotoDeadRoom`: death room in newbie
-range → teleport RID_NEWB1 (NOT the Underworld); else Underworld near-square
-24/10 fine 38/54. Then vitals: Frenzy death → `HP = MaxHealth/2`,
-`Mana = MaxMana/2`, `Vigor = 100`; ordinary/cheap death → `HP = 1`,
-`Mana = 1`, `Vigor = bound(Vigor/4, 0, 50)` then `NewVigor` bounds 1..200
-(so the 0 floor becomes 1). All three regen timers recreated via
-`NewHealth/NewMana/NewVigor`. Angel mail: if `piDeathCost > 0` AND
-still-newbie (see below) AND NOT murderer → mail + `Mana = MaxMana/2 + 2`
-(OVERWRITES the earlier mana=1) + `NewMana`.
+**Immediate vitals + teleport:** `UserGotoDeadRoom` (`user.kod`):
+death room in newbie range (`RID_NEWB_BASE..RID_NEWB_MAX`) →
+teleport `RID_NEWB1` directly (NOT the Underworld); else Underworld
+near-square 24/10 fine 38/54. Then vitals: Frenzy death → `HP =
+MaxHealth/2`, `Mana = MaxMana/2`, `Vigor = 100`; ordinary/cheap death
+→ `HP = 1`, `Mana = 1`, `Vigor = bound(Vigor/4, 0, 50)` then
+`NewVigor` bounds 1..200 (so the 0 floor becomes 1). All three regen
+timers recreated via `NewHealth/NewMana/NewVigor`. Angel mail: if
+`piDeathCost > 0` AND still-newbie (see below) AND NOT murderer →
+mail + `Mana = MaxMana/2 + 2` (OVERWRITES the earlier mana=1) +
+`NewMana`.
+
+**Newbie-zone cheap real death (binding source route):** a real death
+whose death room lies in the newbie range is a CHEAP real death that
+still creates the normal player corpse (generic cheap drops remain
+absent), but `UserGotoDeadRoom` sends the player directly to
+`RID_NEWB1` — such a player does NOT enter the Underworld.
+`ApplyDeathPenalties` is invoked only by Underworld `LeaveHold`, so
+the direct newbie-home route has NO delayed `ApplyDeathPenalties`
+phase. This is NOT generalized to every cost-zero/cheap death:
+frenzy-only deaths, newbie-honor-only deaths outside the newbie room
+range, and token-only deaths outside the newbie room range still
+follow the Underworld lifecycle (with its between-entry-and-exit
+phase) even when the effective cost is zero. When several cheap
+causes are simultaneously true and the newbie-zone cause holds, the
+direct newbie-home route wins (no Underworld, no pending death).
 
 **`PFLAG_TUTORIAL` is inverted:** TRUE means the player is NO LONGER a
 newbie (set at age ≥ 2 game-months or on becoming PK-able/murderer/outlaw).

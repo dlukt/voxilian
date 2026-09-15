@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.41 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.42 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -8040,6 +8040,15 @@ The old phrase "single-txn state+ledger" means each phase's own mutation
 is atomic with its audit rows (§8.1) — never one transaction spanning the
 lifecycle.
 
+Newbie-home exception (binding, frozen v0.3.42, §9.5.8b): a real
+death with `NewbieHomeRespawn == true` (death room in the resolved
+newbie range, direct teleport to the newbie home, no Underworld
+entry) has NO delayed Underworld-exit penalty phase, so its Phase-1
+death entry commits the character post-death snapshot, item
+relocations if any, corpse, and optional kill with NO
+`pending_deaths` row. Only `NewbieHomeRespawn == true` suppresses
+the pending row; cost zero alone never does.
+
 #### 9.5.1a M5 death runtime integration layers (T5c split, frozen v0.3.39)
 
 The former single T5c crossed four distinct ownership layers, so it
@@ -8831,6 +8840,111 @@ Portal mutation belongs to T5b2a, which freezes its own update
 semantics. No `CommitDeathEntry`, no character/item death CAS
 composition, no kill/ledger composition in T5b1a.
 
+#### 9.5.8b Newbie-home death commits no pending row (frozen v0.3.42)
+
+Source basis (`meridian59.md` §9.5): a newbie-zone death is a CHEAP
+REAL death — the normal player corpse IS created and generic cheap
+drops remain absent — but `UserGotoDeadRoom` sends a player whose
+death room lies in the newbie range directly to the newbie home.
+Such a player does NOT enter the Underworld, and
+`ApplyDeathPenalties` runs only from Underworld `LeaveHold`, so the
+direct newbie-home route has NO delayed penalty phase. This is NOT
+generalized: frenzy-only deaths, newbie-honor-only deaths outside
+the newbie room range, and token-only deaths outside the newbie
+room range still follow the Underworld lifecycle (with its
+between-entry-and-exit phase) even when the effective cost is zero.
+When several cheap causes hold simultaneously and the newbie-zone
+cause holds, the direct newbie-home route wins.
+
+T5a pending rule (binding): `PlanPendingDeath` returns
+`DeathPhaseNone` for `DeathAvoided` AND for any real death with
+`NewbieHomeRespawn == true`; every other real death returns
+`DeathPhasePending`. Binding matrix:
+
+```text
+avoided                              -> None
+cheap newbie-zone                    -> None
+cheap newbie-zone + token            -> None
+cheap newbie-zone + frenzy           -> None
+cheap frenzy only                    -> Pending(cost 0)
+cheap newbie-honor only (outside)    -> Pending(cost 0)
+cheap token only (outside)           -> Pending(cost 0)
+normal                               -> Pending(cost 1..100)
+```
+
+`DeathPhaseNone` on this path means only "no delayed Underworld
+penalty phase exists" — it does NOT mean avoided death. The real
+newbie-home death still requires the corpse plan, post-death
+vitals, death-entry character persistence, optional token
+relocation, and optional kill audit. `NewbieHomeRespawn` is the
+already-frozen field of `DeathDispositionPlan`; no competing flag
+is added.
+
+Durable rule (binding): `pending_deaths` exists IFF the real death
+has a delayed Underworld-exit penalty phase. A newbie-home death
+commits the character post-death snapshot, item relocations if
+any, corpse, and optional kill with NO `pending_deaths` row. The
+corpse exists independently. No migration is needed; the schema
+is unchanged.
+
+`DeathEntryRequest` extension (binding): one caller-resolved
+Store-domain field `NewbieHomeRespawn bool` (default `false` =
+current behavior; `true` = source-faithful direct newbie-home
+path). No second enum, no generalized death-route model, no
+coordinate inference — Store receives the already-resolved fact.
+Validation: `NewbieHomeRespawn == true` requires
+`EffectiveDeathCost == 0`; a nonzero-cost newbie-home request is
+`ErrInvalidDeathEntry` before Begin with zero stale metric.
+
+Newbie-home transaction order (binding, `NewbieHomeRespawn ==
+true` only): Begin, character root CAS FIRST, then
+`GetPendingDeathByCharacter` reusing the existing generated query
+(no new SQL, no public pending-read API). `pgx.ErrNoRows` means
+no outstanding pending death (proceed); any other lookup error
+aborts. An existing pending row means `ErrDeathAlreadyPending`
+with the tentative character CAS rolled back and no stale metric.
+Otherwise: item root CASes ascending ItemID, corpse insert, NO
+`InsertPendingDeath`, optional kill, commit once. The `false`
+path preserves current semantics. No ledger row in either path.
+
+`ErrDeathAlreadyPending` (binding): a death entry encountering an
+existing live pending-death phase, whether detected by the
+`pending_deaths` PK conflict or by the explicit newbie-home
+precheck. Still NOT stale: no stale metric increment, whole
+transaction rolled back.
+
+Commit-ambiguity / replay rule (binding): a newbie-home death
+leaves NO pending row, so it has no pending-row replay fence —
+but NO new blind-retry mechanism is invented. The T5c2b rule
+stands: after any callback/commit ambiguity, return zero public
+operation result, reconcile-block Saver participants, reconcile
+materialized character/items, and DO NOT blindly replay
+`CommitDeathEntry`. After a committed newbie-home death with lost
+acknowledgement, recovery shows the advanced character root
+revision with the post-death snapshot, advanced participating
+item revisions/state, `Pending == nil`, and a durably existing
+corpse. No dummy pending row as an idempotency token, no new
+schema/history table, no auto-`CommitDeathPenalties` merely to
+clear a temporary row.
+
+Recovery (binding): T5c2a already supports `Pending == nil` and
+needs no production API change. After a committed newbie-home
+death, `LoadDeathCharacterRecovery(...).Pending == nil` while the
+returned Character snapshot carries the committed post-death
+root revision/state. The corpse row is never embedded into
+character recovery.
+
+T5c2b (binding): `freezeDeathEntryRequest` copies scalar fields by
+value, so `NewbieHomeRespawn` survives immutable capture
+naturally. `WriteCriticalSet` execution-time revision injection,
+the result-visibility fence, and explicit reconciliation are
+unchanged; no special Saver path, no automatic recovery.
+
+T5c3 remains blocked: no `CharacterID` runtime binding, death
+lifecycle state, respawn, Underworld runtime, placement mutation,
+zero-HP orchestration, gateway, opcode 120, or 214/215 work
+belongs in this fix.
+
 #### 9.5.9 DeathCost domain
 
 The default cost comes from server settings (source default 100,
@@ -9100,7 +9214,9 @@ Voxilian coordinates in T5 tasks. Newbie-range deaths respawn at the
 resolved newbie-home placement; other deaths at the resolved
 Underworld-placement seam; both are T5c3 live-integration inputs (M10-T2b
 authors the real classic Underworld source). T5a performs NO world
-lookup.
+lookup. The newbie-home route enters no Underworld and creates no
+durable pending-death state (§9.5.8b); T5c3 remains blocked and owns
+no placement mutation in this fix.
 
 #### 9.5.16 Wire ownership (unchanged)
 
@@ -9135,7 +9251,7 @@ room, honor, token + token-still-loses-artifact ordering); corpse
 constants; post-death vitals boundary vectors (low/non-divisible/high
 vigor, cap 50, 0→1 floor, frenzy branch, angel-mana override) all
 `Validate()`-clean; advancement exact results; ordered drop plan
-(droppable/undroppable/mixed/cheap/PK vs non-PK); Portal-of-Life golden
+ (droppable/undroppable/mixed/cheap/PK vs non-PK); Portal-of-Life golden
 vectors (ages 0/59/60/61/later/lifetime-edge, power min/max, bounds 5
 and 80, truncation, invalid inputs); cost scaling (ordinary/newbie/3/
 murderer/zero); HP roll boundary (roll == cost) independent from ability
@@ -9145,7 +9261,13 @@ proof (HP → spells → skills; ineligible and saved rolls consume exactly
 as frozen); hook flags; bounded property loops over DeathCost/vigor/
 BaseMaxHP/Stamina 1..70/ability 1..99/power 1..99/corpse ages with
 value invariants and no panics on hostile integers (overflow-safe
-arithmetic).
+arithmetic). Newbie-home matrix (§9.5.8b): avoided → None; cheap
+newbie-zone (incl. +token, +frenzy combinations) → None with corpse
+plan intact; cheap frenzy-only / newbie-honor-only-outside /
+token-only-outside → Pending cost 0 (cost zero alone never suppresses
+pending); normal → Pending default cost; composed through real
+`PlanDeathDisposition` + `PlanCorpse` + `PlanPendingDeath` (no
+impossible plans).
 
 ## 10. Config / deployment / ops
 
@@ -9302,6 +9424,29 @@ arithmetic).
    survives it.
 
 ## 14. Version history
+
+- v0.3.42: freeze M5 newbie-home no-pending death path (docs
+  only; no schema/query/code change). New §9.5.8b freezes the
+  source-faithful correction: a real death with
+  `NewbieHomeRespawn == true` creates the normal corpse but
+  teleports directly to the newbie home (no Underworld entry,
+  no `LeaveHold`, no delayed `ApplyDeathPenalties`), so
+  `PlanPendingDeath` returns `DeathPhaseNone` for it while all
+  other real deaths (incl. cost-zero Underworld cheap deaths)
+  stay `DeathPhasePending`; `DeathEntryRequest` gains one
+  caller-resolved `NewbieHomeRespawn bool` (`true` requires
+  cost 0, else `ErrInvalidDeathEntry` before Begin);
+  newbie-home transactions CAS the character root first, then
+  precheck the pending row via the existing generated query
+  (existing row → `ErrDeathAlreadyPending`, never stale),
+  then items/corpse/optional kill with NO pending insert;
+  commit-ambiguity recovery stays materialized-state-only
+  (no blind replay, no dummy pending row); T5c2a already
+  supports `Pending == nil`; T5c2b scalar capture is
+  unchanged; T5c3 remains blocked. `meridian59.md` §9.5 pins
+  the `UserGotoDeadRoom` direct-`RID_NEWB1` route. Checkbox
+  state unchanged: T5a/T5b1a/T5b1b/T5b2a/T5b2b/T5c1/T5c2a/
+  T5c2b `[x]`, T5c3/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v0.3.41: freeze M5 critical death persistence adapters (docs
   only; no schema/query/code change). New §9.5.1c freezes the
