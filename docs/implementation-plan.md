@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.24)
+# Voxilian Backend — Implementation Plan (v1.25)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.40).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.41).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -331,7 +331,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   (one-key sets for Portal/DeathPenalties), mapping
   execution-time Saver revisions into Store request
   `ExpectedRevision` fields. Spec: §9.5.1, §9.5.1a, §9.5.1b,
-  §9.5.8a, §9.5.10a, §9.5.11a.
+  §9.5.1c, §9.5.8a, §9.5.10a, §9.5.11a.
 - [ ] **M5-T5c3** Sim-owner death lifecycle + resolved placement
   (depends on T5a + T4b2 + T5c2a + T5c2b): durable `CharacterID` association
   with player runtime, typed player initialization, zero-HP → death
@@ -507,6 +507,27 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.25: freeze M5 critical death persistence adapters (docs
+  only, spec v0.3.41 §9.5.1c; no scope or dependency change):
+  T5c2b is the `internal/persist` composition layer between
+  `sim.Saver.WriteCriticalSet` and the frozen
+  `Store.CommitDeathEntry` / `CommitPortalOfLife` /
+  `CommitDeathPenalties` transactions (no new migration/query/
+  generated code, no Store method, no `sim` production change);
+  DeathEntry participants are exactly character + one item root
+  per `Items` element (zero items valid; duplicates fail before
+  Store), Portal/Penalties are one-key critical sets;
+  execution-time Saver revisions overwrite hostile
+  `ExpectedRevision` inside the callback only; immutable
+  request capture reusing the existing clone rules;
+  `store.ErrStaleRevision` via `mapStale` vs semantic causes
+  preserved; ZERO public result until Saver success; no
+  automatic reconciliation/retry (T5c3 reconciles via T5c2a);
+  commit-ambiguity recovery is materialized state, never blind
+  replay. Checkbox state unchanged: T5a/T5b1a/T5b1b/T5b2a/
+  T5b2b/T5c1/T5c2a `[x]`, T5c2b/T5c3/T5c4/T6/T7 and M5 exit
+  `[ ]`.
 
 - v1.24: freeze M5 materialized death recovery (docs only, spec
   v0.3.40 §9.5.1b; split only): replace M5-T5c2 with T5c2a

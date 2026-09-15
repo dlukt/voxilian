@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.40 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.41 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -7992,7 +7992,7 @@ v0.3.40 in §9.5.1b):
   adapters bridging them into the existing `ReconcileSaver`.
   Depends on T5b1b + T5b2a + T5b2b. No new migration, query, or
   generated code.
-- **T5c2b — critical death persistence adapters** (§9.5.1b): the
+- **T5c2b — critical death persistence adapters** (§9.5.1c): the
   `persist` write adapters executing `CommitDeathEntry` /
   `CommitPortalOfLife` / `CommitDeathPenalties` through
   `sim.Saver.WriteCriticalSet`, mapping execution-time Saver
@@ -8168,7 +8168,7 @@ loaders plus `persist` staged reload adapters. The ONLY T5c layer
 that may add Store read APIs if required — never T5c1, and T5c2a
 itself needs none (existing generated queries suffice).
 
-T5c2b ownership (frozen boundary only): the `persist` write
+T5c2b ownership (frozen in §9.5.1c): the `persist` write
 adapters executing `CommitDeathEntry` / `CommitPortalOfLife` /
 `CommitDeathPenalties` through `sim.Saver.WriteCriticalSet`.
 Portal and DeathPenalties are one-root critical transactions but
@@ -8325,6 +8325,141 @@ expire immediately afterward. Recovery never locks or pins the
 corpse. Future Portal execution stays authoritative via the
 existing Store transaction (corpse mismatch / NULL, portal
 already used, no pending death).
+
+#### 9.5.1c M5 critical death persistence adapters (T5c2b, frozen v0.3.41)
+
+T5c2b is the `internal/persist` composition layer between
+`sim.Saver.WriteCriticalSet` (§8.3.17, §9.5.1a) and the
+already-frozen Store transactions `Store.CommitDeathEntry` /
+`Store.CommitPortalOfLife` / `Store.CommitDeathPenalties`
+(§9.5.8a, §9.5.10a, §9.5.11a). Dependency direction is binding:
+`sim` imports neither `store` nor `persist`; `store` imports
+neither `sim` nor `persist`; `persist` imports `sim` + `store`
+with NO `pgx`/generated-sqlc import in production code. Store
+transactions remain completely unchanged, and no new migration,
+query, generated code, Store method, or `sim` production change
+is required.
+
+Participant roots (binding). DeathEntry participants are
+EXACTLY the character root `{AggregateCharacter, Character.ID}`
+plus one item root `{AggregateItem, item.Snapshot.ID}` for EVERY
+`DeathEntryRequest.Items` element — no other participant
+exists. `corpse` is not a CAS root, `pending_deaths` is
+character child state, `item_pk_protections` is item child
+state, and `kills` is audit/history, so none of them is a
+separate Saver root. Zero death items is valid (character-only
+participant set). Duplicate item IDs naturally produce duplicate
+Saver keys and MUST fail BEFORE Store invocation through the
+existing critical-set validation. Portal-of-Life and
+DeathPenalties each use EXACTLY ONE participant,
+`{AggregateCharacter, Character.ID}`, but MUST still use
+`WriteCriticalSet` (not ordinary `WriteThrough`) so the
+conservative post-callback ambiguity rule applies uniformly.
+
+Execution-time revisions (binding): the caller-supplied Store
+request may carry ANY value (including stale/hostile) in
+`Character.ExpectedRevision` / item `Snapshot.ExpectedRevision`;
+those values are NOT authoritative. Only inside the
+`WriteCriticalSet` callback, after all participant gates are
+owned, the adapter copies the execution-time Saver revisions
+into the Store request (`Character.ExpectedRevision` from the
+matching character key, each item `Snapshot.ExpectedRevision`
+from its matching item key). Revisions are never captured
+before Saver gate ownership, never incremented locally, and
+never taken from the input request. No positional assumption
+beyond key identity is made between request item order, Saver
+order, and Store `ItemRevisions` order.
+
+Immutable request capture (binding): before entering
+`WriteCriticalSet` the adapter freezes the complete request
+content reusing the exact existing copy rules
+(`freezeCharacterSnapshot`, `freezeItemSnapshot`); DeathEntry
+additionally deep-copies the `Items` slice, each
+`DeathEntryItem`, and the optional `Killer` value, while Portal
+and DeathPenalties freeze their complete `CharacterSnapshot`.
+The caller's request/slices/pointers MUST NOT be mutated or
+reordered, and post-capture caller mutation must not alter the
+Store request executed after Saver gate waits. No second
+divergent Character/Item clone policy exists.
+
+Error mapping (binding): inside each critical callback,
+`store.ErrStaleRevision` MUST pass through the existing
+`mapStale` before being returned to Saver, so the public
+adapter error is discoverable with ALL of
+`store.ErrStaleRevision`, `sim.ErrSnapshotStale`, and
+`sim.ErrSaverReconcileRequired` (all participants
+reconcile-blocked, known revisions unchanged). The adapter
+itself performs NO retry and NO reconciliation.
+Operation-specific Store causes (`ErrDeathAlreadyPending`,
+`ErrInvalidDeathEntry`, `ErrNoPendingDeath`,
+`ErrPortalCorpseMismatch`, `ErrPortalAlreadyUsed`,
+`ErrInvalidPortalOfLife`, `ErrPendingDeathCostMismatch`,
+`ErrInvalidDeathPenalties`, context/connection/constraint
+errors) MUST remain discoverable unchanged; because the Store
+callback WAS invoked, `ErrSaverReconcileRequired` is also
+discoverable, but such errors MUST NOT become
+`sim.ErrSnapshotStale` (no adapter-level special-casing of
+"known rollback" errors — T5c1 owns the one generic
+conservative rule). If `WriteCriticalSet` rejects BEFORE Store
+callback invocation (invalid key, duplicate key, untracked
+aggregate, already-blocked participant, pre-callback
+cancellation, revision/generation preflight), Store MUST NOT be
+called, no operation result is fabricated, and no new blanket
+reconciliation is added beyond what Saver reports.
+
+Result mapping and visibility fence (binding): on Store
+success the critical callback converts ONLY root revisions
+into the Saver callback result (character key ->
+`CharacterRevision`; each item key -> its `ItemRevision` by
+exact durable key/ID identity; `CorpseID` is NOT a Saver
+revision and is NOT a participant). `WriteCriticalSet`
+performs the final authoritative exact-set and `expected+1`
+verification, so a Store success with a missing/extra/
+duplicate/wrong revision MUST surface as
+`ErrSaverRevisionInvariant` + `ErrSaverReconcileRequired` with
+no partial Saver acceptance. The public adapter MUST NOT
+expose ANY Store success result (e.g. `DeathEntryResult.
+CorpseID`, `PortalOfLifeResult.EffectiveCost`) until
+`Saver.WriteCriticalSet` itself returns success: on ANY
+`WriteCriticalSet` error the adapter returns the ZERO Store
+operation result plus the error, even if the Store callback
+had already returned a nonzero success value. After
+`WriteCriticalSet` success the adapter returns the original
+successful Store result verbatim (never a second result
+synthesized from Saver metadata).
+
+Recovery contract (binding): T5c2b MUST NOT call any loader or
+`ReconcileSaver` automatically and MUST NOT retry; on
+`ErrSaverReconcileRequired` the adapter returns and T5c3
+reconciles every affected root via T5c2a (character + every
+participating item for DeathEntry; character only for
+Portal/Penalties) before continuing. If a real Store
+transaction COMMITTED but its acknowledgement was lost, the
+adapter returns zero result with the lost-ack cause plus
+`ErrSaverReconcileRequired` (known revisions old, all
+participants blocked); T5c2a recovery then reveals the
+authoritative materialized state (DeathEntry: new character
+revision, pending death, corpse association, new
+item revisions/locations, PK protection; Portal:
+`portal_used=true` with lowered cost; Penalties: post-penalty
+snapshot with pending absent). T5c2b never blindly replays the
+mutation to discover commit state.
+
+Public seam (binding), conceptually:
+
+```go
+type DeathPersistenceStore interface {
+    CommitDeathEntry(context.Context, store.DeathEntryRequest) (store.DeathEntryResult, error)
+    CommitPortalOfLife(context.Context, store.PortalOfLifeRequest) (store.PortalOfLifeResult, error)
+    CommitDeathPenalties(context.Context, store.DeathPenaltiesRequest) (store.DeathPenaltiesResult, error)
+}
+// var _ DeathPersistenceStore = (*store.PGStore)(nil)
+```
+
+Public persist operations execute the corresponding Store
+operation through `sim.Saver.WriteCriticalSet` and own the
+Store↔Saver mapping; raw `sim.CriticalSetWrite` is NOT
+exposed to T5c3.
 
 #### 9.5.2 Death disposition: avoided vs cheap vs normal (frozen)
 
@@ -9167,6 +9302,31 @@ arithmetic).
    survives it.
 
 ## 14. Version history
+
+- v0.3.41: freeze M5 critical death persistence adapters (docs
+  only; no schema/query/code change). New §9.5.1c freezes the
+  T5c2b contract: `persist` composition between
+  `Saver.WriteCriticalSet` and the frozen Store transactions
+  (dependency `persist` -> `sim` + `store` only; Store
+  unchanged; no migration/query/generated/`sim` change);
+  DeathEntry participants are exactly character + one item root
+  per `Items` element (zero items valid; duplicates fail before
+  Store), Portal/Penalties are one-key critical sets;
+  execution-time Saver revisions overwrite hostile
+  `ExpectedRevision` inside the callback only; immutable
+  request capture reusing the existing clone rules;
+  `store.ErrStaleRevision` via `mapStale` (all three sentinels
+  discoverable) vs semantic Store causes preserved (plus
+  `ErrSaverReconcileRequired`, never `ErrSnapshotStale`);
+  pre-callback Saver rejection calls no Store; callback maps
+  only root revisions by key identity for Saver `expected+1`
+  verification; ZERO public result until Saver success
+  (`CorpseID`/`EffectiveCost` never escape early); no
+  automatic reconciliation/retry (T5c3 reconciles via T5c2a);
+  commit-ambiguity recovery is materialized state, never blind
+  replay. Checkbox state unchanged: T5a/T5b1a/T5b1b/T5b2a/
+  T5b2b/T5c1/T5c2a `[x]`, T5c2b/T5c3/T5c4/T6/T7 and M5 exit
+  `[ ]`.
 
 - v0.3.40: freeze M5 materialized death recovery (docs only; no
   schema/query/code change). Split T5c2 into T5c2a (materialized
