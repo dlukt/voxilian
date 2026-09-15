@@ -60,16 +60,12 @@ func cloneBytes(b []byte) []byte {
 	return append([]byte(nil), b...)
 }
 
-// NewCharacterSnapshotJob deep-copies a complete character snapshot
-// and binds it to its saver key. The input ExpectedRevision is
-// ignored (the saver owns revisions): at execution the closure
-// sets ExpectedRevision from the saver's authoritative value
-// immediately before invoking Store.
-func NewCharacterSnapshotJob(st SnapshotStore, snap store.CharacterSnapshot) (SnapshotJob, error) {
-	if snap.ID <= 0 {
-		return SnapshotJob{}, fmt.Errorf("%w: character snapshot id %d",
-			sim.ErrInvalidAggregateKey, snap.ID)
-	}
+// freezeCharacterSnapshot deep-copies a complete character snapshot
+// into immutable staged ownership: Vitals/Advancement bytes plus the
+// full Spells/Skills slices (preserving nil-vs-empty so the captured
+// shape never aliases the caller's slice header). Shared by snapshot
+// jobs and death-recovery reload staging: exactly one copy rule.
+func freezeCharacterSnapshot(snap store.CharacterSnapshot) store.CharacterSnapshot {
 	frozen := snap
 	frozen.Vitals = cloneBytes(snap.Vitals)
 	frozen.Advancement = cloneBytes(snap.Advancement)
@@ -84,6 +80,20 @@ func NewCharacterSnapshotJob(st SnapshotStore, snap store.CharacterSnapshot) (Sn
 	if snap.Skills == nil {
 		frozen.Skills = nil
 	}
+	return frozen
+}
+
+// NewCharacterSnapshotJob deep-copies a complete character snapshot
+// and binds it to its saver key. The input ExpectedRevision is
+// ignored (the saver owns revisions): at execution the closure
+// sets ExpectedRevision from the saver's authoritative value
+// immediately before invoking Store.
+func NewCharacterSnapshotJob(st SnapshotStore, snap store.CharacterSnapshot) (SnapshotJob, error) {
+	if snap.ID <= 0 {
+		return SnapshotJob{}, fmt.Errorf("%w: character snapshot id %d",
+			sim.ErrInvalidAggregateKey, snap.ID)
+	}
+	frozen := freezeCharacterSnapshot(snap)
 	return SnapshotJob{
 		Key: sim.AggregateKey{Kind: sim.AggregateCharacter, ID: snap.ID},
 		Write: func(ctx context.Context, expectedRevision int64) (int64, error) {
@@ -114,14 +124,11 @@ func cloneStringPtr(p *string) *string {
 	return &v
 }
 
-// NewItemSnapshotJob deep-copies a complete item snapshot (enchants
-// bytes plus every location pointer VALUE into fresh storage) and
-// binds it to its saver key. Input ExpectedRevision is ignored.
-func NewItemSnapshotJob(st SnapshotStore, snap store.ItemSnapshot) (SnapshotJob, error) {
-	if snap.ID <= 0 {
-		return SnapshotJob{}, fmt.Errorf("%w: item snapshot id %d",
-			sim.ErrInvalidAggregateKey, snap.ID)
-	}
+// freezeItemSnapshot deep-copies a complete item snapshot
+// (enchants bytes plus every location pointer VALUE into fresh
+// storage). Shared by snapshot jobs and death-recovery reload
+// staging: exactly one copy rule.
+func freezeItemSnapshot(snap store.ItemSnapshot) store.ItemSnapshot {
 	frozen := snap
 	frozen.Enchants = cloneBytes(snap.Enchants)
 	loc := snap.Location
@@ -134,6 +141,18 @@ func NewItemSnapshotJob(st SnapshotStore, snap store.ItemSnapshot) (SnapshotJob,
 	loc.PosZ = cloneInt64Ptr(loc.PosZ)
 	loc.Slot = cloneStringPtr(loc.Slot)
 	frozen.Location = loc
+	return frozen
+}
+
+// NewItemSnapshotJob deep-copies a complete item snapshot (enchants
+// bytes plus every location pointer VALUE into fresh storage) and
+// binds it to its saver key. Input ExpectedRevision is ignored.
+func NewItemSnapshotJob(st SnapshotStore, snap store.ItemSnapshot) (SnapshotJob, error) {
+	if snap.ID <= 0 {
+		return SnapshotJob{}, fmt.Errorf("%w: item snapshot id %d",
+			sim.ErrInvalidAggregateKey, snap.ID)
+	}
+	frozen := freezeItemSnapshot(snap)
 	return SnapshotJob{
 		Key: sim.AggregateKey{Kind: sim.AggregateItem, ID: snap.ID},
 		Write: func(ctx context.Context, expectedRevision int64) (int64, error) {

@@ -312,7 +312,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   `expected+1` result validation, canonical result order, no new
   metric, no PG I/O. NO Store/persist/PG/gateway/proto/death-state/
   recovery-API work (those are T5c2–T5c4). Spec: §8.3.17, §9.5.1a.
-- [ ] **M5-T5c2a** Materialized death recovery reads + reload
+- [x] **M5-T5c2a** Materialized death recovery reads + reload
   adapters (depends on T5b1b + T5b2a + T5b2b): Store read-only
   recovery loaders (`LoadDeathCharacterRecovery` /
   `LoadDeathItemRecovery`) returning the COMPLETE death-relevant
