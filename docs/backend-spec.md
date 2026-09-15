@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.44 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.45 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -7965,11 +7965,13 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
 
 #### 9.5.1 Ownership split and the two-phase lifecycle
 
-M5-T5 is THIRTEEN tasks (this section is their shared boundary;
+M5-T5 is FIFTEEN tasks (this section is their shared boundary;
 the former single T5c is split into T5c1–T5c4, frozen v0.3.39 in
 §9.5.1a, T5c2 is further split into T5c2a+T5c2b, frozen
-v0.3.40 in §9.5.1b, and T5c3 is further split into
-T5c3a+T5c3b+T5c3c+T5c3d, frozen v0.3.43 in §9.5.1d):
+v0.3.40 in §9.5.1b, T5c3 is further split into
+T5c3a+T5c3b+T5c3c+T5c3d, frozen v0.3.43 in §9.5.1d, and T5c3c is
+further split into T5c3c1+T5c3c2+T5c3c3, frozen v0.3.45 in
+§9.5.1f):
 
 - **T5a — pure/source-faithful death mechanics and immutable plans**
   (§9.5.4–§9.5.14 pure surface; §9.5.17 non-scope).
@@ -8034,21 +8036,45 @@ T5c3a+T5c3b+T5c3c+T5c3d, frozen v0.3.43 in §9.5.1d):
   deterministic runtime reinitialization after accepted post-death
   state. `internal/sim` only; depends on T5c3a + T5a + T4b2. No
   PG/persist/store/gateway/proto work.
-- **T5c3c — immediate-death async persistence/reconciliation state
-  machine** (§9.5.1d): zero-HP handoff into the death state
-  machine, T5a immediate-plan composition over
-  caller/resolver-supplied facts, freeze/serialize of affected
-  gameplay participants while the critical death operation is
-  outstanding, non-blocking handoff from the sim owner to
-  off-owner persistence using the existing
-  `persist.CommitDeathEntry`, callback-success completion back
-  through typed owner ingress, stale/semantic/commit-ambiguity
-  recovery via the existing T5c2a (no blind `CommitDeathEntry`
-  replay), owner-only installation of successful/recovered live
-  state, the correct `NewbieHomeRespawn` no-pending path, and the
-  correct Underworld-bound pending path. `internal/sim` +
-  `internal/persist`. Depends on T5c3a + T5c3b + T5a + T5c2a +
-  T5c2b. No gateway/protocol work.
+- **T5c3c1 — immediate-death lifecycle gate + attempt correlation**
+  (§9.5.1f): the owner-local player life-state gate (`Alive` /
+  `DeathPersisting` / `AwaitingRespawn`), one correlated
+  immediate-death persistence attempt at a time (per-entity ephemeral
+  death epoch + immutable `DeathAttemptToken`), the owner-local
+  begin-death transition over the existing `PlayerQuiesceForDeath`
+  semantics, the correlated owner-local post-death
+  completion/install wrapper over the existing
+  `PlayerInstallPostDeathState` (applied vs duplicate-idempotent),
+  ordinary gameplay mutation/input rejection while death is in
+  progress or awaiting respawn, and retry-safe duplicate completion
+  handling. `internal/sim` only. Depends on T5c3a + T5c3b. No T5a
+  immediate plan composition, no double-death time calculation, no
+  complete durable Character/Item capture, no Store-domain types, no
+  Saver, no `CommitDeathEntry`, no PG, no workers/goroutines, no
+  completion ingress, no zero-HP automatic dispatch, no
+  gateway/protocol.
+- **T5c3c2 — complete immutable immediate-death capture +
+  Store-domain persistence mapping** (§9.5.1f): the still-missing
+  complete immutable persistence-content boundary — a
+  store-independent sim-domain capture sufficient to build the
+  complete `store.DeathEntryRequest` (complete current character
+  aggregate content required by death + complete affected item
+  aggregate content, T5a plans mapped onto that captured content,
+  sim-domain → Store-domain mapping inside `internal/persist`)
+  without importing `store` into `sim`, without re-reading older PG
+  state and silently discarding newer in-memory state, and without
+  exposing raw sim `CriticalSetWrite`. Depends on T5c3c1 + T5a +
+  T5c2b. The exact capture API is deferred to T5c3c2's own
+  pre-implementation audit/spec freeze.
+- **T5c3c3 — bounded off-owner death persistence/recovery +
+  zero-HP orchestration + typed owner completion** (§9.5.1f):
+  bounded off-owner persistence execution (no goroutine-per-death),
+  `persist.CommitDeathEntry`, explicit T5c2a recovery on
+  stale/ambiguous results (no blind replay), typed completion
+  through sim owner ingress, zero-HP/T5a immediate-death
+  orchestration, and owner-only accepted/recovered final-state
+  installation. Depends on T5c3c1 + T5c3c2 + T5c2a + T5c2b. No
+  gateway/protocol.
 - **T5c3d — pending-death / Portal / Underworld-exit async
   lifecycle** (§9.5.1d): the already-durable second phase —
   recovered pending-death lifecycle, Portal-of-Life runtime
@@ -8057,10 +8083,10 @@ T5c3a+T5c3b+T5c3c+T5c3d, frozen v0.3.43 in §9.5.1d):
   same off-owner rule, the authoritative Underworld EXIT
   transition, `PlanDeathPenalties` using the current durable
   pending cost, `persist.CommitDeathPenalties`, exactly-once
-  pending consumption, recovery after stale/semantic/ambiguous
+  pending   consumption, recovery after stale/semantic/ambiguous
   results, and owner-only final live-state apply. `internal/sim`
-  + `internal/persist`. Depends on T5c3c + T5b2a + T5b2b + T5c2a
-  + T5c2b. `C->S 120 respawn_ack` is NOT the semantic synonym
+  + `internal/persist`. Depends on T5c3c1 + T5c3c2 + T5c3c3 +
+  T5b2a + T5b2b + T5c2a + T5c2b. `C->S 120 respawn_ack` is NOT the semantic synonym
   for Underworld `LeaveHold` / `ApplyDeathPenalties`: T5c4 owns
   opcode 120 transport/state routing while T5c3d owns the
   gameplay event "player actually leaves the Underworld".
@@ -8068,10 +8094,10 @@ T5c3a+T5c3b+T5c3c+T5c3d, frozen v0.3.43 in §9.5.1d):
   gateway/state-machine routing, rate-gated C→S 120 handling, critical
   S→C 214 / 215 delivery, session/Presence/NetEntityID composition,
   reconnect/end-to-end proof reusing the existing 120/214/215 codecs
-  (no second protocol). Depends on T5c3a + T5c3b + T5c3c + T5c3d +
-  the existing M4 gateway/presence/fanout foundation.
+  (no second protocol). Depends on T5c3a + T5c3b + T5c3c1 + T5c3c2 +
+  T5c3c3 + T5c3d + the existing M4 gateway/presence/fanout foundation.
 
-M5-T5-complete is `T5a + T5b1a + T5b1b + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a + T5c3b + T5c3c + T5c3d + T5c4`.
+M5-T5-complete is `T5a + T5b1a + T5b1b + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3 + T5c3d + T5c4`.
 
 Ledger contract (binding on T5b2a/T5b2b): Portal-of-Life writes ZERO
 ledger rows. Underworld-exit death penalties write ZERO ledger rows.
@@ -8250,10 +8276,10 @@ with player runtime, typed player initialization, and the typed
 player-add owner command (`internal/sim` only, no death
 lifecycle); T5c3b owns the owner-local death-safe relocation +
 runtime quiesce/reinitialization primitives over resolved
-placement (no hard-coded Underworld coordinates); T5c3c owns the
-immediate-death async persistence/reconciliation state machine
-(`internal/sim` + `internal/persist`, off-owner execution with
-typed owner completion); T5c3d owns the pending-death / Portal /
+ placement (no hard-coded Underworld coordinates); T5c3c1+T5c3c2+T5c3c3 own the
+ immediate-death lifecycle gate, complete immutable capture, and
+ bounded persistence/recovery split (see §9.5.1f, v0.3.45);
+ T5c3d owns the pending-death / Portal /
 Underworld-exit async lifecycle (same off-owner rule;
 opcode 120 transport stays T5c4).
 
@@ -8387,7 +8413,7 @@ its buffers after return cannot alter what `Apply` receives. The
 existing `persist.ReconcileSaver` is reused unchanged as the
 Saver + `ReconcileState` bridge. No `DeathReconcileState`, no
 multi-root reconciliation primitive, no automatic polling, no
-background reload worker — T5c3c/T5c3d serialize the gameplay
+ background reload worker — T5c3c3/T5c3d serialize the gameplay
 participants while performing all required per-aggregate
 reconciliation.
 
@@ -8502,7 +8528,7 @@ synthesized from Saver metadata).
 
 Recovery contract (binding): T5c2b MUST NOT call any loader or
 `ReconcileSaver` automatically and MUST NOT retry; on
-`ErrSaverReconcileRequired` the adapter returns and T5c3c/T5c3d
+ `ErrSaverReconcileRequired` the adapter returns and T5c3c3/T5c3d
 reconcile every affected root via T5c2a (character + every
 participating item for DeathEntry; character only for
 Portal/Penalties) before continuing. If a real Store
@@ -8531,7 +8557,7 @@ type DeathPersistenceStore interface {
 Public persist operations execute the corresponding Store
 operation through `sim.Saver.WriteCriticalSet` and own the
 Store↔Saver mapping; raw `sim.CriticalSetWrite` is NOT
-exposed to T5c3c/T5c3d.
+ exposed to T5c3c1/T5c3c2/T5c3c3/T5c3d.
 
 #### 9.5.1d M5 async death runtime ownership split (T5c3a–T5c3d, frozen v0.3.43)
 
@@ -8715,8 +8741,8 @@ belong to T5c3c's own spec freeze before implementation.
 T5c3b is `internal/sim` only. It MUST NOT import `store`,
 `persist`, pgx, sqlc output, `gateway`, `session`, or `proto`.
 No blocking work, no goroutines, no persistence, no wire
-behavior. It adds owner-local primitives that T5c3c/T5c3d later
-compose. Exact Go names may differ slightly where repository
+ behavior. It adds owner-local primitives that T5c3c1/T5c3c3/T5c3d later
+ compose. Exact Go names may differ slightly where repository
 naming strongly suggests another form, but there MUST be two
 distinct concepts: (1) quiesce while the async death operation
 is outstanding, (2) install already-accepted authoritative
@@ -8758,7 +8784,7 @@ otherwise unchanged resident player MAY be an exact idempotent
 no-op after the first call. Quiescence is a primitive, NOT the
 long-lived lifecycle gate: it introduces no `PlayerLifeState`,
 no dead/persisting enums, no permanent movement rejection, and
-no async-operation ownership. T5c3c owns the state machine
+ no async-operation ownership. T5c3c1 owns the state machine
 that prevents new gameplay from resuming while persistence is
 outstanding.
 
@@ -8766,8 +8792,8 @@ outstanding.
 values: `placement`, `PlayerVitals`,
 `PlayerVitalsRuntimeInputs`. It performs no world-content
 lookup, no newbie/Underworld decision, no T5a calculation, no
-persistence check, and no Store call. Binding caller contract:
-T5c3c/T5c3d may call this only after the supplied state has
+ persistence check, and no Store call. Binding caller contract:
+ T5c3c1/T5c3c3/T5c3d may call this only after the supplied state has
 become authoritative via successful critical persistence OR
 authoritative materialized-state reconciliation. T5c3b itself
 cannot verify PostgreSQL acceptance.
@@ -8865,6 +8891,260 @@ anchored now, movement stopped, history empty, identity
 preserved. No intermediate public state exists where only
 relocation or only vitals installed; the single-owner model
 is the atomicity boundary.
+
+v0.3.45 note: T5c3c1 (new §9.5.1f) composes these two primitives
+into an owner-local lifecycle gate with attempt correlation. T5c3c1
+does NOT construct `store.DeathEntryRequest`, performs no
+Store/persist call, and defers the complete immutable
+persistence-content capture to T5c3c2 (see §9.5.1f). `meridian59.md`
+is untouched by that split.
+
+#### 9.5.1f M5 immediate-death lifecycle split (T5c3c1–T5c3c3, frozen v0.3.45)
+
+The former single T5c3c combined three different correctness
+boundaries that are not safely implementable as one patch:
+owner-local player lifecycle/gating/correlation; capture of the
+COMPLETE immutable death persistence content and mapping of
+sim-domain state to Store-domain requests; bounded off-owner
+`CommitDeathEntry`/recovery execution with typed completion back to
+the sim owner. It is therefore split into T5c3c1+T5c3c2+T5c3c3.
+This section refines (and, where it names T5c3c, supersedes) the
+T5c3c paragraph of §9.5.1d; §9.5.1d stays otherwise frozen.
+
+Verified repository facts motivating the split: the live sim player
+owns `EntityID`, `CharacterID`, `PlayerVitals`,
+`PlayerVitalsRuntimeInputs`, and movement/runtime metadata, but NOT
+the full Store `CharacterSnapshot` or complete item aggregate
+state; `persist.CommitDeathEntry` requires a COMPLETE
+`store.CharacterSnapshot` plus zero or more complete
+`store.ItemSnapshot` values; the Saver may hold newer unsaved
+in-memory snapshots. An off-owner worker therefore MUST NOT simply
+reload an older PG `CharacterSnapshot` and treat it as the complete
+current gameplay state. The authoritative complete death capture
+boundary is frozen separately in T5c3c2. A second missing boundary:
+`PlayerQuiesceForDeath` is deliberately only a primitive — after
+quiesce, `SubmitMove` and the ordinary `Player*` mutation APIs can
+be invoked again because no long-lived death lifecycle gate
+exists. T5c3c1 fixes ONLY that second problem.
+
+T5c3c1 — immediate-death lifecycle gate + attempt correlation
+(`internal/sim` only; depends on T5c3a + T5c3b). Owns the explicit
+player life-state gate, one correlated immediate-death persistence
+attempt at a time, the owner-local begin-death transition, the
+correlated owner-local post-death completion/install wrapper,
+mutation/input rejection while death is in progress or awaiting
+respawn, and retry-safe duplicate completion handling. It does NOT
+own T5a immediate plan composition, double-death time calculation,
+complete durable Character/Item capture, Store-domain types, the
+Saver, `CommitDeathEntry`, PG, workers/goroutines, completion
+ingress, zero-HP automatic dispatch, or gateway/protocol.
+
+Player life states (sim-domain lifecycle enum, conceptually):
+
+```go
+type PlayerLifeState uint8
+
+const (
+    PlayerLifeAlive PlayerLifeState = iota
+    PlayerLifeDeathPersisting
+    PlayerLifeAwaitingRespawn
+)
+```
+
+Exact Go names may differ slightly. Binding meanings: `Alive` is
+normal gameplay (mutations/input accepted); `DeathPersisting`
+means a real death has been owner-accepted for async persistence —
+the entity is quiesced and critical persistence/recovery has not
+yet been accepted back by the owner; `AwaitingRespawn` means
+authoritative post-death placement/vitals have been installed but
+the transport/gameplay respawn-release phase has not yet
+completed. `C->S 120 respawn_ack` semantics remain T5c4: T5c3c1
+MUST NOT add a transition out of `AwaitingRespawn`, and provides
+no `PlayerConfirmRespawn`/`PlayerBecomeAliveAgain`/`UnderworldEnter`/
+opcode-120 handler. T5c3d may later add an Underworld-specific life
+state if needed. Generic entities do not participate in this state
+machine. The enum is ephemeral: never persisted, never sent on the
+wire.
+
+Initial state: every successfully created/attached player starts
+`PlayerLifeAlive`. Generic entities have no meaningful player life
+state. Character handoff preserves life state because the SAME
+entity object moves. Removal discards it with the entity.
+
+Stable errors (naming may follow repository convention; match via
+`errors.Is`):
+
+```go
+ErrPlayerNotAlive
+ErrPlayerNotDead
+ErrDeathAttemptMismatch
+ErrDeathAttemptExhausted
+```
+
+`ErrPlayerNotAlive`: an ordinary gameplay mutation/input targeted a
+player whose state is `DeathPersisting` or `AwaitingRespawn`.
+`ErrPlayerNotDead`: begin-death was requested while authoritative
+HP != 0. `ErrDeathAttemptMismatch`: a completion token does not
+match the entity's current character/epoch/state.
+`ErrDeathAttemptExhausted`: the attempt epoch cannot advance
+without wrapping. The existing `ErrEntityNotPlayer`,
+`ErrEntityNotFound`, and `ErrCellHandoffRequired` are NOT
+overloaded for these conditions.
+
+Attempt correlation token (plain immutable value, conceptually):
+
+```go
+type DeathAttemptToken struct {
+    EntityID    EntityID
+    CharacterID CharacterID
+    Epoch       uint64
+}
+```
+
+Rules: `EntityID != 0`, `CharacterID > 0`, `Epoch > 0`. The epoch
+is ephemeral, per entity, never persisted, never sent on the wire.
+It is NOT an `OpID`, `NetEntityID`, Store revision, or session ID.
+Each successfully begun real-death persistence attempt increments
+the entity's epoch exactly once. No wrap: `MaxUint64` yields
+`ErrDeathAttemptExhausted` with zero mutation. The token exists
+solely so a late/duplicate off-owner completion can never apply to
+the wrong death attempt.
+
+Raw-vs-active player resolution: the current `resolvePlayer`
+behavior is split into the resident player regardless of
+`PlayerLifeState` (conceptually `resolvePlayerAnyLife`) and the
+ordinary gameplay-mutable `Alive` player (conceptually
+`resolveActivePlayer`); exact private names may differ. Binding:
+T5c3b lifecycle primitives may resolve the resident player
+regardless of life state; ordinary `Player*` gameplay mutation APIs
+require `PlayerLifeAlive`. `PlayerVitalsOf`,
+`PlayerVitalsRuntimeOf`, `Entity`, and `History` inspection stays
+allowed while a player is locked.
+
+Begin-death owner transition (conceptually
+`PlayerBeginDeathPersistence(id EntityID) (DeathAttemptToken,
+error)`; NOT the T5a planner or zero-HP automatic dispatch).
+Preconditions, in this order: entity exists; entity is a RESIDENT
+player; life state == `Alive`; `vitals.HP == 0`; death epoch can
+increment. Failure is zero mutation. `MIGRATING` uses the existing
+`ErrCellHandoffRequired`; non-`Alive` uses `ErrPlayerNotAlive`;
+HP != 0 uses `ErrPlayerNotDead`. On success, in the SAME owner
+turn: invoke the existing `PlayerQuiesceForDeath` semantics,
+increment the death epoch exactly once, set life state =
+`DeathPersisting`, and return the exact token. The successful
+transition preserves every T5c3b quiesce invariant. No persistence
+call, no goroutine, no sink invocation, no T5a planner, no wall
+clock.
+
+Ordinary gameplay gate: while a player is `DeathPersisting` or
+`AwaitingRespawn`, ordinary player gameplay mutation/input is
+rejected before mutation with `ErrPlayerNotAlive`. At minimum this
+applies to `SubmitMove`/`EnqueueMove`, `SetPosition` when the
+target is a player, all ordinary owner-local `PlayerVitals`
+mutation families, `PlayerSetVitalsRuntimeInputs`,
+`PlayerStartResting`, and `PlayerStopResting`. Inspection stays
+allowed; `RemoveEntity` stays allowed; generic entities remain
+unchanged. The future internal post-death install is NOT an
+ordinary gameplay mutation and uses the lifecycle-specific
+raw-player path. Validation ordering for locked players: once the
+player is resolved as locked, reject before consuming a new
+movement `InputSeq` or mutating any gameplay state; sequence
+anchors are neither cleared nor advanced on rejected input.
+
+Step behavior while `DeathPersisting`: `PlayerBeginDeathPersistence`
+has already canceled health, mana, rest, and movement controls, so
+a `DeathPersisting` player MUST remain quiescent across normal
+`Step()` calls — no translation, no newly-created vitals deadlines,
+no vitals mutation. Normal tick-end history sampling MAY continue
+at the unchanged position; T5c3b resets history when authoritative
+post-death placement installs. No second timer system is created.
+
+`AwaitingRespawn` runtime behavior: after authoritative post-death
+installation, T5c3b intentionally creates new Health/Mana
+deadlines. `AwaitingRespawn` therefore blocks external ordinary
+gameplay input/mutation, but the existing internal deterministic
+health/mana runtime MAY continue. Rest remains absent unless a
+future valid gameplay transition starts it after respawn release.
+T4b2 internal deadline processing is NOT suppressed merely because
+the state is `AwaitingRespawn`. Movement stays stopped because
+current controls are clear and new `SubmitMove` is rejected.
+
+Correlated authoritative completion wrapper (conceptually
+`PlayerAcceptPostDeathState(token DeathAttemptToken, placement
+world.Vec3, vitals PlayerVitals, runtimeInputs
+PlayerVitalsRuntimeInputs) (EntitySnapshot,
+DeathCompletionDisposition, error)` with `DeathCompletionApplied` /
+`DeathCompletionDuplicate`; exact naming may differ). This wrapper
+is the future T5c3c3 typed-completion target. It MUST NOT perform
+persistence. Validation: the entity named by the token exists, is a
+player, `token.CharacterID` matches the live `CharacterID`, and
+`token.Epoch` matches the current death epoch. First valid
+completion requires life state == `DeathPersisting`, then calls the
+EXISTING `PlayerInstallPostDeathState`: on success life state ->
+`AwaitingRespawn` with the installed `EntitySnapshot` and
+`DeathCompletionApplied`; on install failure life state REMAINS
+`DeathPersisting`, the attempt token REMAINS current/valid, the
+entity remains in the T5c3b guaranteed rollback/quiesced state, and
+the install error returns (never a silent transition back to
+`Alive`). Duplicate completion — same `EntityID`, same
+`CharacterID`, same epoch, life state == `AwaitingRespawn` — is a
+retry/redelivery of the already-applied attempt: return
+`DeathCompletionDuplicate` with the current `EntitySnapshot` and
+nil error with ABSOLUTELY ZERO mutation (no relocate, no history
+reset, no stomach re-anchor, no health/mana deadline restart, no
+generation change, no second observer event). Stale/mismatched
+completion (wrong `CharacterID`, wrong epoch, or incompatible
+state) yields `ErrDeathAttemptMismatch` with zero mutation.
+
+Removal / ABA rule: `EntityID`s are never reused. If a player is
+removed while `DeathPersisting`, the entity and its death epoch
+disappear normally and the `CharacterID` binding is freed per
+T5c3a. A later new entity for the same `CharacterID` gets a fresh
+`EntityID`. A late completion carrying the OLD token MUST NOT
+affect the new entity: it returns `ErrEntityNotFound` for the old
+`EntityID`. No `CharacterID`-only fallback lookup is allowed for
+completion application.
+
+No respawn release yet: T5c3c1 deliberately provides NO
+respawn-release transition. A successfully completed real death
+remains `PlayerLifeAwaitingRespawn`. T5c4/T5c3d own the later
+route-specific release semantics.
+
+Complete-state persistence gap — frozen, NOT solved: T5c3c1 does
+NOT construct `store.DeathEntryRequest`. The repository holds live
+sim state (`CharacterID` + `PlayerVitals` + ephemeral runtime)
+while the persist death transaction requires the complete
+`CharacterSnapshot` + complete participating `ItemSnapshot`s.
+T5c3c2 MUST solve this by freezing a COMPLETE immutable
+store-independent capture from authoritative current in-memory
+gameplay state. Forbidden T5c3c2 shortcut: loading the old
+materialized PG root and treating it as the current complete
+gameplay snapshot when newer unsaved in-memory state may exist. The
+solution is NOT implemented in T5c3c1.
+
+T5c3c2 — complete immutable immediate-death capture +
+Store-domain persistence mapping (depends on T5c3c1 + T5a + T5c2b).
+Owns the still-missing complete immutable persistence-content
+boundary: the complete current character aggregate content required
+by death, the complete affected item aggregate content, mapping T5a
+plans onto that captured content, and the sim-domain →
+Store-domain mapping inside `internal/persist`. Binding
+constraints: no `store` import in `sim`, no re-reading older PG
+state while silently discarding newer in-memory state, no exposure
+of raw sim `CriticalSetWrite`. The exact capture API is
+deliberately deferred to T5c3c2's own pre-implementation
+audit/spec freeze; it is NOT invented in T5c3c1.
+
+T5c3c3 — bounded off-owner death persistence/recovery + zero-HP
+orchestration + typed owner completion (depends on T5c3c1 + T5c3c2
++ T5c2a + T5c2b). Owns bounded off-owner persistence execution (no
+goroutine-per-death), `persist.CommitDeathEntry`, explicit T5c2a
+recovery on stale/ambiguous results (no blind replay), typed
+completion through sim owner ingress, zero-HP/T5a immediate-death
+orchestration, and owner-only accepted/recovered final-state
+installation. The exact bounded worker/request shapes deferred by
+§9.5.1d's future off-owner execution rule belong to T5c3c3's own
+spec freeze before implementation. No gateway/protocol.
 
 #### 9.5.2 Death disposition: avoided vs cheap vs normal (frozen)
 
@@ -9336,7 +9616,7 @@ naturally. `WriteCriticalSet` execution-time revision injection,
 the result-visibility fence, and explicit reconciliation are
 unchanged; no special Saver path, no automatic recovery.
 
-T5c3a/T5c3b/T5c3c/T5c3d/T5c4 remain blocked: no `CharacterID`
+ T5c3a/T5c3b/T5c3c1/T5c3c2/T5c3c3/T5c3d/T5c4 remain blocked: no `CharacterID`
 runtime binding, death lifecycle state, respawn, Underworld
 runtime, placement mutation, zero-HP orchestration, gateway,
 opcode 120, or 214/215 work belongs in this fix.
@@ -9608,12 +9888,12 @@ early-return takes precedence so it is not over-constrained.
 No RID_UNDERWORLD, no Meridian row/column coordinates, no invented
 Voxilian coordinates in T5 tasks. Newbie-range deaths respawn at the
 resolved newbie-home placement; other deaths at the resolved
-Underworld-placement seam; both are T5c3b live-integration inputs (M10-T2b
-authors the real classic Underworld source). T5a performs NO world
-lookup. The newbie-home route enters no Underworld and creates no
-durable pending-death state (§9.5.8b); T5c3b owns the owner-local
-placement primitives over resolved `world.Vec3` (no hard-coded
-coordinates); T5c3c/T5c3d/T5c4 remain blocked.
+ Underworld-placement seam; both are T5c3b live-integration inputs (M10-T2b
+ authors the real classic Underworld source). T5a performs NO world
+ lookup. The newbie-home route enters no Underworld and creates no
+ durable pending-death state (§9.5.8b); T5c3b owns the owner-local
+ placement primitives over resolved `world.Vec3` (no hard-coded
+ coordinates); T5c3c1/T5c3c2/T5c3c3/T5c3d/T5c4 remain blocked.
 
 #### 9.5.16 Wire ownership (unchanged)
 
@@ -9826,6 +10106,41 @@ impossible plans).
    survives it.
 
 ## 14. Version history
+
+- v0.3.45: freeze M5 immediate-death lifecycle split (docs only; no
+  schema/query/code change). Split the former single T5c3c into
+  T5c3c1 (immediate-death lifecycle gate + attempt correlation,
+  `internal/sim` only, depends on T5c3a + T5c3b) + T5c3c2 (complete
+  immutable immediate-death capture + Store-domain persistence
+  mapping, depends on T5c3c1 + T5a + T5c2b; exact capture API
+  deferred to its own pre-implementation audit) + T5c3c3 (bounded
+  off-owner death persistence/recovery + zero-HP orchestration +
+  typed owner completion, depends on T5c3c1 + T5c3c2 + T5c2a +
+  T5c2b); new §9.5.1f freezes the `PlayerLifeState`
+  (`Alive`/`DeathPersisting`/`AwaitingRespawn`, no respawn release
+  in T5c3c1) + initial-Alive/handoff-preservation/removal rules +
+  stable errors (`ErrPlayerNotAlive`/`ErrPlayerNotDead`/
+  `ErrDeathAttemptMismatch`/`ErrDeathAttemptExhausted`) +
+  per-entity ephemeral `DeathAttemptToken` epoch +
+  raw-vs-active player resolution split + owner-local begin-death
+  (`PlayerQuiesceForDeath` composition, epoch increment,
+  `DeathPersisting` transition) + ordinary gameplay gates
+  (`SubmitMove`/`EnqueueMove`, player `SetPosition`, `Player*`
+  mutation families, runtime inputs, rest) + `DeathPersisting`
+  `Step` quiescence + `AwaitingRespawn` internal-regen rule +
+  correlated completion wrapper (applied vs zero-mutation
+  duplicate, failed install keeps the attempt live) + removal/ABA
+  rule + the complete-state persistence gap (T5c3c1 constructs NO
+  `store.DeathEntryRequest`; re-reading older PG state over newer
+  in-memory state is forbidden). M5-T5 is now FIFTEEN tasks;
+  T5c3d now depends on T5c3c1+T5c3c2+T5c3c3+T5b2a+T5b2b+T5c2a+
+  T5c2b; T5c4 now depends on
+  T5c3a+T5c3b+T5c3c1+T5c3c2+T5c3c3+T5c3d + the M4
+  gateway/presence/fanout foundation (revised §9.5.1, §9.5.15
+  pointer, v0.3.45 note in §9.5.1e). `meridian59.md` untouched.
+  Checkbox state unchanged: T5a/T5b1a/T5b1b/T5b2a/T5b2b/T5c1/
+  T5c2a/T5c2b/T5c3a/T5c3b `[x]`,
+  T5c3c1/T5c3c2/T5c3c3/T5c3d/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v0.3.44: freeze M5 death-safe runtime transition primitives
   (docs only; no schema/query/code change). Correct the

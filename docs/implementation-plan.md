@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.28)
+# Voxilian Backend — Implementation Plan (v1.29)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.44).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.45).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -352,18 +352,51 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   state. No PG/persist/store/gateway/proto work. Spec: §9.5.1d +
   §9.5.1e (frozen T5c3b API + `NewVigor` source correction:
   post-death rest stays absent).
-- [ ] **M5-T5c3c** Immediate-death async persistence/reconciliation
-  state machine (depends on T5c3a + T5c3b + T5a + T5c2a + T5c2b;
-  `internal/sim` + `internal/persist`): zero-HP handoff, T5a
-  immediate-plan composition, participant freeze/serialize, non-blocking
-  off-owner handoff using the existing `persist.CommitDeathEntry`,
-  typed owner-ingress completion, T5c2a recovery (no blind replay),
-  owner-only live-state installation, correct newbie-home no-pending
-  vs Underworld-bound pending paths. Off-owner persistence MUST NOT
-  mutate sim entities directly. No gateway/protocol work.
-  Spec: §9.5.1, §9.5.1d.
+- [ ] **M5-T5c3c1** Immediate-death lifecycle gate + attempt
+  correlation (depends on T5c3a + T5c3b; `internal/sim` only):
+  explicit player life-state gate (`Alive` / `DeathPersisting` /
+  `AwaitingRespawn`), one correlated immediate-death persistence
+  attempt at a time (per-entity ephemeral epoch + immutable
+  `DeathAttemptToken`), owner-local begin-death transition over the
+  existing `PlayerQuiesceForDeath` semantics, correlated
+  owner-local post-death completion/install wrapper over the
+  existing `PlayerInstallPostDeathState` (applied vs
+  duplicate-idempotent), ordinary gameplay mutation/input rejection
+  while death is in progress or awaiting respawn, retry-safe
+  duplicate completion handling. No T5a plan composition, no
+  double-death time calculation, no complete Character/Item
+  capture, no Store-domain types, no Saver, no `CommitDeathEntry`,
+  no PG, no workers/goroutines, no completion ingress, no zero-HP
+  automatic dispatch, no gateway/protocol work.
+  Spec: §9.5.1, §9.5.1f.
+- [ ] **M5-T5c3c2** Complete immutable immediate-death capture +
+  Store-domain persistence mapping (depends on T5c3c1 + T5a +
+  T5c2b): the complete immutable store-independent sim-domain
+  capture sufficient to build the complete
+  `store.DeathEntryRequest` (complete current character aggregate
+  content + complete affected item aggregate content, T5a plans
+  mapped onto that captured content, sim-domain → Store-domain
+  mapping inside `internal/persist`) without importing `store`
+  into `sim`, without re-reading older PG state over newer
+  in-memory state, and without exposing raw sim
+  `CriticalSetWrite`. Exact capture API deferred to its own
+  pre-implementation audit/spec freeze.
+  Spec: §9.5.1, §9.5.1f.
+- [ ] **M5-T5c3c3** Bounded off-owner death persistence/recovery +
+  zero-HP orchestration + typed owner completion (depends on
+  T5c3c1 + T5c3c2 + T5c2a + T5c2b; `internal/sim` +
+  `internal/persist`): bounded off-owner persistence execution (no
+  goroutine-per-death) using the existing
+  `persist.CommitDeathEntry`, T5c2a recovery on stale/ambiguous
+  results (no blind replay), typed owner-ingress completion,
+  zero-HP/T5a immediate-death orchestration, owner-only
+  accepted/recovered live-state installation, correct
+  newbie-home no-pending vs Underworld-bound pending paths.
+  Off-owner persistence MUST NOT mutate sim entities directly. No
+  gateway/protocol work.
+  Spec: §9.5.1, §9.5.1f.
 - [ ] **M5-T5c3d** Pending-death / Portal / Underworld-exit async
-  lifecycle (depends on T5c3c + T5b2a + T5b2b + T5c2a + T5c2b;
+  lifecycle (depends on T5c3c1 + T5c3c2 + T5c3c3 + T5b2a + T5b2b + T5c2a + T5c2b;
   `internal/sim` + `internal/persist`): recovered pending-death
   lifecycle, Portal-of-Life runtime transition (pure T5a planner +
   `persist.CommitPortalOfLife`), authoritative Underworld EXIT
@@ -375,7 +408,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   T5c3d owns "player actually leaves the Underworld").
   Spec: §9.5.1, §9.5.1d.
 - [ ] **M5-T5c4** Gateway death wire/state integration + reconnect E2E
-  (depends on T5c3a + T5c3b + T5c3c + T5c3d + the existing M4
+  (depends on T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3 + T5c3d + the existing M4
   gateway/presence/fanout foundation): gateway/state-machine routing, rate-gated C→S 120
   handling, critical S→C 214 / 215 delivery,
   session/Presence/NetEntityID composition, reconnect/end-to-end
@@ -384,7 +417,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
 - [ ] **M5-T6** Personal/world-light intents: `115 rest`, `116 eat` (hunger/vigor effects), `105 use` (skill/item dispatch incl. Second Wind), `119 safety_toggle`, `117/118 → 209` chat (+channel rules, length caps, rate limits). Owner of these opcodes: this task, no other. Spec: §6.3, §9.
 - [ ] **M5-T7** Authoritative attack/cast runtime integration (depends on
   M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a,   M5-T4b1, M5-T4b2,
-  M5-T5-complete (T5a+T5b1a+T5b1b+T5b2a+T5b2b+T5c1+T5c2a+T5c2b+T5c3a+T5c3b+T5c3c+T5c3d+T5c4), M5-T6). Owns real C→S 103
+  M5-T5-complete (T5a+T5b1a+T5b1b+T5b2a+T5b2b+T5c1+T5c2a+T5c2b+T5c3a+T5c3b+T5c3c1+T5c3c2+T5c3c3+T5c3d+T5c4), M5-T6). Owns real C→S 103
   attack routing, real C→S 104 cast routing, typed sim-owner combat
   commands, composition of T1/T2/T3a/T3b mechanics, authoritative T4
   HP/mana/vigor mutation, T5 death handoff, T6 safety/personal-state
@@ -510,11 +543,12 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M5-T5c2b | M5-T5c1, M5-T5c2a + existing M5-T5b1b/T5b2a/T5b2b Store transactions | `backend/voxilian/internal/persist` (critical death write adapters via `Saver.WriteCriticalSet`) |
 | M5-T5c3a | T4b1/T4b2 value domains (no Store/persist/gateway work) | `backend/voxilian/internal/sim` (player runtime identity + typed owner ingress) |
 | M5-T5c3b | M5-T5c3a, M5-T5a, M5-T4b2 | `backend/voxilian/internal/sim` (death-safe relocation + runtime quiesce/reinitialization; no PG/persist/store/gateway/proto) |
-| M5-T5c3c | M5-T5c3a, M5-T5c3b, M5-T5a, M5-T5c2a, M5-T5c2b | `backend/voxilian/internal/sim` + `internal/persist` (immediate-death async persistence/reconciliation; off-owner execution, typed owner completion) |
-| M5-T5c3d | M5-T5c3c, M5-T5b2a, M5-T5b2b, M5-T5c2a, M5-T5c2b | `backend/voxilian/internal/sim` + `internal/persist` (pending-death / Portal / Underworld-exit async lifecycle) |
-| M5-T5c4 | M5-T5c3a, M5-T5c3b, M5-T5c3c, M5-T5c3d + existing M4 gateway/presence/fanout foundation | `backend/voxilian/internal/{sim,gateway}` (death wire/state integration + reconnect E2E, existing 120/214/215 codecs) |
-| M5-T6 | M4-T1, M4-T2 | `backend/voxilian/internal/sim` + gateway only for its own listed personal intents |
-| M5-T7 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2, M5-T5a, M5-T5b1a, M5-T5b1b, M5-T5b2a, M5-T5b2b, M5-T5c1, M5-T5c2a, M5-T5c2b, M5-T5c3a, M5-T5c3b, M5-T5c3c, M5-T5c3d, M5-T5c4, M5-T6 | `backend/voxilian/internal/{sim,gateway}` (authoritative 103/104 runtime integration) |
+| M5-T5c3c1 | M5-T5c3a, M5-T5c3b | `backend/voxilian/internal/sim` (immediate-death lifecycle gate + attempt correlation; no Store/persist/PG/gateway/proto/T5a-composition work) |
+| M5-T5c3c2 | M5-T5c3c1, M5-T5a, M5-T5c2b | `backend/voxilian/internal/sim` (store-independent capture) + `internal/persist` (Store-domain mapping; no new migration unless audit requires) |
+| M5-T5c3c3 | M5-T5c3c1, M5-T5c3c2, M5-T5c2a, M5-T5c2b | `backend/voxilian/internal/sim` + `internal/persist` (bounded off-owner `CommitDeathEntry` execution, T5c2a recovery, typed owner completion, zero-HP orchestration) |
+| M5-T5c3d | M5-T5c3c1, M5-T5c3c2, M5-T5c3c3, M5-T5b2a, M5-T5b2b, M5-T5c2a, M5-T5c2b | `backend/voxilian/internal/sim` + `internal/persist` (pending-death / Portal / Underworld-exit async lifecycle) |
+| M5-T5c4 | M5-T5c3a, M5-T5c3b, M5-T5c3c1, M5-T5c3c2, M5-T5c3c3, M5-T5c3d + existing M4 gateway/presence/fanout foundation | `backend/voxilian/internal/{sim,gateway}` (death wire/state integration + reconnect E2E, existing 120/214/215 codecs) |
+| M5-T7 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2, M5-T5a, M5-T5b1a, M5-T5b1b, M5-T5b2a, M5-T5b2b, M5-T5c1, M5-T5c2a, M5-T5c2b, M5-T5c3a, M5-T5c3b, M5-T5c3c1, M5-T5c3c2, M5-T5c3c3, M5-T5c3d, M5-T5c4, M5-T6 | `backend/voxilian/internal/{sim,gateway}` (authoritative 103/104 runtime integration) |
 | M6-T1…T3 | M5-T1…T5 | `backend/voxilian/internal/sim` (progression) |
 | M7-T1 | M9-T1 (seed pipeline) + M1-T6b | `backend/voxilian/internal/sim`, `seed/` fixtures |
 | M7-T2a…c, T3, T4 | M4-T1…T3a, M1-T7b | `backend/voxilian/internal/sim` |
@@ -544,6 +578,35 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.29: freeze M5 immediate-death lifecycle split (docs only,
+  spec v0.3.45 new §9.5.1f; split only): replace the single
+  M5-T5c3c with T5c3c1 (immediate-death lifecycle gate + attempt
+  correlation, `internal/sim` only; depends on T5c3a + T5c3b; no
+  T5a composition, no durable capture, no Store/persist/PG,
+  no workers, no completion ingress, no zero-HP dispatch, no
+  gateway/proto) + T5c3c2 (complete immutable immediate-death
+  capture + Store-domain persistence mapping; depends on T5c3c1 +
+  T5a + T5c2b; exact capture API deferred to its own
+  pre-implementation audit; re-reading older PG state over newer
+  in-memory state is forbidden) + T5c3c3 (bounded off-owner death
+  persistence/recovery + zero-HP orchestration + typed owner
+  completion; depends on T5c3c1 + T5c3c2 + T5c2a + T5c2b; no
+  goroutine-per-death, no blind replay); T5c3d now depends on
+  T5c3c1 + T5c3c2 + T5c3c3 + T5b2a + T5b2b + T5c2a + T5c2b; T5c4
+  now depends on T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3 + T5c3d
+  + the existing M4 gateway/presence/fanout foundation;
+  M5-T5-complete is now
+  T5a+T5b1a+T5b1b+T5b2a+T5b2b+T5c1+T5c2a+T5c2b+T5c3a+T5c3b+T5c3c1+
+  T5c3c2+T5c3c3+T5c3d+T5c4 (FIFTEEN T5 tasks); M5-T7 depends on
+  the new complete T5 set; §9.5.1f also freezes the
+  `PlayerLifeState` gate, the ephemeral `DeathAttemptToken`
+  epoch, the raw-vs-active resolver split, the owner-local
+  begin/completion transitions, the ordinary gameplay gates, and
+  the complete-state persistence gap (T5c3c1 constructs NO
+  `store.DeathEntryRequest`). Checkbox state unchanged:
+  T5a/T5b1a/T5b1b/T5b2a/T5b2b/T5c1/T5c2a/T5c2b/T5c3a/T5c3b `[x]`,
+  T5c3c1/T5c3c2/T5c3c3/T5c3d/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v1.28: freeze M5 death-safe runtime transition primitives
   (docs only, spec v0.3.44 new §9.5.1e; no scope or
