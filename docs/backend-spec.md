@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.48 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.49 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -7971,8 +7971,9 @@ the former single T5c is split into T5c1–T5c4, frozen v0.3.39 in
 v0.3.40 in §9.5.1b, T5c3 is further split into
 T5c3a+T5c3b+T5c3c+T5c3d, frozen v0.3.43 in §9.5.1d, T5c3c is
 further split into T5c3c1+T5c3c2+T5c3c3, frozen v0.3.45 in
-§9.5.1f, and T5c3c3 is further split into
-T5c3c3a+T5c3c3b+T5c3c3c, frozen v0.3.48 in §9.5.1h):
+§9.5.1f, T5c3c3 is further split into
+T5c3c3a+T5c3c3b+T5c3c3c, frozen v0.3.48 in §9.5.1h, and the
+c3c3b recovery contract is frozen v0.3.49 in §9.5.1h):
 
 - **T5a — pure/source-faithful death mechanics and immutable plans**
   (§9.5.4–§9.5.14 pure surface; §9.5.17 non-scope).
@@ -8079,12 +8080,14 @@ T5c3c3a+T5c3c3b+T5c3c3c, frozen v0.3.48 in §9.5.1h):
   PG, no recovery, no worker, no zero-HP dispatch, no
   gateway/protocol.
 - **T5c3c3b — bounded off-owner CommitDeathEntry + materialized
-  recovery executor** (§9.5.1h, future): bounded off-owner
+  recovery executor** (§9.5.1h, frozen v0.3.49): bounded off-owner
   execution (no goroutine-per-death) of
-  `persist.CommitDeathEntry`, explicit T5c2a character +
-  affected-item recovery on stale/ambiguous results (no blind
-  replay), reconciliation of every Saver participant, and
-  construction of the authoritative c3c3a completion value with
+  `persist.CommitDeathEntry`, exact callback expected-revision
+  observation, explicit T5c2a character + affected-item recovery
+  on stale/ambiguous results (no blind replay), reconciliation of
+  every Saver participant, conservative exact-`expected+1` plus
+  semantic content proof before any completion, and construction
+  of the authoritative c3c3a completion value with
   retry/redelivery of the typed owner completion when owner
   ingress is temporarily unavailable. Depends on T5c3c3a +
   T5c2a + T5c2b. A persistence worker MUST NEVER mutate a live
@@ -9777,6 +9780,327 @@ must compose so queue saturation cannot strand a player in
 exact reservation/submission API belongs to c3c3c's own
 freeze.
 
+T5c3c3b — bounded off-owner `CommitDeathEntry` + proven
+materialized recovery executor (frozen v0.3.49; `internal/persist`
+plus only the narrow sim support required by the already-frozen
+reconciliation/revision APIs; depends on T5c3c3a + T5c2a +
+T5c2b). This freeze is the normative recovery contract; Phase B
+implements exactly it. `meridian59.md` is untouched.
+
+Core correctness rule (binding): a failed / ambiguous
+`persist.CommitDeathEntry` MUST NEVER be blindly replayed.
+Recovery distinguishes: (A) successful normal acknowledgement;
+(B) transaction committed but acknowledgement lost; (C)
+transaction did NOT commit / stale / semantic conflict /
+materially different newer PG state; (D) recovery itself
+failed. Only A and a PROVEN B may produce a
+`sim.ImmediateDeathCompletion` for the sim owner. C and D MUST
+NOT replay `CommitDeathEntry`, MUST NOT install the original
+planned post-death live state, MUST NOT guess, and MUST NOT
+transition the entity out of `DeathPersisting`. Fail closed.
+
+Executor boundary (binding): c3c3b lives primarily in
+`internal/persist` and may import `sim` + `store` as already
+allowed. It MUST NOT import `gateway`, `session`, or `proto`.
+No sim-owner PostgreSQL work: no Store / PG call may execute on
+the sim owner goroutine. No persistence worker may directly
+mutate a live sim entity.
+
+Fixed bounded execution (binding): one bounded
+death-persistence executor with a fixed worker count, a bounded
+job queue, NO goroutine per death, NO unbounded queue, NO
+unbounded completion queue, and explicit lifecycle / shutdown
+(prefer explicit `Run(ctx)` or another repository-consistent
+lifecycle where construction itself does not silently leak
+goroutines). Configuration MUST validate worker count > 0,
+queue capacity > 0, and required dependencies non-nil. Stable
+errors cover at least executor-not-running, executor-queue-full,
+and invalid work/config (exact names follow repository
+conventions). A simple bounded non-blocking submit surface for
+c3c3b testing is acceptable (conceptually `TrySubmit(work)
+(<-chan Result, error)`), but it is frozen here that T5c3c3c
+MUST NOT later use naive TrySubmit-after-begin semantics: its
+separate freeze will add/compose the capacity reservation needed
+BEFORE the irreversible `DeathPersisting` transition.
+
+Executor dependencies (binding): the executor owns stable
+process-level dependencies rather than putting them in every
+job — conceptually a `DeathExecutionStore` (`DeathPersistenceStore`
++ `DeathCharacterRecoveryLoader` + `DeathItemRecoveryLoader`,
+proven by `*store.PGStore` satisfying it), plus `*sim.Saver`
+and a typed completion sink conceptually equivalent to
+`EnqueueImmediateDeathCompletion(ctx,
+sim.ImmediateDeathCompletion) (sim.EntitySnapshot,
+sim.DeathCompletionDisposition, error)`, satisfied by
+`*sim.Engine`. No gateway dependency.
+
+Work input (binding): one submitted work item contains ONLY
+immutable/resolved state — conceptually `Capture
+sim.ImmediateDeathCapture` plus `RuntimeInputs
+sim.PlayerVitalsRuntimeInputs` supplied by future c3c3c. c3c3b
+validates the runtime inputs, freezes/copies them, and does NOT
+resolve/recalculate them. At submit time, before queue
+publication: `MapImmediateDeathCapture`, freeze the resulting
+Store request, freeze the future `ImmediateDeathCompletion`
+payload. Caller mutation after successful submission MUST NOT
+affect the job. The executor MUST NOT retain aliases to
+`Capture.Durable.Advancement`, `Spells`, `Skills`, `Items`,
+`Enchants`, or `AffectedItems`.
+
+Narrow sim clone support (binding, if needed): c3c3a's private
+freeze helper is unreachable from persist, so a minimal
+additive sim helper (conceptually
+`CloneImmediateDeathCompletion(...)` or equivalent) is allowed.
+It MUST deep-copy only, perform no entity mutation, perform no
+persistence, and preserve nil-vs-empty semantics consistently
+with existing c3c2 cloning. No mutable entity internals are
+exposed. Keep this sim change as small as possible.
+
+Observed commit adapter (binding): the existing public
+`persist.CommitDeathEntry(...)` API and ALL T5c2b behavior stay
+unchanged. An internal / narrowly exposed c3c3b helper executes
+the same critical operation while additionally recording the
+exact callback expected revisions — conceptually a
+`deathEntryExecution{ Result store.DeathEntryResult; Expected
+[]sim.AggregateRevision }`. `Expected` is populated ONLY from
+the actual `WriteCriticalSet` callback input; expected keys are
+copied by VALUE; no callback slice alias escapes; the result
+visibility fence is unchanged (on any `WriteCriticalSet`
+error, the Store result remains ZERO externally). The existing
+`CommitDeathEntry` preferably delegates to the same core so the
+transaction logic cannot drift. No second death Store
+transaction implementation is created; no raw
+`sim.CriticalSetWrite` is exposed to callers. Why exact
+callback revisions are required: `persist.CommitDeathEntry`
+executes via `sim.Saver.WriteCriticalSet` and injects
+participant revisions only INSIDE the critical callback, so a
+revision sampled before entering `WriteCriticalSet` is not
+sufficient — an older queued Saver write can advance the
+aggregate while the critical operation waits for the per-key
+gate. For recovery proof, participant `expected` means exactly
+the Saver-known persisted revision used by that Store
+transaction's CAS — never a pre-gate sample, capture-time
+revision, `ExpectedRevision=0` mapper placeholder, or
+`known+1` guessed outside the callback.
+
+Observation semantics (binding): callback never invoked
+(duplicate aggregate key, untracked participant, pre-cancel
+before write ownership, pre-callback Saver validation failure)
+=> `Expected` is nil/empty and no recovery proof using
+expected revisions is possible or necessary unless the
+existing Saver error already requires reconciliation. Callback
+invoked + success => `Expected` holds exactly the character
+root plus one item root per affected death-entry item in
+canonical critical-set participant identity. Callback invoked
++ error (stale CAS, semantic Store error reached inside the
+callback, lost acknowledgement / synthetic callback error) =>
+`Expected` is STILL retained for c3c3b recovery; exact
+expected revisions are never discarded merely because the
+callback returned an error.
+
+Normal success path (binding): on observed `CommitDeathEntry`
+success, do NOT reload PG, do NOT call `ReconcileSaver`, do NOT
+retry Store. Construct the authoritative completion from the
+already-frozen planned state (`Token` / `Placement` / `Vitals`
+/ `RuntimeInputs` / `Durable` from the capture) and deliver it
+through `EnqueueImmediateDeathCompletion`. The owner remains
+the ONLY live-state mutator.
+
+Recovery trigger (binding): c3c3b materialized recovery runs
+when and ONLY when the `CommitDeathEntry` error indicates the
+Saver participants require reconciliation (`errors.Is(err,
+sim.ErrSaverReconcileRequired)` — no string matching). An
+error occurring entirely before the critical callback /
+without a reconcile block returns the error with no PG reload
+and no completion delivery.
+
+Participant set (binding): for a reconciliation-required
+death-entry attempt, recover the character root AND every
+affected item root — never the character alone. Participant
+identity comes from the frozen Store request / observed exact
+critical-set keys. Item recovery order MUST be deterministic
+(ascending durable `ItemID`). Attempt recovery for every
+participant even if one fails where practical; return a
+deterministic joined error. A partially recovered participant
+set MUST NOT produce completion.
+
+Worker-local `ReconcileState` (binding): for each participant
+whose actual callback expected revision was `E`, construct a
+worker-local `sim.NewReconcileState(E)` — valid because `E` is
+the ACTUAL known persisted revision used by the critical
+callback, not a guess — then use the EXISTING T5c2a adapters
+`persist.DeathCharacterReload`, `persist.DeathItemReload`, and
+`persist.ReconcileSaver`. The `Apply` closures MUST write only
+into worker-local staged values, never into the Engine, an
+entity, the `PlayerDurableState` live pointer, or the
+registry. `ReconcileSaver` may update the worker-local
+`ReconcileState` and `sim.Saver` metadata; it may NOT update
+gameplay memory. After successful participant recovery,
+`Saver.ResolveReconciled` via the existing `ReconcileSaver`
+must have accepted the authoritative loaded revision (updating
+Saver known revision, clearing its reconcile block, dropping
+stale pre-recovery pending snapshots). No new Saver recovery
+mechanism is created and existing generic reconciliation
+semantics are not modified merely for death.
+
+Commit proof (binding, conservative): after EVERY participant
+has successfully materialized and reconciled, the original
+transaction is PROVEN committed only if, for EVERY
+participant, the recovered root revision equals exactly
+`callbackExpectedRevision + 1` — not `>= expected+1`. Rationale:
+`expected` means the original transaction did not advance this
+root; `expected+1` means exactly the one CAS advancement the
+attempted death transaction would have produced; `>
+expected+1` means another later/newer durable mutation exists
+and c3c3b cannot prove the original death result is the
+authoritative current state. If ANY participant is not exactly
+`expected+1`: the death commit is NOT proven — no completion,
+no retry. Revision equality alone is insufficient: recovered
+character content MUST semantically equal the frozen intended
+`store.CharacterSnapshot` excluding only `ExpectedRevision`
+(compare exactly `ID`, `Karma`, `PosX`/`PosY`/`PosZ`, `Flags`,
+`Spells`, `Skills`, Vitals JSON, Advancement JSON;
+spells/skills compare semantically by durable catalog ID —
+order-insensitive, duplicates rejected rather than hidden;
+JSON fields compare JSON SEMANTICS via decoded values /
+`json.Number`, never raw byte equality, because PostgreSQL
+JSONB may normalize whitespace/key order; unknown advancement
+keys remain significant). For each affected item, the
+recovered `ItemSnapshot` MUST equal the intended death-entry
+item snapshot excluding only `ExpectedRevision` (compare
+exactly `ID`, `Qty`, `Hits`, Enchants JSON semantics, and the
+complete `ItemLocationSnapshot` against the resolved ground
+position; pointer/value presence is significant: nil is not
+equal to a zero pointer, empty string pointer, or any
+ownership/container/vault/slot difference).
+
+Pending-death proof (binding): newbie-home direct respawn
+(frozen request `NewbieHomeRespawn == true`) requires
+`recovered.Pending == nil`. Every Underworld-bound real death
+(`NewbieHomeRespawn == false`) requires a non-nil pending row
+with exactly `CharacterID` == victim `CharacterID`,
+`EffectiveCost` == frozen request `EffectiveDeathCost`,
+`DeathTimeSeconds` == frozen request `DeathTimeSeconds`, and
+`PortalUsed == false`. `CorpseID` MUST NOT be used as a strict
+commit-proof identity: the pending row may outlive corpse
+expiry via `ON DELETE SET NULL`, so a nil recovered `CorpseID`
+is allowed and no corpse lookup/query is invented in
+production. The atomic Store transaction already guarantees
+that if the proven character/item transaction committed, its
+corpse/kill side effects committed with it.
+
+PK-protection treatment (binding): exact `ExpiresAt` equality
+is NOT a commit-proof requirement — the request carries a
+duration while materialized recovery carries an absolute
+timestamp. `PKProtectionDuration == 0` means "no new write",
+not "delete old protection": a recovered pre-existing
+protection row MUST NOT fail the proof on that ground alone.
+`PKProtectionDuration > 0` requires the recovered protection,
+if used for validation, to at least identify `ItemID` ==
+affected `ItemID` and `VictimCharacterID` == victim
+`CharacterID`. No correctness is derived from wall-clock
+equality; the item root's exact `expected+1` revision plus
+exact item content is the primary item commit proof.
+
+Proven lost-ack path (binding): if ALL participants satisfy
+revision exactly `expected+1`, exact intended materialized
+content, and the correct pending-death shape, the original
+transaction is PROVEN committed. Do NOT call
+`CommitDeathEntry` again. Construct the same authoritative
+completion from the frozen job state (`Token` / `Placement` /
+`Vitals` / `RuntimeInputs` / `Durable` — the original
+post-death `PlayerDurableState` remains the complete live
+shadow including unaffected inventory that was never a
+transaction participant) and deliver it through typed owner
+ingress.
+
+Unproven recovery sentinel (binding): a stable persist-domain
+sentinel (conceptually `ErrDeathCommitUnproven`, matched with
+`errors.Is`) is returned when recovery succeeded enough to
+reconcile Saver metadata but the materialized state does NOT
+prove the attempted death transaction committed (examples:
+character revision == expected, character revision >
+expected+1, item revision mismatch, character content
+mismatch, affected-item content mismatch, pending row
+mismatch). The original `CommitDeathEntry` error is wrapped as
+context where useful. Critical behavior: NO replay, NO owner
+completion, player remains `DeathPersisting`. Do NOT
+transition back Alive, do NOT synthesize a different death
+plan, do NOT merge the original plan over newer PG state.
+
+Recovery failure (binding): if any of
+`LoadDeathCharacterRecovery`, `LoadDeathItemRecovery`,
+`ReconcileSaver`, JSON comparison preparation, or
+materialized snapshot validation fails: no completion, no
+Store replay, return the error. Participants already
+successfully reconciled may remain reconciled; participants
+whose recovery failed remain blocked per existing generic
+semantics (no fake all-or-nothing in-memory metadata across
+independent recovery loads). The player remains
+`DeathPersisting` either way.
+
+Completion delivery (binding): after normal success OR proven
+lost-ack recovery, call `EnqueueImmediateDeathCompletion`. A
+nil-error `DeathCompletionApplied` is success; a nil-error
+`DeathCompletionDuplicate` is ALSO success (the expected
+idempotent redelivery result — no second live-state apply
+occurs). If delivery returns `sim.ErrSimIngressFull`, the
+persistence transaction is already authoritative: DO NOT
+repeat Store, DO NOT repeat PG recovery — retry/redeliver the
+SAME frozen `ImmediateDeathCompletion` on the same fixed
+worker with context-aware retry (no goroutine per retry, no
+unbounded retry queue; a small deterministic/injectable retry
+delay/backoff seam is acceptable; do NOT busy-spin). Do NOT
+indefinitely retry `ErrEngineNotRunning`,
+`ErrEngineStopped`, `ErrEntityNotFound`,
+`ErrDeathAttemptMismatch`, `ErrCellHandoffRequired`, or
+payload/install validation errors: return the delivery error
+with no `CharacterID` fallback lookup and no live-state
+mutation from the worker. The committed PG state remains
+authoritative for reconnect/restart recovery.
+
+Executor result (binding): each accepted work item has one
+definitive bounded result observable by tests/caller without
+requiring owner mutation — conceptually
+`ImmediateDeathPersistenceResult{ Recovered bool; Delivery
+sim.DeathCompletionDisposition; Err error }` (exact shape may
+differ; no mutable Store snapshots are exposed through the
+result). `Recovered=false` means normal `CommitDeathEntry`
+acknowledgement; `Recovered=true` means completion followed
+proven materialized recovery; `Err != nil` means no successful
+owner completion delivery. The result delivery channel MUST be
+buffered so workers never wait for the caller to receive.
+
+Executor shutdown (binding): on executor context
+cancellation, stop accepting new jobs; queued-but-not-started
+jobs receive a definitive shutdown error; running
+Store/recovery work receives the cancelled context; no waiter
+is stranded; no worker leaks. Completion after shutdown is not
+promised. Tests are deterministic without sleeps where
+possible.
+
+Compatibility (binding): no behavioral regression to
+`persist.CommitDeathEntry`, `persist.CommitPortalOfLife`,
+`persist.CommitDeathPenalties`, `DeathCharacterReload`,
+`DeathItemReload`, `ReconcileSaver`,
+`sim.Saver.WriteCriticalSet`, `sim.Saver.ResolveReconciled`,
+`sim.PlayerAcceptImmediateDeathCompletion`, or
+`sim.EnqueueImmediateDeathCompletion`. c3c3b composes them; it
+does not replace them.
+
+Non-scope (binding): no zero-HP automatic dispatch, no
+`PlayerLoseHealth` death routing, no double-death timestamp, no
+`DeathBlockedByDoubleDeath` live integration, no
+`DeathContext` resolution, no `PlanDeathDisposition` /
+`PlanDeathDrops` / `PlanDeathAdvancement` /
+`PlanPostDeathVitals` / `PlanImmediateDeathHooks`
+orchestration, no capacity reservation before
+`DeathPersisting` (T5c3c3c), no Portal, no Underworld exit, no
+death penalties (T5c3d), no gateway, no session, no Presence,
+no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
+(T5c4). No schema change, no migration, no SQL query, no sqlc
+generated change, no Store transaction redesign.
+
 #### 9.5.2 Death disposition: avoided vs cheap vs normal (frozen)
 
 Three dispositions, semantically distinct:
@@ -10782,6 +11106,40 @@ impossible plans).
    survives it.
 
 ## 14. Version history
+
+- v0.3.49: freeze M5 proven death persistence recovery
+  (docs only; no schema/query/code change). Freeze the c3c3b
+  recovery contract in §9.5.1h: the failed/ambiguous
+  `CommitDeathEntry` MUST NEVER be blindly replayed (only a
+  successful acknowledgement or a PROVEN lost-ack may produce a
+  sim completion; stale/conflict/newer-state/recovery-failure
+  stays fail-closed in `DeathPersisting`); exact callback
+  expected revisions observed from the actual
+  `WriteCriticalSet` callback input (never pre-gate samples,
+  placeholders, or guesses); recovery runs only on
+  `ErrSaverReconcileRequired`; every participant (character
+  root + every affected item root, deterministic ascending
+  `ItemID` order) recovers through worker-local
+  `NewReconcileState(E)` plus the existing
+  `DeathCharacterReload` / `DeathItemReload` / `ReconcileSaver`
+  with worker-local `Apply` closures; commit proof requires
+  every recovered root at exactly `expected+1` plus semantic
+  character/item content equality (JSON semantics, never raw
+  bytes; unknown advancement keys significant; pointer presence
+  significant), the exact newbie-home/Underworld pending-death
+  shape (`CorpseID` never a strict identity), and the frozen
+  PK-protection treatment; proven lost-ack delivers the frozen
+  c3c3a completion with NO Store replay; unproven recovery
+  returns the stable `ErrDeathCommitUnproven` sentinel with no
+  completion and no replay; `Applied` and idempotent
+  `Duplicate` are success; `ErrSimIngressFull` redelivers the
+  SAME frozen completion on bounded worker resources while
+  engine-stop/mismatch errors are terminal. Update the §9.5.1
+  ownership split and the T5c3c3b row to frozen v0.3.49.
+  `meridian59.md` untouched. Checkbox state unchanged:
+  T5a/T5b1a/T5b1b/T5b2a/T5b2b/T5c1/T5c2a/T5c2b/T5c3a/T5c3b/
+  T5c3c1/T5c3c2/T5c3c3a `[x]`,
+  T5c3c3b/T5c3c3c/T5c3d/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v0.3.48: freeze M5 immediate-death async completion split
   (docs only; no schema/query/code change). Split the former

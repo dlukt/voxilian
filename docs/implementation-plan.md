@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.32)
+# Voxilian Backend — Implementation Plan (v1.33)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.48).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.49).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -403,20 +403,26 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   no worker, no zero-HP dispatch, no gateway/protocol work.
   Spec: §9.5.1, §9.5.1h.
 - [ ] **M5-T5c3c3b** Bounded off-owner `CommitDeathEntry` +
-  materialized recovery executor (depends on T5c3c3a + T5c2a +
-  T5c2b; `internal/persist` + only the narrow sim support
-  required by the already-frozen reconciliation/revision APIs):
-  bounded off-owner execution (no goroutine-per-death) using the
-  existing `persist.CommitDeathEntry`, explicit T5c2a character
-  + affected-item recovery on stale/ambiguous results (no blind
+  proven materialized recovery executor (depends on T5c3c3a +
+  T5c2a + T5c2b; `internal/persist` + only the narrow sim
+  support required by the already-frozen
+  reconciliation/revision APIs; frozen v0.3.49 in §9.5.1h):
+  bounded off-owner execution (no goroutine-per-death) using
+  the existing `persist.CommitDeathEntry` with exact callback
+  expected-revision observation, explicit T5c2a character +
+  affected-item recovery on stale/ambiguous results (no blind
   replay), reconciliation of every Saver participant,
-  construction of the authoritative c3c3a completion value, and
-  retry/redelivery of the typed owner completion when owner
-  ingress is temporarily unavailable. A persistence worker MUST
-  NEVER mutate a live sim entity; live entity replacement occurs
-  ONLY through the typed c3c3a owner completion. The exact
-  recovery classification / staged-reconstruction algorithm is
-  deferred to this task's own pre-implementation audit.
+  conservative exact-`expected+1` plus semantic content proof
+  before any completion, construction of the authoritative
+  c3c3a completion value, and bounded retry/redelivery of the
+  typed owner completion when owner ingress is temporarily
+  unavailable (`ErrSimIngressFull` redelivery; engine-stop and
+  mismatch errors terminal; unproven recovery returns the
+  stable `ErrDeathCommitUnproven` sentinel fail-closed). A
+  persistence worker MUST NEVER mutate a live sim entity; live
+  entity replacement occurs ONLY through the typed c3c3a owner
+  completion. T5c3c3c MUST NOT later use naive
+  TrySubmit-after-begin semantics (separate reservation freeze).
   Spec: §9.5.1, §9.5.1h.
 - [ ] **M5-T5c3c3c** Zero-HP/T5a orchestration + double-death gate
   + bounded execution submission (depends on T5c3c3a + T5c3c3b +
@@ -616,6 +622,23 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.33: freeze M5 proven death persistence recovery (docs
+  only, spec v0.3.48 -> v0.3.49; no scope, dependency, or
+  checkbox change): freeze the c3c3b recovery contract in new
+  §9.5.1h text (no blind `CommitDeathEntry` replay; exact
+  callback expected revisions; `ErrSaverReconcileRequired`-only
+  recovery trigger; every-participant worker-local
+  reconciliation; exact-`expected+1` plus semantic content /
+  pending / PK-protection proof; proven lost-ack completion
+  with no replay; stable `ErrDeathCommitUnproven` fail-closed
+  sentinel; `Applied`/`Duplicate` success;
+  `ErrSimIngressFull` bounded redelivery; terminal
+  engine-stop/mismatch errors; T5c3c3c reservation still
+  deferred to its own freeze). `meridian59.md` untouched.
+  Checkbox state unchanged: T5a/T5b1a/T5b1b/T5b2a/T5b2b/T5c1/
+  T5c2a/T5c2b/T5c3a/T5c3b/T5c3c1/T5c3c2/T5c3c3a `[x]`,
+  T5c3c3b/T5c3c3c/T5c3d/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v1.32: freeze M5 immediate-death async completion split (docs
   only, spec v0.3.47 -> v0.3.48 new §9.5.1h; split only): replace
