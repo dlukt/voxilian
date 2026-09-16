@@ -73,6 +73,84 @@ const (
 	DeathCompletionDuplicate
 )
 
+// ImmediateDeathCompletion is the one complete authoritative
+// immediate-death completion value (spec §9.5.1h, M5-T5c3c3a):
+// ONLY already-authoritative post-death live state — the
+// correlated DeathAttemptToken, the resolved post-death
+// placement, the resolved post-death vitals, the already-resolved
+// ephemeral runtime-input snapshot, and the resulting post-death
+// durable shadow (as produced by T5c3c2 / future authoritative
+// recovery). It carries NO Store result, corpse ID, revision,
+// Saver metadata, pending-death row, PK-protection row, PG
+// handle, or error. T5c3c3b later produces this value only after
+// either a successful critical persistence result OR
+// authoritative materialized-state reconciliation proving the
+// state that must be installed; this layer does not know which
+// route produced it. Treat values as immutable: owner-local
+// application deep-freezes the durable shadow and typed ingress
+// freezes the payload before publication, so caller mutation
+// after submission cannot reach live state.
+type ImmediateDeathCompletion struct {
+	Token         DeathAttemptToken
+	Placement     world.Vec3
+	Vitals        PlayerVitals
+	RuntimeInputs PlayerVitalsRuntimeInputs
+	Durable       PlayerDurableState
+}
+
+// freezeImmediateDeathCompletion deep-copies a completion payload
+// into independent ownership (spec §9.5.1h): Placement, Vitals,
+// and RuntimeInputs are plain values, while the Durable shadow
+// reuses the T5c3c2 deep-freeze (Advancement bytes,
+// Spells/Skills/Items slices, every item Enchants slice). The
+// deep-copy itself performs no entity mutation.
+func freezeImmediateDeathCompletion(c ImmediateDeathCompletion) ImmediateDeathCompletion {
+	c.Durable = freezePlayerDurableState(c.Durable)
+	return c
+}
+
+// classifyDeathCompletion resolves the entity named by a death
+// completion token and classifies the attempt lifecycle (spec
+// §9.5.1f/§9.5.1h): the shared token/entity/lifecycle
+// classification behind both PlayerAcceptPostDeathState and
+// PlayerAcceptImmediateDeathCompletion. Binding, in this order:
+// a MIGRATING entity keeps ErrCellHandoffRequired; an unknown
+// EntityID reports the lookup error (ErrEntityNotFound,
+// preserving the removal/ABA rule with no CharacterID-only
+// fallback lookup); a generic entity, a wrong CharacterID, a
+// wrong/zero epoch, or an incompatible life state yields
+// ErrDeathAttemptMismatch. Every failure is zero mutation. On
+// success it reports whether this is the first completion (life
+// == DeathPersisting, duplicate false) or a retry/redelivery of
+// the already-applied attempt (life == AwaitingRespawn,
+// duplicate true).
+func (e *Engine) classifyDeathCompletion(token DeathAttemptToken) (ent *entity, duplicate bool, err error) {
+	if _, migrating := e.registry.migrations[token.EntityID]; migrating {
+		return nil, false, fmt.Errorf("%w: id %d migrating", ErrCellHandoffRequired, uint64(token.EntityID))
+	}
+	ent, err = e.registry.lookup(token.EntityID)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ent.isPlayer {
+		return nil, false, fmt.Errorf("%w: id %d not a player", ErrDeathAttemptMismatch, uint64(token.EntityID))
+	}
+	if token.CharacterID != ent.characterID {
+		return nil, false, fmt.Errorf("%w: id %d character %d vs live %d", ErrDeathAttemptMismatch, uint64(token.EntityID), int64(token.CharacterID), int64(ent.characterID))
+	}
+	if token.Epoch == 0 || token.Epoch != ent.deathEpoch {
+		return nil, false, fmt.Errorf("%w: id %d epoch %d vs live %d", ErrDeathAttemptMismatch, uint64(token.EntityID), token.Epoch, ent.deathEpoch)
+	}
+	switch ent.lifeState {
+	case PlayerLifeDeathPersisting:
+		return ent, false, nil
+	case PlayerLifeAwaitingRespawn:
+		return ent, true, nil
+	default:
+		return nil, false, fmt.Errorf("%w: id %d life %d", ErrDeathAttemptMismatch, uint64(token.EntityID), uint8(ent.lifeState))
+	}
+}
+
 // resolvePlayerAnyLife resolves the live RESIDENT player entity
 // regardless of PlayerLifeState (spec §9.5.1f): MIGRATING
 // ownership fails with zero mutation (ErrCellHandoffRequired,
@@ -217,33 +295,101 @@ func (e *Engine) PlayerBeginDeathPersistence(id EntityID) (DeathAttemptToken, er
 // Owner-local: call only from the sim owner goroutine (Run/Step)
 // or in Step-driven tests.
 func (e *Engine) PlayerAcceptPostDeathState(token DeathAttemptToken, placement world.Vec3, vitals PlayerVitals, runtimeInputs PlayerVitalsRuntimeInputs) (EntitySnapshot, DeathCompletionDisposition, error) {
-	if _, migrating := e.registry.migrations[token.EntityID]; migrating {
-		return EntitySnapshot{}, DeathCompletionApplied, fmt.Errorf("%w: id %d migrating", ErrCellHandoffRequired, uint64(token.EntityID))
-	}
-	ent, err := e.registry.lookup(token.EntityID)
+	ent, duplicate, err := e.classifyDeathCompletion(token)
 	if err != nil {
 		return EntitySnapshot{}, DeathCompletionApplied, err
 	}
-	if !ent.isPlayer {
-		return EntitySnapshot{}, DeathCompletionApplied, fmt.Errorf("%w: id %d not a player", ErrDeathAttemptMismatch, uint64(token.EntityID))
-	}
-	if token.CharacterID != ent.characterID {
-		return EntitySnapshot{}, DeathCompletionApplied, fmt.Errorf("%w: id %d character %d vs live %d", ErrDeathAttemptMismatch, uint64(token.EntityID), int64(token.CharacterID), int64(ent.characterID))
-	}
-	if token.Epoch == 0 || token.Epoch != ent.deathEpoch {
-		return EntitySnapshot{}, DeathCompletionApplied, fmt.Errorf("%w: id %d epoch %d vs live %d", ErrDeathAttemptMismatch, uint64(token.EntityID), token.Epoch, ent.deathEpoch)
-	}
-	switch ent.lifeState {
-	case PlayerLifeDeathPersisting:
-		snap, err := e.PlayerInstallPostDeathState(token.EntityID, placement, vitals, runtimeInputs)
-		if err != nil {
-			return EntitySnapshot{}, DeathCompletionApplied, err
-		}
-		ent.lifeState = PlayerLifeAwaitingRespawn
-		return snap, DeathCompletionApplied, nil
-	case PlayerLifeAwaitingRespawn:
+	if duplicate {
 		return ent.snapshot(), DeathCompletionDuplicate, nil
-	default:
-		return EntitySnapshot{}, DeathCompletionApplied, fmt.Errorf("%w: id %d life %d", ErrDeathAttemptMismatch, uint64(token.EntityID), uint8(ent.lifeState))
 	}
+	snap, err := e.PlayerInstallPostDeathState(token.EntityID, placement, vitals, runtimeInputs)
+	if err != nil {
+		return EntitySnapshot{}, DeathCompletionApplied, err
+	}
+	ent.lifeState = PlayerLifeAwaitingRespawn
+	return snap, DeathCompletionApplied, nil
+}
+
+// PlayerAcceptImmediateDeathCompletion is the canonical
+// authoritative immediate-death completion target (spec
+// §9.5.1h, M5-T5c3c3a): the owner-local installation of an
+// already-authoritative completion value carrying placement,
+// post-death vitals, the already-resolved runtime-input
+// snapshot, AND the post-death durable shadow. It MUST NOT
+// perform persistence and does NOT recalculate any durable
+// content: the supplied state became authoritative via
+// successful critical persistence OR authoritative
+// materialized-state reconciliation by caller contract.
+//
+// Token/entity/lifecycle validation reuses exactly the c3c1
+// correlation domain via classifyDeathCompletion: unknown
+// EntityID -> ErrEntityNotFound (no CharacterID-only fallback,
+// preserving the removal/ABA rule); MIGRATING ->
+// ErrCellHandoffRequired; generic entity, wrong CharacterID,
+// wrong/zero epoch, or incompatible life state ->
+// ErrDeathAttemptMismatch. Every failure is zero mutation.
+//
+// Duplicate completion (token exactly matching the current
+// attempt while life == AwaitingRespawn) returns
+// DeathCompletionDuplicate with the current EntitySnapshot and
+// nil error with ABSOLUTELY ZERO mutation. Duplicate detection
+// happens BEFORE validating or installing the completion
+// payload: a duplicate/redelivered completion is already
+// obsolete as a mutation and must not revalidate replacement
+// durable content, relocate, reset history, replace the durable
+// shadow, re-anchor the stomach, restart deadlines, or change
+// generation.
+//
+// First valid completion (life == DeathPersisting) validates
+// ALL replacement values before any live mutation — placement,
+// vitals, runtime inputs (existing rules), and the durable
+// shadow (existing T5c3c2 validation, deep-frozen before
+// applying) — then invokes the EXISTING
+// PlayerInstallPostDeathState semantics; ONLY after that
+// succeeds does it replace the durable shadow with the frozen
+// post-death shadow and move life state -> AwaitingRespawn,
+// returning DeathCompletionApplied. On install failure life
+// state REMAINS DeathPersisting, the token REMAINS
+// current/valid, the entity remains in the T5c3b guaranteed
+// rollback/quiesced state with its PRE-DEATH durable shadow,
+// and the install error returns (never a silent transition
+// back Alive). No partial durable install is permitted.
+//
+// The completion emits NO PlayerVitalsObserver event (the state
+// was already accepted by the critical death
+// persistence/recovery path; T5c4 owns wire presentation), and
+// replacing the durable shadow adds no new observer and
+// generates no second persistence dirty event.
+//
+// Owner-local: call only from the sim owner goroutine (Run/Step)
+// or in Step-driven tests. Concurrent callers use
+// EnqueueImmediateDeathCompletion.
+func (e *Engine) PlayerAcceptImmediateDeathCompletion(completion ImmediateDeathCompletion) (EntitySnapshot, DeathCompletionDisposition, error) {
+	ent, duplicate, err := e.classifyDeathCompletion(completion.Token)
+	if err != nil {
+		return EntitySnapshot{}, DeathCompletionApplied, err
+	}
+	if duplicate {
+		return ent.snapshot(), DeathCompletionDuplicate, nil
+	}
+	if _, err := world.CellForPosition(completion.Placement); err != nil {
+		return EntitySnapshot{}, DeathCompletionApplied, fmt.Errorf("%w: %w", ErrInvalidPosition, err)
+	}
+	if err := completion.Vitals.Validate(); err != nil {
+		return EntitySnapshot{}, DeathCompletionApplied, err
+	}
+	if err := completion.RuntimeInputs.Validate(); err != nil {
+		return EntitySnapshot{}, DeathCompletionApplied, err
+	}
+	if err := validatePlayerDurableState(completion.Durable); err != nil {
+		return EntitySnapshot{}, DeathCompletionApplied, err
+	}
+	frozen := freezePlayerDurableState(completion.Durable)
+	snap, err := e.PlayerInstallPostDeathState(ent.id, completion.Placement, completion.Vitals, completion.RuntimeInputs)
+	if err != nil {
+		return EntitySnapshot{}, DeathCompletionApplied, err
+	}
+	ent.durable = &frozen
+	ent.lifeState = PlayerLifeAwaitingRespawn
+	return snap, DeathCompletionApplied, nil
 }

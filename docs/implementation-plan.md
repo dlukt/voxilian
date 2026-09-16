@@ -388,7 +388,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
    a Normal death and without inventing durable kill-target state.
    Scope and dependencies unchanged.
    Spec: §9.5.1, §9.5.1f.
-- [ ] **M5-T5c3c3a** Authoritative immediate-death owner
+- [x] **M5-T5c3c3a** Authoritative immediate-death owner
   completion + typed completion ingress (depends on T5c3b +
   T5c3c1 + T5c3c2; `internal/sim` only): one complete
   authoritative immediate-death completion value (token +

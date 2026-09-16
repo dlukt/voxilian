@@ -33,9 +33,10 @@ var (
 )
 
 // ingressCommand is the private typed command union the owner
-// mailbox carries (spec §5.2.10): exactly generic add, player add,
-// remove, and move. Gateway-facing code can never submit arbitrary
-// closures: there is no func(*Engine) command.
+// mailbox carries (spec §5.2.10 + §9.5.1h): exactly generic add,
+// player add, remove, move, and immediate-death completion.
+// Gateway-facing code can never submit arbitrary closures: there
+// is no func(*Engine) command.
 type ingressCommand interface {
 	// execute runs the command on the sim owner goroutine and
 	// delivers its definitive result. It never blocks on the caller:
@@ -122,6 +123,40 @@ func (c ingressMove) fail(err error) {
 	c.res <- ingressMoveResult{err: err}
 }
 
+// ingressDeathCompletionResult is the typed completion of one
+// immediate-death completion command, preserving the exact
+// owner-local PlayerAcceptImmediateDeathCompletion semantics
+// (Applied vs Duplicate vs error).
+type ingressDeathCompletionResult struct {
+	snap EntitySnapshot
+	disp DeathCompletionDisposition
+	err  error
+}
+
+// ingressImmediateDeathCompletion is the typed authoritative
+// death-completion owner command (spec §9.5.1h): it carries one
+// already-frozen ImmediateDeathCompletion value only — no
+// lookup, no recovery, no persistence — and the owner executes
+// the normal PlayerAcceptImmediateDeathCompletion path. It uses
+// the SAME bounded mailbox and admission rules as every other
+// ingress command; the future c3c3b executor redelivers the SAME
+// completion/token after ErrSimIngressFull, and a redelivery
+// after the first apply resolves as the existing zero-mutation
+// Duplicate result.
+type ingressImmediateDeathCompletion struct {
+	completion ImmediateDeathCompletion
+	res        chan ingressDeathCompletionResult
+}
+
+func (c ingressImmediateDeathCompletion) execute(e *Engine) {
+	snap, disp, err := e.PlayerAcceptImmediateDeathCompletion(c.completion)
+	c.res <- ingressDeathCompletionResult{snap: snap, disp: disp, err: err}
+}
+
+func (c ingressImmediateDeathCompletion) fail(err error) {
+	c.res <- ingressDeathCompletionResult{err: err}
+}
+
 // ingressState is the run-ownership coordination only: whether a Run
 // currently owns the engine. It MUST NOT become a mutex protecting
 // normal sim entity state — mutable sim stays single-owner, and the
@@ -201,6 +236,31 @@ func (e *Engine) EnqueueMove(ctx context.Context, id EntityID, intent MoveIntent
 	}
 	res := <-cmd.res
 	return res.disp, res.err
+}
+
+// EnqueueImmediateDeathCompletion submits one authoritative
+// immediate-death completion through the sim owner (spec
+// §9.5.1h). It uses the SAME bounded mailbox and admission rules
+// as every other ingress command and returns the real
+// owner-local result: admitted commands are authoritative and the
+// owner invokes the normal PlayerAcceptImmediateDeathCompletion
+// path (same token/lifecycle validation, Applied vs
+// zero-mutation Duplicate semantics, atomic
+// placement/vitals/runtime/durable installation). The completion
+// payload is frozen before publication, so caller mutation after
+// this call begins cannot change what the owner applies. On
+// admission or execution error the disposition is meaningless —
+// check err first.
+func (e *Engine) EnqueueImmediateDeathCompletion(ctx context.Context, completion ImmediateDeathCompletion) (EntitySnapshot, DeathCompletionDisposition, error) {
+	cmd := ingressImmediateDeathCompletion{completion: freezeImmediateDeathCompletion(completion), res: make(chan ingressDeathCompletionResult, 1)}
+	if err := e.admit(ctx, cmd); err != nil {
+		return EntitySnapshot{}, DeathCompletionApplied, err
+	}
+	// Admitted commands are authoritative: later caller cancellation
+	// does NOT retract them, so the caller waits for the exact
+	// command's definitive result (never an ambiguous maybe).
+	res := <-cmd.res
+	return res.snap, res.disp, res.err
 }
 
 // admit performs the deterministic pre-publication checks and the
