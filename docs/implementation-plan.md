@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.29)
+# Voxilian Backend — Implementation Plan (v1.30)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.45).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.46).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -378,10 +378,16 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   mapped onto that captured content, sim-domain → Store-domain
   mapping inside `internal/persist`) without importing `store`
   into `sim`, without re-reading older PG state over newer
-  in-memory state, and without exposing raw sim
-  `CriticalSetWrite`. Exact capture API deferred to its own
-  pre-implementation audit/spec freeze.
-  Spec: §9.5.1, §9.5.1f.
+   in-memory state, and without exposing raw sim
+   `CriticalSetWrite`. Exact capture API deferred to its own
+   pre-implementation audit/spec freeze.
+   v1.30 note: consumes the corrected five-effect T5a
+   `DeathAdvancementPlan` (spec v0.3.46 §9.5.6), including
+   `CancelAdvancementTimer`, mapping `ResetGainFlags` to the durable
+   `0x70` flag clear with NO active advancement deadline persisted on
+   a Normal death and without inventing durable kill-target state.
+   Scope and dependencies unchanged.
+   Spec: §9.5.1, §9.5.1f.
 - [ ] **M5-T5c3c3** Bounded off-owner death persistence/recovery +
   zero-HP orchestration + typed owner completion (depends on
   T5c3c1 + T5c3c2 + T5c2a + T5c2b; `internal/sim` +
@@ -578,6 +584,22 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.30: freeze M5 death advancement timer fidelity (docs only,
+  spec v0.3.46 corrected §9.5.6; no scope or dependency change):
+  the Normal-death immediate advancement result is FIVE effects
+  (points → 0, gain-chance integer half truncating toward zero,
+  `ResetGainFlags`, `ResetAtrophyFlags`, advancement timer
+  cancelled), carried by the pure T5a `DeathAdvancementPlan` as one
+  explicit boolean intent (`CancelAdvancementTimer`: Normal = true,
+  Cheap = false); `ResetGainFlags` owns the durable `0x70`
+  (`PFLAG_DID_DAMAGE`/`PFLAG_TOOK_DAMAGE`/`PFLAG_DODGED`) clear
+  while `poKill_target` stays ephemeral with no durable
+  representation. T5c3c2 consumes the corrected plan (note on its
+  entry; scope and dependencies unchanged); T5a stays `[x]`.
+  Checkbox state unchanged:
+  T5a/T5b1a/T5b1b/T5b2a/T5b2b/T5c1/T5c2a/T5c2b/T5c3a/T5c3b `[x]`,
+  T5c3c1/T5c3c2/T5c3c3/T5c3d/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v1.29: freeze M5 immediate-death lifecycle split (docs only,
   spec v0.3.45 new §9.5.1f; split only): replace the single

@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.45 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.46 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -9135,6 +9135,14 @@ of raw sim `CriticalSetWrite`. The exact capture API is
 deliberately deferred to T5c3c2's own pre-implementation
 audit/spec freeze; it is NOT invented in T5c3c1.
 
+T5c3c2 dependency note (v0.3.46): T5c3c2 consumes the corrected
+five-effect `DeathAdvancementPlan` (§9.5.6), including
+`CancelAdvancementTimer`, and MUST map `ResetGainFlags` onto the
+durable `0x70` flag clear while `CancelAdvancementTimer == true`
+yields durable advancement state with NO active advancement
+deadline — without inventing durable kill-target state. Scope and
+dependencies otherwise unchanged.
+
 T5c3c3 — bounded off-owner death persistence/recovery + zero-HP
 orchestration + typed owner completion (depends on T5c3c1 + T5c3c2
 + T5c2a + T5c2b). Owns bounded off-owner persistence execution (no
@@ -9277,13 +9285,56 @@ normal drop/PK path is skipped.
 
 #### 9.5.6 Immediate advancement plan (normal death only)
 
-Frozen source result: advancement points → 0; gain chance → integer half
-(truncation toward zero — the value is usually negative); gain flags
-reset (did-damage/took-damage/dodged + kill target); atrophy marks reset
-(spell entries marked unused; the atrophy feature itself stays disabled).
-All four are durable character-advancement state in Voxilian (written by
-T5b1); T5a returns them as an immutable plan value. Cheap/avoided deaths
-change none of these.
+Frozen source result (`player.kod` `Killed` normal-death branch) — FIVE
+effects:
+
+```text
+1. advancement points -> 0
+2. gain chance -> integer half, truncating toward zero
+   (KOD `/` = C division; the value is usually negative)
+3. ResetGainFlags
+4. ResetAtrophyFlags (spell entries marked unused; the atrophy
+   feature itself stays disabled)
+5. advancement timer cancelled (`DeleteTimer(ptAdvancement)`;
+   no active advancement deadline remains)
+```
+
+Cheap real death changes none of these: advancement points unchanged,
+gain chance unchanged, gain flags unchanged, atrophy flags unchanged,
+existing advancement timer/deadline unchanged. Avoided death never
+reaches the plan.
+
+`ResetGainFlags` source semantics (`player.kod`):
+
+```text
+poKill_target = $
+clear PFLAG_DID_DAMAGE  (0x000010)
+clear PFLAG_TOOK_DAMAGE (0x000020)
+clear PFLAG_DODGED      (0x000040)
+```
+
+Voxilian ownership freeze: the three PFLAG bits are durable character
+flag state; resetting them means clearing only mask `0x000070` while
+preserving every unrelated character flag bit (conceptually
+`characters.flags &= ^0x000070`, mapped by T5c3c2 — NOT implemented
+here). `poKill_target` is ephemeral live combat state with NO durable
+SQL/JSON representation: it is never encoded as a
+CharacterID/EntityID/item ID inside `characters.flags`, advancement
+JSON, or any other persisted field, and no live kill-target field is
+added now. Future M5-T7 attack runtime MUST ensure a pre-death kill
+target does not survive a Normal death.
+
+The pure T5a plan carries the fifth effect as one explicit boolean
+intent (`CancelAdvancementTimer`: Normal = true, Cheap = false) —
+never a timer duration, `time.Time`, tick, deadline scalar, timer
+handle, or nullable sentinel. `CancelAdvancementTimer == true` means
+the resulting complete durable advancement state represents NO active
+advancement timer/deadline: a Normal death MUST NOT persist the
+pre-death advancement deadline (the pre-existing `adv_timer_due`
+advancement JSON field stays as-is; its exact inactive JSON encoding
+is T5c3c2's own freeze; no migration here). T5a creates no timer
+handle and performs no mutation: it returns only immutable plan
+intent.
 
 #### 9.5.7 Immediate post-death vitals
 
@@ -10106,6 +10157,37 @@ impossible plans).
    survives it.
 
 ## 14. Version history
+
+- v0.3.46: freeze M5 death advancement timer fidelity (docs only; no
+  schema/query/code change). Correct §9.5.6 against the normative
+  upstream source
+  (`Meridian59/Meridian59@095c07b69e957fb5c49593e6ad488b4c64ba088d`,
+  `player.kod` `Killed` normal-death branch): the Normal-death
+  immediate advancement result is FIVE effects (points → 0, gain
+  chance integer-halved truncating toward zero, `ResetGainFlags`,
+  `ResetAtrophyFlags`, advancement timer cancelled via
+  `DeleteTimer(ptAdvancement)`), while a cheap real death leaves
+  points/chance/flags AND the existing advancement timer/deadline
+  unchanged and avoided death never reaches the plan. Freeze the
+  pure-plan extension as one explicit boolean intent
+  (`CancelAdvancementTimer`: Normal = true, Cheap = false — no
+  duration/`time.Time`/tick/deadline/handle/sentinel; T5a creates no
+  timer handle, returns only immutable plan intent) and the
+  `ResetGainFlags` ownership split (`poKill_target = $` is
+  ephemeral live combat state with no durable representation;
+  durable reset = clear `PFLAG_DID_DAMAGE`/`PFLAG_TOOK_DAMAGE`/
+  `PFLAG_DODGED` = mask `0x000070`, preserving unrelated
+  `characters.flags` bits; no live kill-target field added; M5-T7
+  MUST NOT carry a pre-death kill target across a Normal death).
+  `CancelAdvancementTimer == true` means the resulting complete
+  durable advancement state has NO active advancement timer/
+  deadline (a Normal death MUST NOT persist the pre-death
+  deadline; exact inactive `adv_timer_due` JSON encoding is
+  T5c3c2's own freeze; no migration). Add the T5c3c2 dependency
+  note in §9.5.1f. `meridian59.md` untouched (already
+  source-faithful here). Checkbox state unchanged: T5a/T5b1a/
+  T5b1b/T5b2a/T5b2b/T5c1/T5c2a/T5c2b/T5c3a/T5c3b `[x]`,
+  T5c3c1/T5c3c2/T5c3c3/T5c3d/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v0.3.45: freeze M5 immediate-death lifecycle split (docs only; no
   schema/query/code change). Split the former single T5c3c into
