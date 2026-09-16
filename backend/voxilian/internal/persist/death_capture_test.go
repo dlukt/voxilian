@@ -414,6 +414,111 @@ func TestMetersToStoreMillimeters(t *testing.T) {
 	}
 }
 
+// TestMetersToStoreMillimetersInt64Boundary pins the immediate
+// signed-int64 millimeter boundary with an exactly representable
+// binary64 limit (2^63): float64(math.MaxInt64) == 2^63, so it
+// must not serve as the positive validity boundary. +2^63 rejects,
+// the representable value one ulp below in meters accepts, -2^63
+// accepts as math.MinInt64, and anything below -2^63 rejects.
+func TestMetersToStoreMillimetersInt64Boundary(t *testing.T) {
+	limit := math.Ldexp(1, 63) // exactly 2^63
+
+	// 1. Exact positive 2^63-millimeter result is rejected.
+	posLimitMeters := limit / 1000
+	if got := math.Round(posLimitMeters * 1000); got != limit {
+		t.Fatalf("fixture: Round(%v*1000) = %v, want 2^63", posLimitMeters, got)
+	}
+	if _, err := MetersToStoreMillimeters(posLimitMeters); !errors.Is(err, sim.ErrInvalidDeathInput) {
+		t.Fatalf("(+2^63 mm) err = %v, want ErrInvalidDeathInput", err)
+	}
+
+	// 2. A representable positive value immediately below 2^63
+	// (one ulp below in meters) is accepted.
+	justBelowMeters := math.Nextafter(posLimitMeters, 0)
+	justBelowRounded := math.Round(justBelowMeters * 1000)
+	if !(justBelowRounded < limit) {
+		t.Fatalf("fixture: Round(%v*1000) = %v, want < 2^63", justBelowMeters, justBelowRounded)
+	}
+	got, err := MetersToStoreMillimeters(justBelowMeters)
+	if err != nil {
+		t.Fatalf("(just below +2^63 mm) unexpected err = %v", err)
+	}
+	if want := int64(justBelowRounded); got != want {
+		t.Fatalf("(just below +2^63 mm) = %d, want %d", got, want)
+	}
+
+	// 3. Exact -2^63 millimeters is accepted as math.MinInt64.
+	negLimitMeters := -limit / 1000
+	if got := math.Round(negLimitMeters * 1000); got != -limit {
+		t.Fatalf("fixture: Round(%v*1000) = %v, want -2^63", negLimitMeters, got)
+	}
+	got, err = MetersToStoreMillimeters(negLimitMeters)
+	if err != nil {
+		t.Fatalf("(-2^63 mm) unexpected err = %v", err)
+	}
+	if got != math.MinInt64 {
+		t.Fatalf("(-2^63 mm) = %d, want math.MinInt64", got)
+	}
+
+	// 4. A representable value below -2^63 is rejected.
+	belowNegMeters := math.Nextafter(negLimitMeters, math.Inf(-1))
+	if got := math.Round(belowNegMeters * 1000); !(got < -limit) {
+		t.Fatalf("fixture: Round(%v*1000) = %v, want < -2^63", belowNegMeters, got)
+	}
+	if _, err := MetersToStoreMillimeters(belowNegMeters); !errors.Is(err, sim.ErrInvalidDeathInput) {
+		t.Fatalf("(below -2^63 mm) err = %v, want ErrInvalidDeathInput", err)
+	}
+
+	// 5. Half-rounding away from zero is unchanged.
+	if got, err := MetersToStoreMillimeters(0.0005); err != nil || got != 1 {
+		t.Fatalf("(0.0005) = %d,%v; want 1,nil", got, err)
+	}
+	if got, err := MetersToStoreMillimeters(-0.0005); err != nil || got != -1 {
+		t.Fatalf("(-0.0005) = %d,%v; want -1,nil", got, err)
+	}
+
+	// 6. NaN / +Inf / -Inf remain rejected.
+	for _, bad := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if _, err := MetersToStoreMillimeters(bad); !errors.Is(err, sim.ErrInvalidDeathInput) {
+			t.Fatalf("(%v) err = %v, want ErrInvalidDeathInput", bad, err)
+		}
+	}
+}
+
+// TestMapImmediateDeathCaptureBoundaryOverflow proves a
+// boundary-overflow position (exact +2^63 millimeters) fails the
+// mapper with the ZERO store.DeathEntryRequest.
+func TestMapImmediateDeathCaptureBoundaryOverflow(t *testing.T) {
+	limit := math.Ldexp(1, 63) // exactly 2^63
+	overflowMeters := limit / 1000
+	if got := math.Round(overflowMeters * 1000); got != limit {
+		t.Fatalf("fixture: Round(%v*1000) = %v, want 2^63", overflowMeters, got)
+	}
+	for name, mutate := range map[string]func(*sim.ImmediateDeathCapture){
+		"boundary overflow placement": func(c *sim.ImmediateDeathCapture) {
+			c.Placement.X = overflowMeters
+		},
+		"boundary overflow death position": func(c *sim.ImmediateDeathCapture) {
+			c.DeathPosition.Y = overflowMeters
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			capture := captureFixture(t, sim.DeathKillerIdentity{Kind: sim.DeathKillerNone})
+			mutate(&capture)
+			req, err := MapImmediateDeathCapture(capture)
+			if err == nil {
+				t.Fatalf("expected error, got %+v", req)
+			}
+			if !errors.Is(err, sim.ErrInvalidDeathInput) {
+				t.Fatalf("err = %v, want ErrInvalidDeathInput", err)
+			}
+			if !reflect.DeepEqual(req, store.DeathEntryRequest{}) {
+				t.Fatalf("non-zero request on error: %+v", req)
+			}
+		})
+	}
+}
+
 // TestMapImmediateDeathCaptureFailures proves conversion/range
 // failures return the zero request.
 func TestMapImmediateDeathCaptureFailures(t *testing.T) {

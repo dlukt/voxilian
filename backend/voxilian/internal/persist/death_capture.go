@@ -35,8 +35,15 @@ func MetersToStoreMillimeters(meters float64) (int64, error) {
 	if math.IsNaN(meters) || math.IsInf(meters, 0) {
 		return 0, fmt.Errorf("persist: death capture position %v: %w", meters, sim.ErrInvalidDeathInput)
 	}
-	rounded := math.Round(meters * 1000)
-	if rounded > float64(math.MaxInt64) || rounded < float64(math.MinInt64) {
+	scaled := meters * 1000
+	rounded := math.Round(scaled)
+	// Exact binary64 boundary: 2^63 is representable while
+	// float64(math.MaxInt64) rounds up to 2^63, so the upper
+	// bound must not use float64(math.MaxInt64). +2^63 is
+	// outside int64 (reject); -2^63 is math.MinInt64 (accept).
+	limit := math.Ldexp(1, 63)
+	if math.IsNaN(rounded) || math.IsInf(rounded, 0) ||
+		rounded >= limit || rounded < -limit {
 		return 0, fmt.Errorf("persist: death capture position %v out of int64 millimeters: %w", meters, sim.ErrInvalidDeathInput)
 	}
 	return int64(rounded), nil
