@@ -692,8 +692,9 @@ position described above.
 **Immediate advancement (normal death only):** `piAdvancement_points = 0`;
 `piGain_chance = piGain_chance/2` (KOD `/` = C truncation toward zero —
 gain chance is usually negative); `ResetGainFlags` (kill target + did-damage/
-took-damage/dodged flags); `ResetAtrophyFlags` (negate all spell entries —
-atrophy itself is disabled); advancement timer cancelled. Also normal-death
+took-damage/dodged flags); `ResetAtrophyFlags` (negate EVERY entry in
+BOTH `plSpells` AND `plSkills` — atrophy itself is disabled);
+advancement timer cancelled. Also normal-death
 only: `Post EvaluatePKStatus`, the currently-used SoldierShield
 `OwnerDied(what=killer)` (normal `Killed` call, source default
 `logoff = FALSE`; the `logoff = TRUE` branch is the separate

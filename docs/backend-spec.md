@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.46 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.47 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -9154,6 +9154,351 @@ installation. The exact bounded worker/request shapes deferred by
 §9.5.1d's future off-owner execution rule belong to T5c3c3's own
 spec freeze before implementation. No gateway/protocol.
 
+#### 9.5.1g M5 complete immutable immediate-death capture + Store-domain mapping (T5c3c2, frozen v0.3.47)
+
+T5c3c2 (depends on T5c3c1 + T5a + T5c2b; `internal/sim` capture +
+`internal/persist` mapping) owns the complete immutable
+store-independent sim-domain capture sufficient to build the
+complete `store.DeathEntryRequest` without importing `store` into
+`sim`, without re-reading older PG state over newer in-memory
+state, and without exposing raw sim `CriticalSetWrite`. Exact Go
+names may differ; semantics below are binding.
+
+Verified repository fact (see §9.5.1f): the live player entity
+owns `CharacterID`, `world.Vec3` position, `PlayerVitals`,
+ephemeral vitals runtime, and death lifecycle state, but NOT the
+rest of the complete mutable character/item content required by
+`store.DeathEntryRequest`. PostgreSQL remains recovery authority
+but is NOT the source from which the live death snapshot is
+reconstructed: loading old PG character/item state at death time
+and treating it as current gameplay state is FORBIDDEN (newer
+unsaved authoritative in-memory state may exist).
+
+Complete sim-domain durable shadow (store-independent; exact Go
+names may differ, semantics MUST NOT):
+
+```go
+type PlayerAbilityState struct {
+    ID          int32
+    Ability     int16
+    AtrophyFlag bool
+}
+
+type PlayerInventoryItemState struct {
+    ID      int64
+    ProtoID int32
+
+    Qty      int32
+    Hits     int32
+    Enchants []byte
+
+    Slot string
+}
+
+type PlayerDurableState struct {
+    Karma       int32
+    Advancement []byte
+    Flags       int32
+
+    Spells []PlayerAbilityState
+    Skills []PlayerAbilityState
+
+    Items []PlayerInventoryItemState
+}
+```
+
+The shadow deliberately does NOT contain: `ExpectedRevision`,
+Saver revision, `pending_deaths`, `item_pk_protections`, corpse
+ID, session ID, `NetEntityID`, PG handles, or Store types.
+Position and vitals are NOT duplicated inside it:
+`entity.position` / `entity.vitals` remain authoritative, and
+death capture combines those current live values with the
+durable shadow in ONE owner turn. `ProtoID` is immutable item
+identity metadata for later resolved death-policy/content
+composition; it is NOT part of `store.ItemSnapshot` and the
+persist mapper MUST NOT invent a mutable proto update.
+
+Durable-state validation (before the state can become live): at
+minimum, `Advancement` must be valid JSON with a top-level
+object; spell IDs must be valid catalog IDs and unique in the
+spell namespace; skill IDs must be valid catalog IDs and unique
+in the skill namespace; `Ability` 1..99; inventory `ItemID > 0`
+and unique; `ProtoID` in the existing catalog ID domain
+1..65535; `Enchants` valid JSON; `Qty`/`Hits` use their existing
+int32 domain with no new positivity rule. Do not sort
+caller-owned slices silently: the player inventory slice order
+is authoritative deterministic gameplay order supplied by
+hydration and is preserved exactly. T5a opaque item keys derive
+from capture order, NOT from durable `ItemID`: never establish
+`DeathItemInput.Key == ItemID` as a contract.
+
+Immutability / aliasing: every durable state accepted into the
+entity MUST be deep-frozen — at minimum deep-copy `Advancement`
+bytes, `Spells`/`Skills`/`Items` slices, and every item
+`Enchants` byte slice. Inspection/capture returns independent
+copies: caller mutation after installation or after inspection
+MUST NOT mutate live sim state. The same entity object carries
+this shadow across cell handoff; entity removal discards it
+normally. No second global inventory map is introduced.
+
+Additive full-state player installation: the existing minimal
+`AddPlayerEntity(...)` stays behavior-compatible. A separate
+owner-local full-state installation path (conceptually
+`AddPlayerEntityWithDurableState(characterID, position, vitals,
+runtimeInputs, durableState)`) validates and freezes the
+complete durable state BEFORE ordinary player creation mutates
+the registry or consumes an `EntityID`: an invalid durable
+state creates no player and consumes no `EntityID`. Existing
+minimal players may legitimately have no complete shadow;
+such a player MUST fail death capture closed with a stable
+error such as `ErrPlayerDurableStateMissing`. Do NOT retrofit
+every old `AddPlayerEntity` call merely to hide this
+distinction. A concurrent/gateway full-state add ingress is NOT
+required in c3c2; T5c4 owns real world-entry/reconnect
+hydration and may add/wire the appropriate typed ingress then.
+No world-entry PG loader in this task: no blocking Store reads
+into sim or into the death path; real materialized-state
+hydration for world entry/reconnect is deferred to the later
+integration task. Phase B adds NO SQL query, NO migration, NO
+sqlc output, NO Store read API.
+
+Advancement JSON contract: the durable field is JSONB
+conceptually containing `adv_points`, `adv_timer_due`,
+`gain_chance`, `school_casts`. Creation legitimately persists
+`{}`. Frozen compatibility: missing `adv_points` => semantic 0;
+missing `gain_chance` => semantic 0 (the pinned Meridian source
+initializes `piAdvancement_points = 0`, `piGain_chance = 0`).
+One sim-owned pure decoding helper usable by T5c3c3 later
+obtains the two current inputs for `PlanDeathAdvancement`; T5c3c3
+MUST NOT independently re-parse the same JSON contract. The
+helper rejects malformed/non-object advancement JSON and
+malformed selected numeric fields; unknown/unowned fields remain
+opaque.
+
+Advancement timer representation: absence of `adv_timer_due` ==
+no active advancement deadline. Do NOT invent `0`, `null`,
+`-1`, current tick, or Unix timestamp 0 as the cancellation
+sentinel. For Normal death with `CancelAdvancementTimer == true`
+the resulting advancement object MUST DELETE the
+`adv_timer_due` key. For Cheap death, `Advancement` bytes are
+preserved byte-for-byte (no re-marshalling merely for a Cheap
+death).
+
+Normal-death advancement mapping: apply the supplied validated
+`DeathAdvancementPlan` to the captured durable state:
+`adv_points = plan.PointsAfter`, `gain_chance =
+plan.GainChanceAfter`; if `plan.ResetGainFlags`: `flags &=
+^0x000070`; if `plan.ResetAtrophyFlags`: every
+spell `AtrophyFlag = true` AND every skill `AtrophyFlag = true`;
+if `plan.CancelAdvancementTimer`: delete `adv_timer_due`.
+Preserve: `Karma`, all unrelated flags bits, ability values,
+spell/skill membership, `school_casts`, every unknown
+advancement JSON key. Source gain-reset mask remains
+`PFLAG_DID_DAMAGE 0x000010` / `PFLAG_TOOK_DAMAGE 0x000020` /
+`PFLAG_DODGED 0x000040` / combined `0x000070`.
+`poKill_target` remains ephemeral; do NOT invent durable
+kill-target state.
+
+Cheap-death advancement mapping: cheap real death preserves
+exactly advancement bytes, flags, spell `AtrophyFlag` values,
+skill `AtrophyFlag` values, `Karma`, ability values. The T5a
+plan has all reset/cancel booleans false. Avoided death is NOT a
+death-entry capture and MUST be rejected by the real-death
+builder.
+
+Atomic owner-local begin + capture: a narrow owner-local helper
+composing c3c1 rather than replacing it (conceptually
+`PlayerBeginImmediateDeathCapture(id) ->
+(DeathAttemptToken, ImmediateDeathBaseCapture, error)`).
+Binding behavior: first verify the complete durable shadow
+exists; snapshot/deep-freeze the current complete durable
+shadow plus the current authoritative pre-remap death position
+and current `PlayerVitals`; then invoke the existing
+`PlayerBeginDeathPersistence` semantics in the same owner turn;
+return the exact c3c1 `DeathAttemptToken` correlated with that
+immutable base capture. The player must already have HP==0
+(the existing begin transition owns that rule). Missing durable
+state MUST fail before quiesce, deathEpoch increment, and
+life-state transition. The helper performs NO zero-HP automatic
+dispatch, NO disposition choice, NO double-death calculation, NO
+Store call, NO goroutine. T5c3c3 later decides when to call it.
+`PlayerBeginDeathPersistence` itself stays available and
+behavior-compatible.
+
+Base item keys: the base capture exposes the captured inventory
+in its exact authoritative order and associates each element
+with a unique opaque T5a key. The key may be based on the
+capture index; it MUST NOT carry durable-ID semantics. Tests
+MUST deliberately use `ItemID`s that do not equal the T5a keys.
+T5c3c3 can later resolve `DropOnDeath` / `RoomAccepts` /
+`SpecialItem` per captured item and feed those facts with the
+opaque keys to the existing T5a `PlanDeathDrops`. No catalog
+lookup belongs in the builder.
+
+Complete real-death build input: a pure builder over one
+immutable base capture and already-resolved T5a outputs.
+Conceptually the input needs: `Base`,
+`DeathDispositionPlan`, `CorpsePolicy`, `DeathDropPlan`,
+`DeathAdvancementPlan`, resolved post-death `PlayerVitals`,
+`PendingDeathPlan`, resolved post-death `world.Vec3` placement,
+resolved Token item ID when `TokenDeath`, optional sim-domain
+killer identity. Do not import Store into sim; do not run
+persistence. The builder returns one complete immutable
+sim-domain immediate-death capture sufficient for the persist
+mapper and for later c3c3 owner installation after
+persistence.
+
+Real-death builder validation (reject impossible/inconsistent
+composition before persistence mapping); at minimum:
+disposition MUST be Cheap or Normal, never Avoided; post-death
+vitals MUST `Validate()`; resolved placement MUST be a valid
+world position; corpse policy MUST be the source-frozen player
+corpse policy; `PendingDeathPlan` MUST be consistent with the
+same disposition/corpse (newbie-home real death ->
+`DeathPhaseNone`, every other real death ->
+`DeathPhasePending`, pending cost/time/corpse data match);
+`DeathAdvancementPlan` MUST correspond to the current captured
+`adv_points`/`gain_chance` and disposition; `DeathDropPlan`
+MUST correspond one-for-one, in order, to the base capture's
+opaque item keys (no missing, extra, reordered, or duplicate
+keys). Use the existing T5a pure functions to
+validate/recompute where practical; do NOT duplicate formulas.
+
+Normal drop mapping: for each T5a drop entry with `Drop ==
+true`, produce one affected item mutation carrying the COMPLETE
+existing mutable item root content (`ID`, `Qty`, `Hits`,
+`Enchants`) and resulting semantic location (ground at the
+captured pre-remap death position). The item is removed from
+the resulting player inventory shadow. Generic normal-death
+drop ordering preserves base inventory / T5a order; do NOT sort
+by `ItemID` inside sim (T5c2b/Store already own deterministic
+CAS ordering). PK protection metadata comes exclusively from
+the T5a drop plan (`NeedsPKProtection`,
+`PKProtectionDurationMs`); do not infer it again from killer
+identity.
+
+Token-death special relocation: `DeathDispositionPlan.TokenDeath`
+is the existing pure classification signal. For a Token death:
+caller supplies the already-resolved actual Token `ItemID`; the
+`ItemID` MUST occur exactly once in the captured inventory; the
+token becomes an affected item mutation; the token moves to
+ground at the same pre-remap death position; PK protection
+duration is exactly zero; the token is removed from resulting
+player inventory. The generic Cheap drop entries remain
+non-dropping. Do NOT turn Token relocation into a normal drop;
+do NOT add PK protection merely because the killer is a player.
+The post-death `PlayerVitals` supplied to this builder is
+already caller-resolved and MUST already include any
+source-faithful Token unuse/rest-threshold restoration; c3c2
+does NOT rediscover the token's threshold effect. If
+`TokenDeath == false`, a nonzero Token `ItemID` input is
+invalid.
+
+Special item / SoldierShield non-scope: do not invent Store
+mutations for `specialItemLoss`,
+`SoldierShieldDeathEffect`, `GuardianAngelMail`, or future
+faction/guild/content hooks. Their existing T5a classification
+remains intact. This task only maps the already-frozen durable
+effects that `CommitDeathEntry` can currently represent:
+complete character post-state, normal ground drops, Token
+ground relocation, PK protection metadata, corpse/pending
+metadata, optional kill audit identity.
+
+Resulting player durable shadow: the complete sim-domain
+capture MUST carry the resulting post-death
+`PlayerDurableState`, not merely a Store request recipe —
+that resulting state is what c3c3 can later install after
+successful persistence. For Normal death it includes patched
+`Advancement`, `0x70` gain flags cleared, all spell + skill
+atrophy flags reset, affected dropped items removed from
+inventory. For Cheap death: advancement/flags/atrophy state
+preserved; only an actual Token relocation removes an inventory
+item. Kept inventory item relative order remains unchanged. No
+live entity mutation happens while building this value.
+
+Optional killer — sim domain only: a small sim-domain killer
+identity sufficient to map the existing Store contract
+(character killer, mob killer, nil/environmental). Validate
+identity domains. Do NOT import `store.DeathEntryKiller` into
+sim; the persist mapper performs the mechanical translation.
+
+`ProtoID` ownership: immutable identity/content metadata
+present so later runtime policy resolution needs no blocking PG
+lookup from the sim owner. NOT mutable death-entry aggregate
+content: the persist mapper does NOT put `ProtoID` into
+`store.ItemSnapshot`; death entry never changes proto. T5c2a's
+mutable recovery snapshot also does not change proto. No new
+proto mutation API is created.
+
+Position persistence conversion (frozen inside
+`internal/persist`): `millimeters = math.Round(meters * 1000)`
+per axis, result type `int64`. Analogous to the existing wire
+rounding rule but with an int64 Store domain. Reject `NaN`,
+`+Inf`, `-Inf`, and rounded/scaled values outside signed int64.
+No truncation, no clamp, no wrap. Use the SAME helper for the
+captured death position, the post-death `Character` position,
+and every affected ground item position.
+
+Store-domain mapper (in `internal/persist`, conceptually
+`MapImmediateDeathCapture(capture sim.ImmediateDeathCapture)
+(store.DeathEntryRequest, error)`): does NOT call Store, Saver,
+or recovery; maps the already-resolved sim capture to the
+existing `store.DeathEntryRequest`. Character mapping: `ID` =
+token `CharacterID`; `ExpectedRevision` = 0 placeholder;
+`Karma` = resulting durable state; position = resolved
+post-death placement converted to int64 mm; `Vitals` = JSON
+encoding of resolved post-death `PlayerVitals`; `Advancement` =
+deep copy of already-resolved advancement bytes; `Flags` =
+resulting durable state; complete `Spells`, complete `Skills`.
+The zero `ExpectedRevision` is intentional: T5c2b MUST remain
+the only layer injecting the execution-time Saver revision.
+Items mapping: one Store `DeathEntryItem` per affected item;
+`ExpectedRevision` = 0 placeholder; `ID`/`Qty`/`Hits`/`Enchants`
+= complete affected root content; `Location` = kind=1 ground;
+`PosXYZ` = captured death position in mm; every
+ownership/container/vault/slot reference nil;
+`PKProtectionDuration` from the resolved item mutation. Do not
+use the generated `CorpseID` as an item location. Request
+metadata: `DeathPosXYZ` = captured death position in mm;
+`EffectiveDeathCost` = validated entry death cost;
+`DeathTimeSeconds` = corpse/death plan time; `CorpseLifetime` =
+source corpse lifetime; `NewbieHomeRespawn` = disposition's
+resolved newbie-home fact; `Killer` = mechanical sim -> Store
+translation. Every mapper error returns the zero request.
+
+Revision ownership — absolute: no sim-domain T5c3c2 type
+carries a Store/Saver revision. Do NOT read revisions from
+PostgreSQL; do NOT accept caller revisions into the capture; do
+NOT derive `revision+1`; do NOT copy a descriptor revision into
+`DeathEntryRequest`. The mapper's Store snapshots use zero
+placeholders; existing T5c2b overwrites them inside
+`Saver.WriteCriticalSet` from execution-time participant
+revisions. This boundary is mandatory.
+
+Immutable request boundary: the mapper must own its output
+bytes/slices independently of the sim capture — mutating the
+capture after mapping must not mutate the Store request. The
+existing T5c2b freezer remains the final defensive freeze
+before callback execution; do not remove or weaken it.
+
+Double-death guard non-scope: T5a's two-second double-death
+helper already exists; the live last-death timestamp/runtime
+gate does not yet exist. Do NOT add it to `PlayerDurableState`;
+do NOT persist it. T5c3c3 owns zero-HP orchestration and the
+runtime double-death gate. No speculative `lastDeathSeconds`
+database field belongs here.
+
+Saver / recovery non-scope: T5c3c2 does NOT track Saver roots,
+call `Saver.WriteCriticalSet`, call
+`persist.CommitDeathEntry`, load T5c2a recovery state,
+reconcile blocked roots, retry ambiguous commits, create worker
+pools, or launch goroutines. T5c3c3 owns those operations.
+
+Gateway / protocol non-scope: do not touch
+`internal/gateway`, `internal/proto`, session state,
+`Presence`, `NetEntityID`, opcode 120, opcode 214, opcode 215.
+No wire behavior belongs here.
+
 #### 9.5.2 Death disposition: avoided vs cheap vs normal (frozen)
 
 Three dispositions, semantically distinct:
@@ -9293,8 +9638,10 @@ effects:
 2. gain chance -> integer half, truncating toward zero
    (KOD `/` = C division; the value is usually negative)
 3. ResetGainFlags
-4. ResetAtrophyFlags (spell entries marked unused; the atrophy
-   feature itself stays disabled)
+4. ResetAtrophyFlags (EVERY spell entry AND EVERY skill entry marked
+   unused — `AtrophyFlag = true` for every spell and every skill,
+   the Voxilian representation of the source negative/unused marker;
+   the atrophy feature itself stays disabled)
 5. advancement timer cancelled (`DeleteTimer(ptAdvancement)`;
    no active advancement deadline remains)
 ```
@@ -10158,6 +10505,67 @@ impossible plans).
 
 ## 14. Version history
 
+- v0.3.47: freeze M5 complete death capture mapping (docs only; no
+  schema/query/code change). Correct `ResetAtrophyFlags` against
+  the normative upstream source
+  (`Meridian59/Meridian59@095c07b69e957fb5c49593e6ad488b4c64ba088d`,
+  `player.kod` `ResetAtrophyFlags` negates EVERY entry in BOTH
+  `plSpells` AND `plSkills`): Voxilian durable mapping is
+  `ResetAtrophyFlags == true` => `AtrophyFlag = true` for EVERY
+  spell AND EVERY skill (the prior prose mentioned spells only;
+  T5a boolean behavior already correct, unchanged). Correct the
+  `meridian59.md` §9.5 wording identically. New §9.5.1g freezes
+  the T5c3c2 capture/mapping boundary: store-independent
+  `PlayerDurableState` shadow (karma/advancement/flags + complete
+  spells/skills/items; no revision/pending/corpse/session/Store
+  state; position/vitals stay live-authoritative), validation
+  (advancement top-level-object JSON; catalog-unique spell/skill
+  IDs; ability 1..99; ItemID > 0 unique; ProtoID 1..65535;
+  Enchants JSON; int32 Qty/Hits; order-preserving, no silent
+  sort, opaque capture-order T5a keys never equal to ItemID),
+  deep-freeze/aliasing rules, additive full-state installation
+  (`AddPlayerEntity` compatible; invalid durable state consumes
+  no EntityID; legacy minimal players fail capture closed with
+  `ErrPlayerDurableStateMissing`; no gateway ingress in c3c2),
+  no world-entry PG loader (no SQL/migration/sqlc/Store-read),
+  advancement JSON contract (`{}` creation; missing
+  `adv_points`/`gain_chance` => semantic 0; pure sim-owned
+  decode helper for T5c3c3; unknown fields opaque),
+  no-timer encoding (absence of `adv_timer_due` == no deadline;
+  Normal deletes the key; Cheap preserves bytes byte-for-byte),
+  Normal advancement mapping (planned points/chance, `0x70`
+  gain-flag clear, all spell+skill atrophy reset, deadline
+  delete; karma/unrelated flags/abilities/membership/
+  `school_casts`/unknown keys preserved; no durable
+  kill-target), Cheap preservation (bytes/flags/atrophy
+  bit-identical; avoided rejected), atomic owner-local
+  begin+capture composing c3c1 (shadow verified first; same-turn
+  quiesce/epoch/life transition; exact token; HP==0 owned by
+  c3c1; no dispatch/disposition/double-death/Store/goroutine),
+  pure real-death builder over base + resolved T5a outputs
+  (disposition/placement/vitals/corpse/pending/advancement/drop
+  consistency; no Store import; no persistence), Normal drop
+  mapping (complete Qty/Hits/Enchants; ground at captured death
+  position; inventory removal; base/T5a order; PK metadata from
+  T5a only), Token special relocation (resolved Token ItemID
+  exactly once; ground; zero PK; removed; generic cheap entries
+  stay non-dropping; no threshold rediscovery), resulting
+  post-death durable shadow carried for c3c3 install, sim-only
+  killer identity, `ProtoID` immutable (never into
+  `ItemSnapshot`), `internal/persist` mm conversion
+  (`math.Round(meters*1000)` int64 per axis; NaN/Inf/int64
+  overflow rejected; same helper for death/post-death/item
+  positions), mechanical Store mapper (zero `ExpectedRevision`
+  placeholders owned by T5c2b; complete character/items/killer/
+  corpse/pending metadata; zero request on error; output
+  aliasing independence), absolute revision ownership, no
+  double-death timestamp state, no Saver/recovery/worker, no
+  gateway/proto. Also correct the v0.3.46 history-text mistake
+  that listed `M5-T5c3c1` as unchecked (tracker already `[x]`).
+  Checkbox state unchanged: T5a/T5b1a/T5b1b/T5b2a/T5b2b/T5c1/
+  T5c2a/T5c2b/T5c3a/T5c3b/T5c3c1 `[x]`,
+  T5c3c2/T5c3c3/T5c3d/T5c4/T6/T7 and M5 exit `[ ]`.
+
 - v0.3.46: freeze M5 death advancement timer fidelity (docs only; no
   schema/query/code change). Correct §9.5.6 against the normative
   upstream source
@@ -10184,10 +10592,10 @@ impossible plans).
   deadline (a Normal death MUST NOT persist the pre-death
   deadline; exact inactive `adv_timer_due` JSON encoding is
   T5c3c2's own freeze; no migration). Add the T5c3c2 dependency
-  note in §9.5.1f. `meridian59.md` untouched (already
-  source-faithful here). Checkbox state unchanged: T5a/T5b1a/
-  T5b1b/T5b2a/T5b2b/T5c1/T5c2a/T5c2b/T5c3a/T5c3b `[x]`,
-  T5c3c1/T5c3c2/T5c3c3/T5c3d/T5c4/T6/T7 and M5 exit `[ ]`.
+   note in §9.5.1f. `meridian59.md` untouched (already
+   source-faithful here). Checkbox state unchanged: T5a/T5b1a/
+   T5b1b/T5b2a/T5b2b/T5c1/T5c2a/T5c2b/T5c3a/T5c3b/T5c3c1 `[x]`,
+   T5c3c2/T5c3c3/T5c3d/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v0.3.45: freeze M5 immediate-death lifecycle split (docs only; no
   schema/query/code change). Split the former single T5c3c into

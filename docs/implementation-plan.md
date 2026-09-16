@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.30)
+# Voxilian Backend — Implementation Plan (v1.31)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.46).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.47).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -585,6 +585,30 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 
 ## Plan history
 
+- v1.31: freeze M5 complete death capture mapping (docs only,
+  spec v0.3.46 -> v0.3.47 new §9.5.1g; no scope or dependency
+  change): correct `ResetAtrophyFlags` (`player.kod`
+  `ResetAtrophyFlags` negates EVERY entry in BOTH `plSpells` AND
+  `plSkills`; Voxilian `AtrophyFlag = true` for every spell and
+  every skill); freeze the store-independent `PlayerDurableState`
+  shadow, validation, deep-freeze, additive full-state
+  installation, advancement `{}`/`adv_points`/`gain_chance`
+  contract, no-timer (`adv_timer_due` absence) encoding, Normal
+  (`0x70` clear, all-spell+skill atrophy reset, deadline delete)
+  vs Cheap (byte-for-byte preservation) advancement mapping,
+  atomic owner-local begin+capture composing c3c1, opaque
+  capture-order T5a keys, pure real-death builder (Normal drops
+  + Token special relocation + resulting post-death shadow +
+  sim-only killer + immutable ProtoID), `internal/persist` mm
+  conversion (`math.Round(meters*1000)` int64; NaN/Inf/overflow
+  rejected), mechanical Store mapper (zero `ExpectedRevision`
+  placeholders; T5c2b stays the only revision injector), and the
+  Saver/recovery/worker/gateway/proto non-scope. Correct the
+  v1.30 history-text mistake that listed `M5-T5c3c1` as
+  unchecked (tracker already `[x]`). Checkbox state unchanged:
+  T5a/T5b1a/T5b1b/T5b2a/T5b2b/T5c1/T5c2a/T5c2b/T5c3a/T5c3b/
+  T5c3c1 `[x]`, T5c3c2/T5c3c3/T5c3d/T5c4/T6/T7 and M5 exit `[ ]`.
+
 - v1.30: freeze M5 death advancement timer fidelity (docs only,
   spec v0.3.46 corrected §9.5.6; no scope or dependency change):
   the Normal-death immediate advancement result is FIVE effects
@@ -595,11 +619,11 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
   Cheap = false); `ResetGainFlags` owns the durable `0x70`
   (`PFLAG_DID_DAMAGE`/`PFLAG_TOOK_DAMAGE`/`PFLAG_DODGED`) clear
   while `poKill_target` stays ephemeral with no durable
-  representation. T5c3c2 consumes the corrected plan (note on its
-  entry; scope and dependencies unchanged); T5a stays `[x]`.
-  Checkbox state unchanged:
-  T5a/T5b1a/T5b1b/T5b2a/T5b2b/T5c1/T5c2a/T5c2b/T5c3a/T5c3b `[x]`,
-  T5c3c1/T5c3c2/T5c3c3/T5c3d/T5c4/T6/T7 and M5 exit `[ ]`.
+   representation. T5c3c2 consumes the corrected plan (note on its
+   entry; scope and dependencies unchanged); T5a stays `[x]`.
+   Checkbox state unchanged:
+   T5a/T5b1a/T5b1b/T5b2a/T5b2b/T5c1/T5c2a/T5c2b/T5c3a/T5c3b/T5c3c1 `[x]`,
+   T5c3c2/T5c3c3/T5c3d/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v1.29: freeze M5 immediate-death lifecycle split (docs only,
   spec v0.3.45 new §9.5.1f; split only): replace the single
