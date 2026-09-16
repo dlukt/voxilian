@@ -109,6 +109,18 @@ func freezeImmediateDeathCompletion(c ImmediateDeathCompletion) ImmediateDeathCo
 	return c
 }
 
+// CloneImmediateDeathCompletion deep-copies a completion payload
+// into independent ownership for off-owner persistence use (spec
+// §9.5.1h, M5-T5c3c3b): the typed ingress already freezes on
+// admission and owner-local application freezes again, but the
+// persistence executor must freeze the future completion at work
+// submission time without access to the private freeze helper.
+// Deep-copy only: no entity mutation, no persistence, and the
+// exact nil-vs-empty semantics of the existing c3c2 cloning.
+func CloneImmediateDeathCompletion(c ImmediateDeathCompletion) ImmediateDeathCompletion {
+	return freezeImmediateDeathCompletion(c)
+}
+
 // classifyDeathCompletion resolves the entity named by a death
 // completion token and classifies the attempt lifecycle (spec
 // §9.5.1f/§9.5.1h): the shared token/entity/lifecycle

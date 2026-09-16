@@ -77,28 +77,39 @@ func revisionByKey(expected []sim.AggregateRevision, key sim.AggregateKey) (int6
 	return 0, false
 }
 
-// CommitDeathEntry executes one atomic death entry through
-// sim.Saver.WriteCriticalSet: the character root plus one item
-// root per frozen request Items element (zero items is a valid
-// character-only set; duplicate item IDs fail before Store via
-// the existing critical-set validation). Execution-time Saver
-// revisions overwrite the frozen ExpectedRevision fields inside
-// the callback only. On ANY WriteCriticalSet error the ZERO
-// store result is returned (the visibility fence: CorpseID
-// never escapes before Saver acceptance). No retry, no
-// reconciliation — the caller reconciles every affected root
-// via T5c2a on ErrSaverReconcileRequired.
-func CommitDeathEntry(
+// deathEntryExecution is the observed outcome of one critical
+// death-entry operation (spec §9.5.1h, M5-T5c3c3b): the Store
+// result plus the EXACT callback expected revisions observed
+// from the actual WriteCriticalSet callback input. Expected is
+// populated ONLY from that callback input — never from a
+// pre-gate sample, the caller request, or a placeholder —
+// because an older queued Saver write can advance a participant
+// while the critical operation waits for the per-key gate.
+// Expected keys are copied by VALUE; no callback slice alias
+// escapes. On any WriteCriticalSet error the Result stays ZERO
+// (the visibility fence); Expected is still retained whenever
+// the callback was invoked, including callback-error paths.
+type deathEntryExecution struct {
+	Result   store.DeathEntryResult
+	Expected []sim.AggregateRevision
+}
+
+// commitDeathEntryObserved executes one atomic death entry
+// through sim.Saver.WriteCriticalSet while additionally
+// recording the exact callback expected revisions. This is the
+// single core behind both CommitDeathEntry and the c3c3b
+// recovery executor so the transaction logic cannot drift.
+func commitDeathEntryObserved(
 	ctx context.Context,
 	saver *sim.Saver,
 	st DeathPersistenceStore,
 	req store.DeathEntryRequest,
-) (store.DeathEntryResult, error) {
+) (deathEntryExecution, error) {
 	if saver == nil {
-		return store.DeathEntryResult{}, fmt.Errorf("persist: commit death entry: nil saver")
+		return deathEntryExecution{}, fmt.Errorf("persist: commit death entry: nil saver")
 	}
 	if st == nil {
-		return store.DeathEntryResult{}, fmt.Errorf("persist: commit death entry: nil store")
+		return deathEntryExecution{}, fmt.Errorf("persist: commit death entry: nil store")
 	}
 	frozen := freezeDeathEntryRequest(req)
 	charKey := deathCharacterKey(frozen.Character.ID)
@@ -108,9 +119,15 @@ func CommitDeathEntry(
 		keys = append(keys, deathItemKey(it.Snapshot.ID))
 	}
 	var stored store.DeathEntryResult
+	var observed []sim.AggregateRevision
 	_, err := saver.WriteCriticalSet(ctx, keys, func(
 		ctx context.Context, expected []sim.AggregateRevision,
 	) ([]sim.AggregateRevision, error) {
+		// Record the actual execution-time revisions FIRST so
+		// they survive even when the callback below fails
+		// (stale CAS, semantic Store error, lost ack). Value
+		// copy into a fresh slice: no alias escapes.
+		observed = append([]sim.AggregateRevision(nil), expected...)
 		charRev, ok := revisionByKey(expected, charKey)
 		if !ok {
 			return nil, fmt.Errorf("persist: commit death entry: missing character revision for %v", charKey)
@@ -138,9 +155,33 @@ func CommitDeathEntry(
 		return out, nil
 	})
 	if err != nil {
+		return deathEntryExecution{Expected: observed}, err
+	}
+	return deathEntryExecution{Result: stored, Expected: observed}, nil
+}
+
+// CommitDeathEntry executes one atomic death entry through
+// sim.Saver.WriteCriticalSet: the character root plus one item
+// root per frozen request Items element (zero items is a valid
+// character-only set; duplicate item IDs fail before Store via
+// the existing critical-set validation). Execution-time Saver
+// revisions overwrite the frozen ExpectedRevision fields inside
+// the callback only. On ANY WriteCriticalSet error the ZERO
+// store result is returned (the visibility fence: CorpseID
+// never escapes before Saver acceptance). No retry, no
+// reconciliation — the caller reconciles every affected root
+// via T5c2a on ErrSaverReconcileRequired.
+func CommitDeathEntry(
+	ctx context.Context,
+	saver *sim.Saver,
+	st DeathPersistenceStore,
+	req store.DeathEntryRequest,
+) (store.DeathEntryResult, error) {
+	exec, err := commitDeathEntryObserved(ctx, saver, st, req)
+	if err != nil {
 		return store.DeathEntryResult{}, err
 	}
-	return stored, nil
+	return exec.Result, nil
 }
 
 // CommitPortalOfLife executes one Portal-of-Life transition

@@ -402,7 +402,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   No `CommitDeathEntry`, no Saver, no Store, no PG, no recovery,
   no worker, no zero-HP dispatch, no gateway/protocol work.
   Spec: §9.5.1, §9.5.1h.
-- [ ] **M5-T5c3c3b** Bounded off-owner `CommitDeathEntry` +
+- [x] **M5-T5c3c3b** Bounded off-owner `CommitDeathEntry` +
   proven materialized recovery executor (depends on T5c3c3a +
   T5c2a + T5c2b; `internal/persist` + only the narrow sim
   support required by the already-frozen
