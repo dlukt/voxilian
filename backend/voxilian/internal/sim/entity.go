@@ -106,6 +106,20 @@ type entity struct {
 	characterID CharacterID
 	vitals      PlayerVitals
 
+	// durable is the complete store-independent durable shadow
+	// (spec §9.5.1g, M5-T5c3c2): the mutable gameplay content not
+	// already authoritatively owned by the live entity (karma,
+	// advancement, flags, complete spells/skills, complete
+	// inventory). Nil for legacy minimal players predating c3c2
+	// and for every generic entity. A non-nil shadow is always a
+	// deep-frozen private copy: installation freezes the caller's
+	// value and inspection/capture return independent copies, so
+	// no caller can alias live state. It rides this SAME entity
+	// object through cell handoff and is discarded with the
+	// entity on removal. Never persisted, never sent on the wire,
+	// never a Store type.
+	durable *PlayerDurableState
+
 	// Player life state + death attempt epoch (spec §9.5.1f,
 	// M5-T5c3c1): the owner-local immediate-death lifecycle gate.
 	// lifeState is PlayerLifeAlive for every successfully

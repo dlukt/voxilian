@@ -369,7 +369,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   no PG, no workers/goroutines, no completion ingress, no zero-HP
   automatic dispatch, no gateway/protocol work.
   Spec: §9.5.1, §9.5.1f.
-- [ ] **M5-T5c3c2** Complete immutable immediate-death capture +
+- [x] **M5-T5c3c2** Complete immutable immediate-death capture +
   Store-domain persistence mapping (depends on T5c3c1 + T5a +
   T5c2b): the complete immutable store-independent sim-domain
   capture sufficient to build the complete

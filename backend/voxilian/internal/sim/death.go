@@ -446,8 +446,10 @@ type DeathAdvancementPlan struct {
 	GainChanceAfter int
 	// ResetGainFlags: clear did-damage/took-damage/dodged + kill target.
 	ResetGainFlags bool
-	// ResetAtrophyFlags: mark all spell entries unused (the atrophy
-	// feature itself stays disabled).
+	// ResetAtrophyFlags: mark EVERY spell entry AND EVERY skill entry
+	// unused (AtrophyFlag = true, the Voxilian representation of the
+	// source negative/unused marker in BOTH plSpells and plSkills;
+	// the atrophy feature itself stays disabled).
 	ResetAtrophyFlags bool
 	// CancelAdvancementTimer: the source cancels the existing
 	// advancement timer (DeleteTimer(ptAdvancement)) on a Normal
