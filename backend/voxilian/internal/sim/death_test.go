@@ -348,8 +348,10 @@ func TestDeathAdvancementNormalHalving(t *testing.T) {
 	cases := []struct{ before, after int }{
 		{0, 0},
 		{1, 0},
+		{5, 2},   // positive odd truncates down toward zero
 		{25, 12}, // positive odd truncates down toward zero
 		{24, 12},
+		{-5, -2},   // negative odd truncates UP toward zero (KOD = C division)
 		{-25, -12}, // negative odd truncates UP toward zero (KOD = C division)
 		{-24, -12},
 		{-1, 0},
@@ -368,6 +370,9 @@ func TestDeathAdvancementNormalHalving(t *testing.T) {
 		if !p.ResetGainFlags || !p.ResetAtrophyFlags {
 			t.Fatalf("%d: resets = %v/%v, want true/true", c.before, p.ResetGainFlags, p.ResetAtrophyFlags)
 		}
+		if !p.CancelAdvancementTimer {
+			t.Fatalf("%d: CancelAdvancementTimer = false, want true (source DeleteTimer(ptAdvancement))", c.before)
+		}
 	}
 }
 
@@ -376,7 +381,7 @@ func TestDeathAdvancementCheapUntouched(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cheap: %v", err)
 	}
-	if p.PointsAfter != 37 || p.GainChanceAfter != -25 || p.ResetGainFlags || p.ResetAtrophyFlags {
+	if p.PointsAfter != 37 || p.GainChanceAfter != -25 || p.ResetGainFlags || p.ResetAtrophyFlags || p.CancelAdvancementTimer {
 		t.Fatalf("cheap advancement plan = %+v, want untouched echo", p)
 	}
 }

@@ -428,8 +428,15 @@ func PlanDeathDrops(plan DeathDispositionPlan, items []DeathItemInput) (DeathDro
 }
 
 // DeathAdvancementPlan freezes the immediate advancement effects of a
-// real death (spec §9.5.6). All fields are durable character-advancement
-// state later written by T5b1; this value is only the plan.
+// real death (spec §9.5.6): FIVE effects on a Normal death (points to
+// 0, gain chance integer-halved truncating toward zero, gain flags
+// reset, atrophy flags reset, advancement timer cancelled), none on a
+// Cheap death. This value is only immutable plan intent: T5a creates
+// no timer handle and mutates nothing; T5c3c2 maps
+// CancelAdvancementTimer onto the durable advancement representation
+// (no active deadline after a Normal death) and ResetGainFlags onto
+// the durable 0x70 flag clear (the source poKill_target clear is
+// ephemeral live combat state with no durable representation).
 type DeathAdvancementPlan struct {
 	// PointsAfter: advancement points after the death (0 for normal;
 	// unchanged for cheap).
@@ -442,12 +449,18 @@ type DeathAdvancementPlan struct {
 	// ResetAtrophyFlags: mark all spell entries unused (the atrophy
 	// feature itself stays disabled).
 	ResetAtrophyFlags bool
+	// CancelAdvancementTimer: the source cancels the existing
+	// advancement timer (DeleteTimer(ptAdvancement)) on a Normal
+	// death; a Cheap death leaves the timer/deadline unchanged.
+	// Pure intent only: no duration, deadline, handle, or sentinel.
+	CancelAdvancementTimer bool
 }
 
 // PlanDeathAdvancement freezes the source immediate advancement block
 // (spec §9.5.6): NORMAL death zeroes advancement points, halves the
-// gain chance, and resets gain/atrophy flags; CHEAP death changes
-// nothing (values echo through). AVOIDED deaths never reach this plan.
+// gain chance, resets gain/atrophy flags, and cancels the advancement
+// timer; CHEAP death changes nothing (values echo through, existing
+// timer/deadline unchanged). AVOIDED deaths never reach this plan.
 func PlanDeathAdvancement(disposition DeathDisposition, points, gainChance int) (DeathAdvancementPlan, error) {
 	if err := checkDisposition(disposition); err != nil {
 		return DeathAdvancementPlan{}, err
@@ -457,17 +470,19 @@ func PlanDeathAdvancement(disposition DeathDisposition, points, gainChance int) 
 	}
 	if disposition == DeathCheap {
 		return DeathAdvancementPlan{
-			PointsAfter:       points,
-			GainChanceAfter:   gainChance,
-			ResetGainFlags:    false,
-			ResetAtrophyFlags: false,
+			PointsAfter:            points,
+			GainChanceAfter:        gainChance,
+			ResetGainFlags:         false,
+			ResetAtrophyFlags:      false,
+			CancelAdvancementTimer: false,
 		}, nil
 	}
 	return DeathAdvancementPlan{
-		PointsAfter:       0,
-		GainChanceAfter:   gainChance / 2, // Go int division truncates toward zero, matching KOD
-		ResetGainFlags:    true,
-		ResetAtrophyFlags: true,
+		PointsAfter:            0,
+		GainChanceAfter:        gainChance / 2, // Go int division truncates toward zero, matching KOD
+		ResetGainFlags:         true,
+		ResetAtrophyFlags:      true,
+		CancelAdvancementTimer: true,
 	}, nil
 }
 
