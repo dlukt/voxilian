@@ -150,12 +150,26 @@ type deathExecutorJob struct {
 // goroutine per death, NO unbounded queue, NO unbounded
 // completion queue, explicit Run lifecycle. Construction
 // itself leaks no goroutines.
+//
+// Queue-capacity permits (spec §9.5.1i, M5-T5c3c3c1): the
+// executor owns exactly QueueCapacity permits. A normal
+// TrySubmit consumes one permit before queue publication; a
+// live (reserved or prepared) DeathExecutionReservation owns
+// one permit; a permit is released exactly once when its
+// queued job is dequeued by a worker, when its queued job is
+// drained during shutdown, when its reservation is
+// cancelled, when its reservation preparation fails, or when
+// its activation observes shutdown. Running jobs that a
+// worker already dequeued hold no permit. The combined count
+// of unactivated live reservations plus jobs occupying the
+// bounded queue never exceeds QueueCapacity.
 type DeathExecutor struct {
 	store      DeathExecutionStore
 	saver      *sim.Saver
 	sink       ImmediateDeathCompletionSink
 	retryDelay time.Duration
 	queue      chan deathExecutorJob
+	permits    int
 
 	mu         sync.Mutex
 	running    bool
@@ -192,6 +206,7 @@ func NewDeathExecutor(cfg DeathExecutorConfig) (*DeathExecutor, error) {
 		sink:       cfg.Sink,
 		retryDelay: delay,
 		queue:      make(chan deathExecutorJob, cfg.QueueCapacity),
+		permits:    cfg.QueueCapacity,
 		ready:      make(chan struct{}),
 		numWorkers: cfg.Workers,
 	}, nil
@@ -236,6 +251,10 @@ func (x *DeathExecutor) Run(ctx context.Context) error {
 	for {
 		select {
 		case job := <-x.queue:
+			// One drained queued job returns one queue
+			// permit before its definitive shutdown
+			// result (spec §9.5.1i).
+			x.releasePermit()
 			job.res <- ImmediateDeathPersistenceResult{Err: ErrDeathExecutorShutdown}
 		default:
 			wg.Wait()
@@ -246,38 +265,28 @@ func (x *DeathExecutor) Run(ctx context.Context) error {
 
 // TrySubmit validates, maps, and deep-freezes work, then
 // publishes it without blocking: at submit time (before queue
-// publication) it runs MapImmediateDeathCapture, freezes the
-// resulting Store request, and freezes the future
-// ImmediateDeathCompletion payload. Caller mutation after
-// successful submission MUST NOT affect the job. A full queue
-// fails immediately with the stable full error; a non-running
-// executor fails with the stable not-running error. The exact
-// c3c3c reservation-before-DeathPersisting API is out of scope:
-// T5c3c3c MUST NOT use naive TrySubmit-after-begin semantics.
+// publication) it runs the shared prepareDeathExecutorWork
+// core (MapImmediateDeathCapture, frozen Store request,
+// frozen future ImmediateDeathCompletion payload). Caller
+// mutation after successful submission MUST NOT affect the
+// job. Submission consumes exactly one queue-capacity permit
+// before publication (spec §9.5.1i): a full queue — jobs in
+// the channel plus live unactivated reservations — fails
+// immediately with the stable full error; a non-running
+// executor fails with the stable not-running error. The
+// validation ordering is preserved: invalid work against a
+// non-running executor reports ErrDeathExecutorInvalid,
+// never ErrDeathExecutorNotRunning. The exact c3c3c1
+// reservation-before-DeathPersisting API lives in
+// death_reservation.go: T5c3c3c2 MUST NOT use naive
+// TrySubmit-after-begin semantics.
 func (x *DeathExecutor) TrySubmit(
 	work ImmediateDeathPersistenceWork,
 ) (<-chan ImmediateDeathPersistenceResult, error) {
-	if err := work.RuntimeInputs.Validate(); err != nil {
-		return nil, fmt.Errorf("persist: death executor work runtime inputs: %w: %w",
-			err, ErrDeathExecutorInvalid)
-	}
-	req, err := MapImmediateDeathCapture(work.Capture)
+	req, completion, err := prepareDeathExecutorWork(work)
 	if err != nil {
-		return nil, fmt.Errorf("persist: death executor work capture: %w: %w",
-			err, ErrDeathExecutorInvalid)
+		return nil, err
 	}
-	// Defensive second freeze: the mapper already owns its
-	// output, and the T5c2b adapter freezes again before
-	// callback execution. Freeze here too so the queued job
-	// can never alias caller memory even if the mapper drifts.
-	req = freezeDeathEntryRequest(req)
-	completion := sim.CloneImmediateDeathCompletion(sim.ImmediateDeathCompletion{
-		Token:         work.Capture.Token,
-		Placement:     work.Capture.Placement,
-		Vitals:        work.Capture.Vitals,
-		RuntimeInputs: work.RuntimeInputs,
-		Durable:       work.Capture.Durable,
-	})
 	res := make(chan ImmediateDeathPersistenceResult, 1)
 	job := deathExecutorJob{req: req, completion: completion, res: res}
 	x.mu.Lock()
@@ -285,10 +294,18 @@ func (x *DeathExecutor) TrySubmit(
 	if !x.running {
 		return nil, ErrDeathExecutorNotRunning
 	}
+	if x.permits <= 0 {
+		return nil, ErrDeathExecutorQueueFull
+	}
+	x.permits--
 	select {
 	case x.queue <- job:
 		return res, nil
 	default:
+		// Unreachable by permit accounting (a held permit
+		// proves queue space); still fail safe without
+		// leaking the permit.
+		x.permits++
 		return nil, ErrDeathExecutorQueueFull
 	}
 }
@@ -299,6 +316,13 @@ func (x *DeathExecutor) worker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case job := <-x.queue:
+			// Queue capacity is free the moment a worker
+			// dequeues: release exactly this queued job's
+			// permit BEFORE executing Store/recovery
+			// (spec §9.5.1i), then keep the accepted c3c3b
+			// worker cancellation rule below with no
+			// double-release.
+			x.releasePermit()
 			if ctx.Err() != nil {
 				job.res <- ImmediateDeathPersistenceResult{Err: ErrDeathExecutorShutdown}
 				return

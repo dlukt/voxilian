@@ -424,7 +424,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   completion. T5c3c3c MUST NOT later use naive
   TrySubmit-after-begin semantics (separate reservation freeze).
   Spec: §9.5.1, §9.5.1h.
-- [ ] **M5-T5c3c3c1** Guaranteed bounded executor reservation
+- [x] **M5-T5c3c3c1** Guaranteed bounded executor reservation
   + prepared activation seam (depends on T5c3c3b; `internal/persist`
   + one narrow store-independent interface in `internal/sim`):
   reservation of one bounded executor queue-capacity slot,
