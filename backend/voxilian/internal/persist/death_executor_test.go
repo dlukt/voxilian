@@ -1047,7 +1047,10 @@ func TestDeathExecutorQueueBound(t *testing.T) {
 
 // Shutdown: a running job plus queued jobs, then executor
 // cancel — every result channel receives a definitive terminal
-// result, no waiter strands, no worker leaks.
+// result, no waiter strands, no worker leaks. The running job
+// observes cancellation; the queued-but-not-started job fails
+// with exactly ErrDeathExecutorShutdown and never reaches
+// Store/recovery/completion.
 func TestDeathExecutorShutdown(t *testing.T) {
 	s := mustSaverForPersist(t)
 	trackExecutorRoots(t, s, 0, 0)
@@ -1073,17 +1076,179 @@ func TestDeathExecutorShutdown(t *testing.T) {
 	resB := mustSubmit(t, ex, executorWork(t))
 	cancel()
 	res := awaitResult(t, resA)
-	if res.Err == nil {
-		t.Fatal("running job err = nil, want definitive shutdown error")
+	if !errors.Is(res.Err, context.Canceled) {
+		t.Fatalf("running job err = %v, want context.Canceled", res.Err)
 	}
-	if res := awaitResult(t, resB); res.Err == nil {
-		t.Fatal("queued job err = nil, want definitive shutdown error")
+	resBVal := awaitResult(t, resB)
+	if !errors.Is(resBVal.Err, ErrDeathExecutorShutdown) {
+		t.Fatalf("queued job err = %v, want ErrDeathExecutorShutdown", resBVal.Err)
 	}
 	if err := <-runErr; !errors.Is(err, context.Canceled) {
 		t.Fatalf("run err = %v, want context.Canceled", err)
 	}
+	// Exactly the running job A entered Store; B never did.
+	if bs.calls != 1 {
+		t.Fatalf("store calls = %d, want exactly 1 (only running A entered Store)", bs.calls)
+	}
+	// B never reached recovery: exactly A's single recovery
+	// pass attempted every participant once.
+	if bs.charCalls != 1 {
+		t.Fatalf("character recoveries = %d, want exactly 1 (A only, B never reached recovery)", bs.charCalls)
+	}
+	for _, id := range []int64{101, 303} {
+		if bs.itemCalls[id] != 1 {
+			t.Fatalf("item %d recoveries = %d, want exactly 1 (A only, B never reached recovery)", id, bs.itemCalls[id])
+		}
+	}
 	if sink.numCalls() != 0 {
 		t.Fatalf("sink calls = %d, want 0 (no completion after shutdown)", sink.numCalls())
+	}
+	// Post-shutdown admission stays NotRunning.
+	if _, err := ex.TrySubmit(executorWork(t)); !errors.Is(err, ErrDeathExecutorNotRunning) {
+		t.Fatalf("post-shutdown submit err = %v, want ErrDeathExecutorNotRunning", err)
+	}
+}
+
+// Cancelled worker dequeue: context already cancelled while a
+// job remains queued/not-started, then the worker becomes able
+// to receive it. The job must fail with exactly
+// ErrDeathExecutorShutdown and never reach Store, recovery, or
+// owner completion. The drain fallback mirrors Run so the test
+// never depends on select randomness to pass: after the fix
+// both the worker-takes-queue and worker-takes-Done branches
+// deliver Shutdown with zero Store calls.
+func TestDeathExecutorCancelledWorkerDequeue(t *testing.T) {
+	s := mustSaverForPersist(t)
+	trackExecutorRoots(t, s, 0, 0)
+	fs := newFakeRecoveryStore()
+	sink := &fakeCompletionSink{}
+	ex, err := NewDeathExecutor(DeathExecutorConfig{
+		Workers: 1, QueueCapacity: 4, Store: fs, Saver: s, Sink: sink,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Queue deterministically with no workers running yet.
+	ex.mu.Lock()
+	ex.running = true
+	ex.mu.Unlock()
+	resCh, err := ex.TrySubmit(executorWork(t))
+	if err != nil {
+		t.Fatalf("TrySubmit: %v", err)
+	}
+	// Context cancelled before any worker can receive.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		ex.worker(ctx)
+	}()
+	<-workerDone
+	// Mirror Run's definitive drain: if the worker took the
+	// Done branch, the job is still queued and must fail here.
+	select {
+	case job := <-ex.queue:
+		job.res <- ImmediateDeathPersistenceResult{Err: ErrDeathExecutorShutdown}
+	default:
+	}
+	res := awaitResult(t, resCh)
+	if !errors.Is(res.Err, ErrDeathExecutorShutdown) {
+		t.Fatalf("queued job err = %v, want ErrDeathExecutorShutdown", res.Err)
+	}
+	if fs.deathCalls != 0 {
+		t.Fatalf("store calls = %d, want 0 (queued job never reached Store)", fs.deathCalls)
+	}
+	if fs.charCalls != 0 || len(fs.itemCalls) != 0 {
+		t.Fatalf("recovery loads char=%d items=%v, want zero (queued job never reached recovery)", fs.charCalls, fs.itemCalls)
+	}
+	if sink.numCalls() != 0 {
+		t.Fatalf("sink calls = %d, want 0 (queued job never reached completion)", sink.numCalls())
+	}
+	ex.mu.Lock()
+	ex.running = false
+	ex.mu.Unlock()
+}
+
+// Sequential second Run after shutdown: one-shot lifecycle.
+// No panic, no new workers, ready closed exactly once.
+func TestDeathExecutorSecondRunAfterShutdown(t *testing.T) {
+	s := mustSaverForPersist(t)
+	trackExecutorRoots(t, s, 0, 0)
+	fs := newFakeRecoveryStore()
+	sink := &fakeCompletionSink{}
+	ex, err := NewDeathExecutor(DeathExecutorConfig{
+		Workers: 1, QueueCapacity: 2, Store: fs, Saver: s, Sink: sink,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() { runErr <- ex.Run(ctx1) }()
+	<-ex.ready
+	cancel1()
+	if err := <-runErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first run err = %v, want context.Canceled", err)
+	}
+	// Second Run with a live context must return immediately
+	// (no workers started, no block on ctx2) with Shutdown.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	done2 := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done2 <- fmt.Errorf("panic: %v", r)
+			}
+		}()
+		done2 <- ex.Run(ctx2)
+	}()
+	select {
+	case err := <-done2:
+		if !errors.Is(err, ErrDeathExecutorShutdown) {
+			t.Fatalf("second run err = %v, want ErrDeathExecutorShutdown", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("second Run blocked: workers must not start after shutdown")
+	}
+	// Third Run behaves identically; no panic, no new workers.
+	ctx3, cancel3 := context.WithCancel(context.Background())
+	defer cancel3()
+	if err := ex.Run(ctx3); !errors.Is(err, ErrDeathExecutorShutdown) {
+		t.Fatalf("third run err = %v, want ErrDeathExecutorShutdown", err)
+	}
+	// Post-shutdown admission stays NotRunning.
+	if _, err := ex.TrySubmit(executorWork(t)); !errors.Is(err, ErrDeathExecutorNotRunning) {
+		t.Fatalf("post-shutdown submit err = %v, want ErrDeathExecutorNotRunning", err)
+	}
+	if fs.deathCalls != 0 || sink.numCalls() != 0 {
+		t.Fatalf("store=%d sink=%d, want 0/0 (no workers started on second Run)", fs.deathCalls, sink.numCalls())
+	}
+}
+
+// Concurrent second Run while running: AlreadyRunning.
+func TestDeathExecutorConcurrentSecondRun(t *testing.T) {
+	s := mustSaverForPersist(t)
+	trackExecutorRoots(t, s, 0, 0)
+	fs := newFakeRecoveryStore()
+	sink := &fakeCompletionSink{}
+	ex, err := NewDeathExecutor(DeathExecutorConfig{
+		Workers: 1, QueueCapacity: 2, Store: fs, Saver: s, Sink: sink,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() { runErr <- ex.Run(ctx) }()
+	<-ex.ready
+	if err := ex.Run(context.Background()); !errors.Is(err, ErrDeathExecutorAlreadyRunning) {
+		t.Fatalf("concurrent run err = %v, want ErrDeathExecutorAlreadyRunning", err)
+	}
+	cancel()
+	if err := <-runErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first run err = %v, want context.Canceled", err)
 	}
 }
 

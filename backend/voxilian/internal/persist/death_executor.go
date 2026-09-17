@@ -159,6 +159,7 @@ type DeathExecutor struct {
 
 	mu         sync.Mutex
 	running    bool
+	started    bool
 	ready      chan struct{}
 	numWorkers int
 }
@@ -201,14 +202,22 @@ func NewDeathExecutor(cfg DeathExecutorConfig) (*DeathExecutor, error) {
 // with a definitive shutdown error, lets running
 // Store/recovery work observe the cancelled context, waits for
 // workers, and returns. No waiter is stranded; no worker
-// leaks. A second concurrent Run fails.
+// leaks. A second concurrent Run fails. The executor is
+// one-shot: any Run after the first Run has terminated fails
+// with ErrDeathExecutorShutdown without starting workers and
+// without closing ready again.
 func (x *DeathExecutor) Run(ctx context.Context) error {
 	x.mu.Lock()
 	if x.running {
 		x.mu.Unlock()
 		return ErrDeathExecutorAlreadyRunning
 	}
+	if x.started {
+		x.mu.Unlock()
+		return ErrDeathExecutorShutdown
+	}
 	x.running = true
+	x.started = true
 	close(x.ready)
 	x.mu.Unlock()
 
@@ -290,6 +299,10 @@ func (x *DeathExecutor) worker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case job := <-x.queue:
+			if ctx.Err() != nil {
+				job.res <- ImmediateDeathPersistenceResult{Err: ErrDeathExecutorShutdown}
+				return
+			}
 			job.res <- x.execute(ctx, job)
 		}
 	}
