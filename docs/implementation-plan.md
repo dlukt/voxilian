@@ -438,7 +438,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   resolution, no item/drop policy resolution, no Token
   handling, no placement selection, no gateway/protocol.
   Spec: §9.5.1, §9.5.1i.
-- [ ] **M5-T5c3c3c2** Zero-HP resolved T5a orchestration +
+- [x] **M5-T5c3c3c2** Zero-HP resolved T5a orchestration +
   double-death runtime gate (depends on T5c3c3a + T5c3c3b +
   T5c3c3c1 + T5a + T5c3c2): zero-HP `Killed` orchestration,
   source-order double-death runtime gate, ephemeral

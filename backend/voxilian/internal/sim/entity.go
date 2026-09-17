@@ -134,6 +134,21 @@ type entity struct {
 	lifeState  PlayerLifeState
 	deathEpoch uint64
 
+	// lastDeathSeconds is the ephemeral whole-second timestamp of
+	// the last non-blocked death orchestration for this player
+	// entity (spec §9.5.1j, M5-T5c3c3c2): the Voxilian image of
+	// the pinned source `piLastDeathTime`. Zero-initialized,
+	// matching the source property initialization. Ephemeral
+	// only: not PlayerDurableState, not Store, never persisted,
+	// never sent on the wire. It rides this SAME entity object
+	// through cell handoff (the migration record owns the same
+	// object), is discarded with the entity on removal, and
+	// restarts at 0 on a fresh entity. Only the zero-HP
+	// orchestration mutates it: blocked attempts leave it
+	// unchanged, Avoided/Cheap/Normal stamp it to the resolved
+	// NowSeconds.
+	lastDeathSeconds int64
+
 	// Player-owned ephemeral vitals runtime metadata (spec §9.4b.10,
 	// v0.3.31): installed atomically with the vitals at attach/add
 	// (§9.4b.3a), never persisted (§9.4b.9), and riding this SAME
