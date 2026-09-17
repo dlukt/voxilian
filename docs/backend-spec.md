@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.49 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.50 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -7972,8 +7972,10 @@ v0.3.40 in §9.5.1b, T5c3 is further split into
 T5c3a+T5c3b+T5c3c+T5c3d, frozen v0.3.43 in §9.5.1d, T5c3c is
 further split into T5c3c1+T5c3c2+T5c3c3, frozen v0.3.45 in
 §9.5.1f, T5c3c3 is further split into
-T5c3c3a+T5c3c3b+T5c3c3c, frozen v0.3.48 in §9.5.1h, and the
-c3c3b recovery contract is frozen v0.3.49 in §9.5.1h):
+T5c3c3a+T5c3c3b+T5c3c3c, frozen v0.3.48 in §9.5.1h, the
+c3c3b recovery contract is frozen v0.3.49 in §9.5.1h, and
+T5c3c3c is further split into T5c3c3c1+T5c3c3c2, frozen
+v0.3.50 in §9.5.1i):
 
 - **T5a — pure/source-faithful death mechanics and immutable plans**
   (§9.5.4–§9.5.14 pure surface; §9.5.17 non-scope).
@@ -8095,21 +8097,38 @@ c3c3b recovery contract is frozen v0.3.49 in §9.5.1h):
   may mutate only worker-local staged values, and live entity
   replacement occurs ONLY through the typed c3c3a owner
   completion. No gateway/protocol.
-- **T5c3c3c — zero-HP/T5a orchestration + double-death gate +
-  bounded execution submission** (§9.5.1h, future): zero-HP
-  immediate-death orchestration, the runtime double-death
-  timestamp/guard, resolved T5a plan composition with resolved
-  item/drop/Token/content facts and resolved newbie-home /
-  Underworld placement input, and safe bounded work
-  admission BEFORE an irreversible `DeathPersisting` transition.
-  T5c3c3c MUST NOT transition a player to `DeathPersisting` and
-  only afterward discover that the bounded persistence executor
-  has no capacity: work admission/reservation and lifecycle
-  mutation must compose so queue saturation cannot strand a
-  player in `DeathPersisting` without an authoritative in-flight
-  job. The exact reservation/submission API belongs to c3c3c's
-  own freeze. Depends on T5c3c3a + T5c3c3b + T5a + T5c3c2. No
-  gateway/protocol.
+- **T5c3c3c1 — guaranteed bounded executor reservation +
+  prepared activation seam** (§9.5.1i): reservation of one
+  bounded executor queue-capacity slot BEFORE any owner
+  lifecycle mutation, the one-shot reservation state machine
+  (reserved → prepared → activated / cancelled), prepare /
+  freeze / map of the complete death work BEFORE
+  `PlayerBeginDeathPersistence`, activation that cannot fail
+  with queue-full because the held permit already owns the
+  capacity, cancellation/release, exact queue-permit
+  accounting, and preservation of the existing `TrySubmit`
+  behavior. `internal/persist` plus one narrow
+  store-independent interface in `internal/sim`. Depends on
+  T5c3c3b. No `PlayerLifeState` mutation, no zero-HP routing,
+  no double-death timestamps, no `Killed` sequencing, no T5a
+  composition, no `DeathContext` resolution, no item/drop
+  policy resolution, no Token handling, no placement
+  selection, no gateway/protocol.
+- **T5c3c3c2 — zero-HP resolved T5a orchestration + double-death
+  runtime gate** (§9.5.1i, future): zero-HP `Killed`
+  orchestration, the source-order double-death runtime gate,
+  ephemeral last-death-seconds state, the resolved whole-second
+  death-time input, Avoided / Cheap / Normal routing, resolved
+  T5a planning, the actual Token ItemID + restored rest
+  threshold, complete per-item resolved drop/content facts,
+  resolved newbie-home vs Underworld placement, construction of
+  `ImmediateDeathCapture`, the owner transition to
+  `DeathPersisting` ONLY after reservation work has
+  successfully prepared, and activation of that
+  already-prepared reserved work. No gateway/protocol. Depends
+  on T5c3c3a + T5c3c3b + T5c3c3c1 + T5a + T5c3c2. The exact
+  gameplay API is deferred to c3c3c2's own Phase-A source
+  freeze.
 - **T5c3d — pending-death / Portal / Underworld-exit async
   lifecycle** (§9.5.1d): the already-durable second phase —
   recovered pending-death lifecycle, Portal-of-Life runtime
@@ -8121,7 +8140,7 @@ c3c3b recovery contract is frozen v0.3.49 in §9.5.1h):
   pending   consumption, recovery after stale/semantic/ambiguous
   results, and owner-only final live-state apply. `internal/sim`
   + `internal/persist`. Depends on T5c3c1 + T5c3c2 + T5c3c3a +
-  T5c3c3b + T5c3c3c + T5b2a + T5b2b + T5c2a + T5c2b. `C->S 120 respawn_ack` is NOT the semantic synonym
+  T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5b2a + T5b2b + T5c2a + T5c2b. `C->S 120 respawn_ack` is NOT the semantic synonym
   for Underworld `LeaveHold` / `ApplyDeathPenalties`: T5c4 owns
   opcode 120 transport/state routing while T5c3d owns the
   gameplay event "player actually leaves the Underworld".
@@ -8130,9 +8149,9 @@ c3c3b recovery contract is frozen v0.3.49 in §9.5.1h):
   S→C 214 / 215 delivery, session/Presence/NetEntityID composition,
   reconnect/end-to-end proof reusing the existing 120/214/215 codecs
   (no second protocol). Depends on T5c3a + T5c3b + T5c3c1 + T5c3c2 +
-  T5c3c3a + T5c3c3b + T5c3c3c + T5c3d + the existing M4 gateway/presence/fanout foundation.
+  T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d + the existing M4 gateway/presence/fanout foundation.
 
-M5-T5-complete is `T5a + T5b1a + T5b1b + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c + T5c3d + T5c4`.
+M5-T5-complete is `T5a + T5b1a + T5b1b + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d + T5c4` (EIGHTEEN tasks).
 
 Ledger contract (binding on T5b2a/T5b2b): Portal-of-Life writes ZERO
 ledger rows. Underworld-exit death penalties write ZERO ledger rows.
@@ -9764,7 +9783,9 @@ deliberately deferred to T5c3c3b's own pre-implementation
 audit and MUST NOT be invented in c3c3a.
 
 T5c3c3c — zero-HP/T5a orchestration + double-death gate +
-bounded execution submission (depends on T5c3c3a + T5c3c3b +
+bounded execution submission (SUPERSEDED by the
+T5c3c3c1+T5c3c3c2 split frozen in new §9.5.1i; §9.5.1h stays
+otherwise frozen; depends on T5c3c3a + T5c3c3b +
 T5a + T5c3c2; future). Owns zero-HP immediate-death
 orchestration, the runtime double-death timestamp/guard,
 resolved T5a plan composition, resolved item/drop/Token/content
@@ -10098,10 +10119,290 @@ orchestration, no capacity reservation before
 `DeathPersisting` (T5c3c3c), no Portal, no Underworld exit, no
 death penalties (T5c3d), no gateway, no session, no Presence,
 no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
-(T5c4). No schema change, no migration, no SQL query, no sqlc
-generated change, no Store transaction redesign.
+ (T5c4). No schema change, no migration, no SQL query, no sqlc
+ generated change, no Store transaction redesign.
 
-#### 9.5.2 Death disposition: avoided vs cheap vs normal (frozen)
+ #### 9.5.1i M5 death executor reservation split (T5c3c3c1+T5c3c3c2, frozen v0.3.50)
+
+ The former single T5c3c3c combined two independent
+ correctness boundaries that must be proven separately:
+ concurrency/admission (guarantee persistence capacity BEFORE
+ the sim owner can enter the irreversible `DeathPersisting`
+ state) and gameplay/source orchestration (zero-HP `Killed`
+ sequencing, the double-death runtime gate, resolved T5a
+ composition, Avoided / Cheap / Normal routing, Token
+ threshold restoration, resolved drop/content facts, and
+ newbie-home / Underworld placement). It is therefore split
+ into T5c3c3c1+T5c3c3c2. This section supersedes (and, where
+ it names T5c3c3c, replaces) the T5c3c3c paragraph of
+ §9.5.1h; §9.5.1h stays otherwise frozen.
+ `meridian59.md` is untouched.
+
+ The existing c3c3b executor exposes `TrySubmit(work)`, but
+ the frozen contract already explicitly states that T5c3c3c
+ MUST NOT use naive TrySubmit-after-begin semantics, because
+ `PlayerBeginDeathPersistence` followed by a
+ `ErrDeathExecutorQueueFull` admission failure would strand a
+ live player in `DeathPersisting` with no persistence job.
+ T5c3c3c1 solves the admission problem only; T5c3c3c2 later
+ composes the source-faithful gameplay transition over the
+ proven reservation seam.
+
+ T5c3c3c1 — guaranteed bounded executor reservation +
+ prepared activation seam (`internal/persist` plus one narrow
+ store-independent interface in `internal/sim`; depends on
+ T5c3c3b; future c3c3c2 depends on it). Owns reservation of
+ one bounded executor queue-capacity slot, the reservation
+ state machine, prepare/freeze/map of the complete death
+ work BEFORE owner lifecycle mutation, activation that
+ cannot fail with queue-full, cancellation/release, exact
+ queue-permit accounting, and preservation of the existing
+ `TrySubmit` behavior. It does NOT own `PlayerLifeState`
+ mutation, zero-HP routing, double-death timestamps, `Killed`
+ sequencing, T5a composition, `DeathContext` resolution,
+ item/drop policy resolution, Token handling, placement
+ selection, or gateway/protocol.
+
+ Reservation architecture (binding): the SAME executor gains
+ an explicit capacity-reservation API (conceptually
+ `ReserveImmediateDeath() (*DeathExecutionReservation,
+ error)`; exact Go names may differ). A successful
+ reservation means ONE future queued death job already owns
+ one unit of the executor's existing `QueueCapacity`. This is
+ NOT additional capacity: for configured `QueueCapacity = N`,
+ the combined count of unactivated live reservations plus
+ jobs currently occupying the bounded queue must never
+ exceed `N`. Running jobs that a worker has already dequeued
+ no longer occupy queue capacity, preserving the existing
+ queue-capacity meaning.
+
+ Queue permits (binding): implement explicit fixed
+ queue-capacity permits (`N` permits for `QueueCapacity N`).
+ A reservation consumes exactly one permit. A normal
+ `TrySubmit` also consumes exactly one permit before queue
+ publication. A permit is released exactly once when a
+ reservation is cancelled before activation, when
+ reservation preparation fails and is abandoned, when an
+ activated job is dequeued by a worker, when an activated
+ queued job is drained during shutdown, or when activation
+ discovers the executor has already shut down and resolves
+ the work directly as shutdown. A queued-job permit MUST NOT
+ be released immediately after send (that would let a later
+ sender overfill the actual channel). No capacity beyond
+ `QueueCapacity` is created; no unbounded semaphore.
+
+ Sim-domain reservation capability (binding): ONE narrow
+ store-independent interface in `internal/sim`
+ (conceptually `PrepareImmediateDeathWork(capture,
+ runtimeInputs) error` + `ActivateImmediateDeathWork()` +
+ `CancelImmediateDeathWork()`; exact Go names may differ)
+ exists so future c3c3c2 owner-local orchestration can
+ reserve capacity before lifecycle mutation, construct the
+ complete capture, call Prepare while still Alive, enter
+ `DeathPersisting` only if Prepare succeeds, and call
+ Activate in the SAME owner turn. The interface MUST contain
+ NO Store type, NO persist type, NO revision, NO PG handle,
+ NO result-channel type from persist, and NO arbitrary
+ func/closure. All three methods MUST be non-blocking with
+ respect to PG/network/disk: `Prepare` may perform bounded
+ CPU validation/mapping/freezing and short mutex/channel
+ bookkeeping only; `Activate` and `Cancel` must never do
+ Store/PG work. The concrete `*persist.DeathExecutionReservation`
+ MUST satisfy the sim interface (compile-time proof).
+
+ Reservation state machine (binding): one concrete
+ reservation is one-shot with conceptual states reserved /
+ prepared / activated / cancelled and no backwards
+ transition. Reserved owns one queue permit and contains no
+ published executor job. Prepared owns one queue permit plus
+ one fully validated/frozen `store.DeathEntryRequest`,
+ `sim.ImmediateDeathCompletion`, and buffered result
+ channel, with NOTHING published to workers yet — so
+ preparation is safe BEFORE `PlayerBeginDeathPersistence`.
+ Activated means exactly one frozen job has been handed to
+ executor processing or, if executor shutdown already won
+ the lifecycle race, the result has been definitively
+ resolved as executor shutdown; activation never performs
+ Store work itself. Cancelled means nothing will execute and
+ owned capacity is returned exactly once.
+
+ Prepare semantics (binding): `Prepare` reuses the SAME
+ validation/mapping/freezing semantics as `TrySubmit`
+ (validate `PlayerVitalsRuntimeInputs`,
+ `MapImmediateDeathCapture`, freeze the Store request,
+ `CloneImmediateDeathCompletion`; no alternate mapper, no
+ alternate request representation, no Store call, no Saver
+ call, no recovery, no owner mutation). On success the
+ reservation becomes prepared and privately owns the frozen
+ work: later caller mutation of Advancement, Spells, Skills,
+ Items, Enchants, AffectedItems, or the completion durable
+ shadow cannot reach it. On preparation failure the existing
+ wrapped validation/mapping error returns, the reservation
+ becomes terminal/cancelled, the queue permit is returned
+ exactly once, and no job is published — so future c3c3c2
+ can treat "Prepare error == no `DeathPersisting`
+ transition occurred" as a hard invariant.
+
+ Activation semantics (binding): after successful Prepare,
+ activation MUST be non-blocking, one-shot /
+ idempotent-safe, and incapable of
+ `ErrDeathExecutorQueueFull` — the held reservation permit
+ is the proof that queue capacity exists. On a normal
+ running executor it publishes exactly one frozen job to the
+ existing queue (no second queue, no goroutine, no second
+ worker pool). If executor shutdown has already made normal
+ execution impossible before activation, it does NOT block
+ and does NOT publish an orphaned job: it resolves the
+ reservation's buffered result exactly once with
+ `ErrDeathExecutorShutdown` and returns its permit.
+ Activation itself is intentionally a no-error capability
+ for future same-owner-turn use. A repeated Activate after
+ the first activation is a no-op and MUST NOT publish
+ twice.
+
+ Cancellation semantics (binding): cancellation is
+ idempotent. Before activation there is no Store call, no
+ sink call, no queue publication, and the queue permit is
+ released exactly once. If a result channel already exists
+ from successful Prepare, cancellation places one
+ definitive terminal result carrying a stable
+ executor-domain sentinel (conceptually
+ `ErrDeathReservationCanceled`, matched with `errors.Is`)
+ into that buffered channel so no observer waits forever.
+ Cancel after activation is a no-op: it must never retract
+ an authoritative queued/running persistence job.
+
+ Concrete result access (binding): the concrete persist
+ reservation exposes the existing
+ `ImmediateDeathPersistenceResult` without exposing that
+ type through the sim interface (conceptually `Result()
+ (<-chan ImmediateDeathPersistenceResult, error)`; exact Go
+ names may differ). Before successful Prepare no result
+ channel is available; after successful Prepare the SAME
+ buffered result channel returns every time, including
+ after Activate, after prepared Cancel (receiving the
+ cancellation sentinel), and after shutdown-before-activation
+ (receiving `ErrDeathExecutorShutdown`). No new completion
+ queue is created.
+
+ Reserve semantics (binding): reservation is non-blocking
+ with order "executor running check, then one queue permit
+ attempt": not running -> `ErrDeathExecutorNotRunning`; no
+ permit -> `ErrDeathExecutorQueueFull`; success -> one live
+ reservation. A failed reservation publishes nothing,
+ allocates no death attempt, and mutates no sim state.
+
+ `TrySubmit` compatibility (binding): the existing
+ `TrySubmit(work)` stays externally compatible, in
+ particular its current validation ordering (it validates /
+ maps / freezes work BEFORE the running/full admission
+ check), so invalid work against a non-running executor
+ keeps reporting `ErrDeathExecutorInvalid` rather than
+ `ErrDeathExecutorNotRunning`. A private shared
+ prepare helper behind both `TrySubmit` and
+ reservation Prepare is preferred; all existing c3c3b tests
+ stay unchanged/green unless a test merely needs internal
+ fixture adaptation for permit accounting.
+
+ Worker permit release (binding): when a worker successfully
+ dequeues a queued job, queue capacity is free immediately —
+ release exactly that queued job's permit BEFORE executing
+ Store/recovery, retaining the already-accepted c3c3b worker
+ cancellation rule (`ctx` cancelled before execution begins
+ -> `ErrDeathExecutorShutdown` result with no
+ Store/recovery/completion, and no double-release of its
+ permit). Run teardown draining queued jobs likewise
+ releases one permit per drained job before sending
+ `ErrDeathExecutorShutdown`.
+
+ Shutdown + unactivated reservations (binding): NO
+ unbounded registry of reservations is added merely to
+ enumerate them at shutdown. An unactivated reservation
+ contains no goroutine, no queued job, and no Store
+ operation; it may observe executor shutdown on its later
+ Activate and resolve its result as above. Cancellation
+ remains safe after executor shutdown and returns the
+ permit once. No waiter associated with a successfully
+ Prepared reservation may strand after either Cancel or
+ Activate. Future c3c3c2 orchestration owns ensuring its
+ reservation is always activated or cancelled.
+
+ Thread safety (binding): reservation methods may be called
+ from different goroutines during tests/future composition.
+ One-shot state transitions are protected: no double permit
+ release, no double queue publication, no double result
+ send, no panic on repeated Cancel/Activate, `-race` clean.
+ The executor mutex MUST NOT be held while Store executes,
+ recovery executes, or owner completion executes (the
+ existing c3c3b rule remains).
+
+ Non-scope (binding): no `PlayerLoseHealth` death routing,
+ no zero-HP owner orchestration, no lastDeathSeconds, no
+ double-death runtime state, no `DeathBlockedByDoubleDeath`
+ integration, no `DeathContext` orchestration, no
+ `PlanDeathDisposition` / `PlanDeathDrops` /
+ `PlanDeathAdvancement` / `PlanPostDeathVitals` /
+ `PlanImmediateDeathHooks` orchestration, no Token ItemID
+ handling, no Token rest-threshold restoration, no Avoided
+ death HP=1 runtime, no newbie-home placement choice, no
+ Underworld placement choice, no T5c3c3c2, no T5c3d, no
+ T5c4, no gateway, no session, no proto, no Presence, no
+ `NetEntityID`, no opcode 120, no opcode 214, no opcode
+ 215. No Store production change, no SQL/query change, no
+ migration, no generated sqlc change, no new PG read/write,
+ no second executor.
+
+ T5c3c3c2 — zero-HP resolved T5a orchestration +
+ double-death runtime gate (depends on T5c3c3a + T5c3c3b +
+ T5c3c3c1 + T5a + T5c3c2; future). Owns zero-HP `Killed`
+ orchestration, the source-order double-death runtime gate,
+ ephemeral last-death-seconds state, the resolved
+ whole-second death-time input, Avoided / Cheap / Normal
+ routing, resolved T5a planning, the actual Token ItemID +
+ restored rest threshold, complete per-item resolved
+ drop/content facts, resolved newbie-home vs Underworld
+ placement, construction of `ImmediateDeathCapture`, the
+ owner transition to `DeathPersisting` ONLY after
+ reservation work has successfully prepared, and activation
+ of that already-prepared reserved work. No
+ gateway/protocol. The exact gameplay API is deliberately
+ deferred to c3c3c2's own Phase-A source freeze.
+
+ Source-order readiness note for future c3c3c2 (binding
+ input, not an implementation): pinned source remains
+ `Meridian59/Meridian59@095c07b69e957fb5c49593e6ad488b4c64ba088d`.
+ `player.kod::Killed` order is: (1) resolve/default
+ `piDeathCost`; (2) if `GetTime() < piLastDeathTime + 2`,
+ return immediately; (3) `CancelRescue`; (4)
+ `piLastDeathTime = GetTime()`; (5) capture death location;
+ (6) test Avoided-death conditions; (7) if Avoided: HP = 1,
+ `NewHealth`, `ActivateCheapDeath` on special active items,
+ return; (8) otherwise continue the real-death Cheap/Normal
+ pipeline. Binding consequence for future c3c3c2: a
+ double-death blocked attempt does NOT update lastDeath; an
+ Avoided death DOES update lastDeath; a real death DOES
+ update lastDeath. Also: the current §9.5.3 wording saying
+ T5c runtime gating uses the "deterministic tick clock" is
+ superseded for c3c3c2 — the source uses `GetTime()` whole
+ seconds, so c3c3c2 must freeze an explicit RESOLVED
+ whole-second time scalar, with deterministic tests, rather
+ than `time.Now()` inside the sim owner or a `uint32` sim
+ tick interpreted as Unix/absolute seconds. That API is
+ deliberately NOT finished in c3c3c1.
+
+ Downstream graph (binding): T5c3d now depends on T5c3c1 +
+ T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5b2a +
+ T5b2b + T5c2a + T5c2b; T5c4 depends on T5c3a + T5c3b +
+ T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 +
+ T5c3d + the existing M4 gateway/presence/fanout foundation;
+ M5-T5-complete is the EIGHTEEN-task set T5a + T5b1a + T5b1b
+ + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a + T5c3b +
+ T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 +
+ T5c3d + T5c4 (M5-T7 wording/task index updated
+ accordingly). After this task T5c3c3c1 is `[x]` while
+ T5c3c3c2, T5c3d, T5c4, T6, T7, and the M5 exit stay `[ ]`.
+
+ #### 9.5.2 Death disposition: avoided vs cheap vs normal (frozen)
 
 Three dispositions, semantically distinct:
 
