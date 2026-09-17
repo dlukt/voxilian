@@ -74,38 +74,50 @@ const (
 )
 
 // ImmediateDeathCompletion is the one complete authoritative
-// immediate-death completion value (spec §9.5.1h, M5-T5c3c3a):
-// ONLY already-authoritative post-death live state — the
-// correlated DeathAttemptToken, the resolved post-death
-// placement, the resolved post-death vitals, the already-resolved
-// ephemeral runtime-input snapshot, and the resulting post-death
-// durable shadow (as produced by T5c3c2 / future authoritative
-// recovery). It carries NO Store result, corpse ID, revision,
-// Saver metadata, pending-death row, PK-protection row, PG
-// handle, or error. T5c3c3b later produces this value only after
-// either a successful critical persistence result OR
-// authoritative materialized-state reconciliation proving the
-// state that must be installed; this layer does not know which
-// route produced it. Treat values as immutable: owner-local
-// application deep-freezes the durable shadow and typed ingress
-// freezes the payload before publication, so caller mutation
-// after submission cannot reach live state.
+// immediate-death completion value (spec §9.5.1h, M5-T5c3c3a,
+// extended by §9.5.1k, M5-T5c3d1): ONLY already-authoritative
+// post-death live state — the correlated DeathAttemptToken,
+// the resolved post-death placement, the resolved post-death
+// vitals, the already-resolved ephemeral runtime-input
+// snapshot, the resulting post-death durable shadow (as
+// produced by T5c3c2 / future authoritative recovery), AND
+// the authoritative pending-death runtime state that became
+// durable together with the death entry (nil for a direct
+// newbie-home death with no delayed penalty phase). The
+// older c3c3a rule is superseded by d1 ONLY for this
+// pending lifecycle field: it still carries NO Store
+// request/result, revision, Saver metadata, PK-protection
+// row, PG handle, or error. T5c3c3b later produces this
+// value only after either a successful critical persistence
+// result OR authoritative materialized-state reconciliation
+// proving the state that must be installed; this layer does
+// not know which route produced it. Treat values as
+// immutable: owner-local application deep-freezes the
+// durable shadow and the pending value, and typed ingress
+// freezes the payload before publication, so caller
+// mutation after submission cannot reach live state.
 type ImmediateDeathCompletion struct {
 	Token         DeathAttemptToken
 	Placement     world.Vec3
 	Vitals        PlayerVitals
 	RuntimeInputs PlayerVitalsRuntimeInputs
 	Durable       PlayerDurableState
+
+	Pending *PendingDeathRuntime
 }
 
 // freezeImmediateDeathCompletion deep-copies a completion payload
-// into independent ownership (spec §9.5.1h): Placement, Vitals,
-// and RuntimeInputs are plain values, while the Durable shadow
-// reuses the T5c3c2 deep-freeze (Advancement bytes,
-// Spells/Skills/Items slices, every item Enchants slice). The
-// deep-copy itself performs no entity mutation.
+// into independent ownership (spec §9.5.1h + §9.5.1k):
+// Placement, Vitals, and RuntimeInputs are plain values,
+// while the Durable shadow reuses the T5c3c2 deep-freeze
+// (Advancement bytes, Spells/Skills/Items slices, every
+// item Enchants slice) and the Pending value reuses the
+// d1 deep-freeze (including the optional CorpseID
+// pointer). The deep-copy itself performs no entity
+// mutation.
 func freezeImmediateDeathCompletion(c ImmediateDeathCompletion) ImmediateDeathCompletion {
 	c.Durable = freezePlayerDurableState(c.Durable)
+	c.Pending = freezePendingDeathRuntime(c.Pending)
 	return c
 }
 
@@ -324,10 +336,11 @@ func (e *Engine) PlayerAcceptPostDeathState(token DeathAttemptToken, placement w
 
 // PlayerAcceptImmediateDeathCompletion is the canonical
 // authoritative immediate-death completion target (spec
-// §9.5.1h, M5-T5c3c3a): the owner-local installation of an
+// §9.5.1h, M5-T5c3c3a, extended by §9.5.1k, M5-T5c3d1): the owner-local installation of an
 // already-authoritative completion value carrying placement,
 // post-death vitals, the already-resolved runtime-input
-// snapshot, AND the post-death durable shadow. It MUST NOT
+// snapshot, the post-death durable shadow, AND the
+// authoritative pending-death runtime state. It MUST NOT
 // perform persistence and does NOT recalculate any durable
 // content: the supplied state became authoritative via
 // successful critical persistence OR authoritative
@@ -354,18 +367,23 @@ func (e *Engine) PlayerAcceptPostDeathState(token DeathAttemptToken, placement w
 //
 // First valid completion (life == DeathPersisting) validates
 // ALL replacement values before any live mutation — placement,
-// vitals, runtime inputs (existing rules), and the durable
+// vitals, runtime inputs (existing rules), the durable
 // shadow (existing T5c3c2 validation, deep-frozen before
-// applying) — then invokes the EXISTING
+// applying), AND the pending-death runtime value (d1 domain
+// validation, deep-frozen before applying, nil valid) —
+// then invokes the EXISTING
 // PlayerInstallPostDeathState semantics; ONLY after that
-// succeeds does it replace the durable shadow with the frozen
-// post-death shadow and move life state -> AwaitingRespawn,
+// succeeds does it replace the durable shadow AND the
+// pending-death state with the frozen post-death values and
+// move life state -> AwaitingRespawn,
 // returning DeathCompletionApplied. On install failure life
 // state REMAINS DeathPersisting, the token REMAINS
 // current/valid, the entity remains in the T5c3b guaranteed
-// rollback/quiesced state with its PRE-DEATH durable shadow,
+// rollback/quiesced state with its PRE-DEATH durable shadow
+// AND pre-death pending state,
 // and the install error returns (never a silent transition
-// back Alive). No partial durable install is permitted.
+// back Alive). No partial durable install and no partial
+// pending install are permitted.
 //
 // The completion emits NO PlayerVitalsObserver event (the state
 // was already accepted by the critical death
@@ -396,12 +414,17 @@ func (e *Engine) PlayerAcceptImmediateDeathCompletion(completion ImmediateDeathC
 	if err := validatePlayerDurableState(completion.Durable); err != nil {
 		return EntitySnapshot{}, DeathCompletionApplied, err
 	}
+	if err := ValidatePendingDeathRuntime(completion.Pending); err != nil {
+		return EntitySnapshot{}, DeathCompletionApplied, err
+	}
 	frozen := freezePlayerDurableState(completion.Durable)
+	frozenPending := freezePendingDeathRuntime(completion.Pending)
 	snap, err := e.PlayerInstallPostDeathState(ent.id, completion.Placement, completion.Vitals, completion.RuntimeInputs)
 	if err != nil {
 		return EntitySnapshot{}, DeathCompletionApplied, err
 	}
 	ent.durable = &frozen
+	ent.pendingDeath = frozenPending
 	ent.lifeState = PlayerLifeAwaitingRespawn
 	return snap, DeathCompletionApplied, nil
 }

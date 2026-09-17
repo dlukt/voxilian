@@ -453,7 +453,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
    reserved work. No gateway/protocol. Exact gameplay API
    frozen in spec §9.5.1j (v0.3.51 Phase-A source freeze).
    Spec: §9.5.1, §9.5.1i, §9.5.1j.
-- [ ] **M5-T5c3d1** Authoritative pending-death owner state +
+- [x] **M5-T5c3d1** Authoritative pending-death owner state +
   immediate-completion handoff + respawn-release primitive
   (depends on T5c3c3a + T5c3c3b + T5c3c3c2 + T5c2a;
   `internal/sim` + the narrow `internal/persist` recovery

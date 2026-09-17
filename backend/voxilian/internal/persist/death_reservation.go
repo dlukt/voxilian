@@ -69,6 +69,13 @@ func prepareDeathExecutorWork(
 	// callback execution. Freeze here too so the staged work
 	// can never alias caller memory even if the mapper drifts.
 	req = freezeDeathEntryRequest(req)
+	// The future completion template carries token,
+	// placement, vitals, runtime inputs, and durable only:
+	// the authoritative Pending state is attached at
+	// execution time (spec §9.5.1k) — from the committed
+	// DeathEntryResult.CorpseID on normal success, or from
+	// the recovered PendingDeathSnapshot on proven
+	// lost-ack — never from the pre-commit plan alone.
 	completion := sim.CloneImmediateDeathCompletion(sim.ImmediateDeathCompletion{
 		Token:         work.Capture.Token,
 		Placement:     work.Capture.Placement,

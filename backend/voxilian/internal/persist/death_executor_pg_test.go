@@ -160,7 +160,7 @@ func pgExecutorCapture(
 // pending), real CommitDeathEntry, real materialized state,
 // owner completion Applied, no recovery path, exact revisions.
 func TestPersistPGDeathExecutorNormal(t *testing.T) {
-	ctx, _, q, st, s, charID, items := pgExecutorSetup(t, "sub-exec-normal", "ExecNormal", 1)
+	ctx, pool, q, st, s, charID, items := pgExecutorSetup(t, "sub-exec-normal", "ExecNormal", 1)
 	killerID := pgAccountChar(t, q, "sub-exec-normal-k", "ExecNormalKiller")
 	capture := pgExecutorCapture(t, charID, items, killerID)
 	sink := &fakeCompletionSink{}
@@ -222,6 +222,123 @@ func TestPersistPGDeathExecutorNormal(t *testing.T) {
 	}
 	if irec.PKProtection == nil || irec.PKProtection.VictimCharacterID != charID {
 		t.Fatalf("protection = %+v, want victim %d", irec.PKProtection, charID)
+	}
+	// d1 owner state: the sink completion carries the exact
+	// authoritative pending state — cost/time from the
+	// committed request, CorpseID == the actual generated
+	// corpse row ID, PortalUsed == false.
+	var corpseID int64
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM corpses WHERE character_id = $1`, charID).Scan(&corpseID); err != nil {
+		t.Fatal(err)
+	}
+	pending := got.Pending
+	if pending == nil || pending.EffectiveCost != 40 ||
+		pending.DeathTimeSeconds != 777 || pending.CorpseID == nil ||
+		*pending.CorpseID != corpseID || pending.PortalUsed {
+		t.Fatalf("sink pending = %+v, want cost40 time777 corpse%d unused", pending, corpseID)
+	}
+}
+
+// pgExecutorNewbieCapture builds a complete cheap
+// newbie-home sim capture over real PG identities: direct
+// newbie-home route, zero cost, no affected items, no
+// killer, corpse row still generated, no pending row.
+func pgExecutorNewbieCapture(t *testing.T, charID int64) sim.ImmediateDeathCapture {
+	t.Helper()
+	e := mustSimEngine(t)
+	v := zeroHPDeathVitals(t)
+	snap, err := e.AddPlayerEntityWithDurableState(sim.CharacterID(charID),
+		world.Vec3{X: 5, Y: 0, Z: 6}, v, testDeathRuntimeInputs(t), pgExecutorDurable(nil))
+	if err != nil {
+		t.Fatalf("add player: %v", err)
+	}
+	_, base, err := e.PlayerBeginImmediateDeathCapture(snap.ID)
+	if err != nil {
+		t.Fatalf("begin capture: %v", err)
+	}
+	plan, err := sim.PlanDeathDisposition(40, sim.DeathContext{NewbieZoneDeath: true}, false)
+	if err != nil {
+		t.Fatalf("disposition: %v", err)
+	}
+	drops, err := sim.PlanDeathDrops(plan, nil)
+	if err != nil {
+		t.Fatalf("drops: %v", err)
+	}
+	points, gain, err := sim.DecodeDeathAdvancementInputs(base.Durable.Advancement)
+	if err != nil {
+		t.Fatalf("advancement inputs: %v", err)
+	}
+	adv, err := sim.PlanDeathAdvancement(sim.DeathCheap, points, gain)
+	if err != nil {
+		t.Fatalf("advancement: %v", err)
+	}
+	corpse, err := sim.PlanCorpse(12)
+	if err != nil {
+		t.Fatalf("corpse: %v", err)
+	}
+	pending, err := sim.PlanPendingDeath(plan, corpse)
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	post, err := sim.PlanPostDeathVitals(sim.PostDeathVitalsInput{
+		Vitals: testDeathVitals(t), Disposition: sim.DeathCheap,
+	})
+	if err != nil {
+		t.Fatalf("post vitals: %v", err)
+	}
+	got, err := sim.BuildImmediateDeathCapture(sim.ImmediateDeathBuildInput{
+		Base: base, Disposition: plan, Corpse: corpse,
+		Drops: drops, Advancement: adv, PostVitals: post,
+		Pending: pending, Placement: world.Vec3{X: 1, Y: 0, Z: 1},
+		Killer: sim.DeathKillerIdentity{Kind: sim.DeathKillerNone},
+	})
+	if err != nil {
+		t.Fatalf("build capture: %v", err)
+	}
+	return got
+}
+
+// Real newbie-home normal success through the executor:
+// the corpse row exists, the sink completion carries
+// Pending == nil, and no pending_deaths row exists. No
+// Store replay, no recovery path.
+func TestPersistPGDeathExecutorNewbieHome(t *testing.T) {
+	ctx, pool, _, st, s, charID, _ := pgExecutorSetup(t, "sub-exec-newbie", "ExecNewbie", 0)
+	capture := pgExecutorNewbieCapture(t, charID)
+	sink := &fakeCompletionSink{}
+	ex, _ := startExecutor(t, DeathExecutorConfig{
+		Workers: 1, QueueCapacity: 4, Store: st, Saver: s, Sink: sink,
+	})
+	res := awaitResult(t, mustSubmit(t, ex, ImmediateDeathPersistenceWork{
+		Capture: capture, RuntimeInputs: testDeathRuntimeInputs(t),
+	}))
+	if res.Err != nil {
+		t.Fatalf("result err = %v", res.Err)
+	}
+	if res.Recovered {
+		t.Fatal("Recovered = true, want false (normal ack, no recovery path)")
+	}
+	if res.Delivery != sim.DeathCompletionApplied {
+		t.Fatalf("delivery = %v, want Applied", res.Delivery)
+	}
+	if sink.numCalls() != 1 {
+		t.Fatalf("sink calls = %d, want 1", sink.numCalls())
+	}
+	if sink.calls[0].Pending != nil {
+		t.Fatalf("sink pending = %+v, want nil (newbie-home)", sink.calls[0].Pending)
+	}
+	var corpses, pendings int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM corpses WHERE character_id = $1`, charID).Scan(&corpses); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM pending_deaths WHERE character_id = $1`, charID).Scan(&pendings); err != nil {
+		t.Fatal(err)
+	}
+	if corpses != 1 || pendings != 0 {
+		t.Fatalf("corpses=%d pendings=%d, want 1/0 (corpse kept, no pending row)", corpses, pendings)
 	}
 }
 
@@ -313,6 +430,19 @@ func TestPersistPGDeathExecutorLostAck(t *testing.T) {
 	}
 	if rec.Character.ExpectedRevision != 1 || rec.Pending == nil || rec.Pending.EffectiveCost != 40 {
 		t.Fatalf("materialized = %+v, want committed rev1 cost40", rec)
+	}
+	// d1 owner state: the proven lost-ack completion
+	// delivers the recovered pending state exactly — no
+	// Store replay, no guessed values.
+	delivered := sink.calls[0].Pending
+	if delivered == nil || delivered.EffectiveCost != int(rec.Pending.EffectiveCost) ||
+		delivered.DeathTimeSeconds != rec.Pending.DeathTimeSeconds ||
+		delivered.PortalUsed != rec.Pending.PortalUsed {
+		t.Fatalf("sink pending = %+v, want recovered %+v", delivered, rec.Pending)
+	}
+	if (delivered.CorpseID == nil) != (rec.Pending.CorpseID == nil) ||
+		(delivered.CorpseID != nil && *delivered.CorpseID != *rec.Pending.CorpseID) {
+		t.Fatalf("sink corpse = %+v, want recovered %+v", delivered.CorpseID, rec.Pending.CorpseID)
 	}
 }
 

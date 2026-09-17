@@ -134,6 +134,27 @@ type entity struct {
 	lifeState  PlayerLifeState
 	deathEpoch uint64
 
+	// pendingDeath is the authoritative owner-local
+	// pending-death runtime state (spec §9.5.1k,
+	// M5-T5c3d1): character-aggregate child runtime
+	// metadata installed only by the immediate-death
+	// completion (Underworld-bound deaths) or by the
+	// authoritative recovery/hydration seam. Nil means
+	// no pending death outstanding — the only absence
+	// encoding (no Active boolean). Nil for every
+	// generic entity and for every new player unless
+	// hydration installs one. A non-nil value is always
+	// a private deep-frozen copy: installation freezes
+	// the caller's value (including the optional
+	// CorpseID pointer) and inspection returns
+	// independent copies. It rides this SAME entity
+	// object through cell handoff, is discarded with
+	// the entity on removal, and restarts at nil on a
+	// fresh entity. Never persisted, never sent on the
+	// wire, never a Store type, and NOT part of
+	// PlayerDurableState.
+	pendingDeath *PendingDeathRuntime
+
 	// lastDeathSeconds is the ephemeral whole-second timestamp of
 	// the last non-blocked death orchestration for this player
 	// entity (spec §9.5.1j, M5-T5c3c3c2): the Voxilian image of

@@ -336,6 +336,13 @@ func (x *DeathExecutor) worker(ctx context.Context) {
 // result: normal CommitDeathEntry acknowledgement, proven
 // materialized recovery, or a fail-closed error. It NEVER
 // replays CommitDeathEntry and NEVER mutates live sim state.
+// The authoritative Pending state is attached to the
+// completion here (spec §9.5.1k): normal success builds it
+// from the already-committed request plus the generated
+// DeathEntryResult.CorpseID (no PG reload); proven lost-ack
+// builds it from the recovered pending snapshot (never
+// from the original plan alone, never guessed after
+// unproven recovery).
 func (x *DeathExecutor) execute(
 	ctx context.Context,
 	job deathExecutorJob,
@@ -343,9 +350,14 @@ func (x *DeathExecutor) execute(
 	exec, err := commitDeathEntryObserved(ctx, x.saver, x.store, job.req)
 	if err == nil {
 		// Normal success: no PG reload, no ReconcileSaver,
-		// no Store retry. The frozen planned completion is
+		// no Store retry. The frozen planned completion plus
+		// the authoritative normal-path pending state is
 		// authoritative.
-		return x.deliver(ctx, job.completion, false)
+		completion, cerr := completionWithNormalPending(job.req, job.completion, exec.Result)
+		if cerr != nil {
+			return ImmediateDeathPersistenceResult{Err: cerr}
+		}
+		return x.deliver(ctx, completion, false)
 	}
 	if !errors.Is(err, sim.ErrSaverReconcileRequired) {
 		// Failed entirely before the critical callback /
@@ -360,7 +372,79 @@ func (x *DeathExecutor) execute(
 	if perr := proveDeathCommit(job.req, exec.Expected, rec, err); perr != nil {
 		return ImmediateDeathPersistenceResult{Err: perr}
 	}
-	return x.deliver(ctx, job.completion, true)
+	// Proven lost-ack: the recovered pending snapshot is
+	// the authoritative materialized-state proof, so the
+	// completion carries its exact values (retained, not
+	// discarded). No CommitDeathEntry replay, no PG
+	// reload beyond the recovery already performed.
+	completion, cerr := completionWithRecoveredPending(job.req, job.completion, rec.char.Pending)
+	if cerr != nil {
+		return ImmediateDeathPersistenceResult{Err: cerr}
+	}
+	return x.deliver(ctx, completion, true)
+}
+
+// completionWithNormalPending attaches the authoritative
+// normal-path pending state to the frozen completion
+// template (spec §9.5.1k): no PG reload — the
+// already-committed request plus the generated
+// DeathEntryResult.CorpseID is sufficient. A direct
+// newbie-home death carries Pending = nil even though the
+// transaction still created a corpse. An
+// Underworld-bound death carries the exact effective
+// cost, death time, generated CorpseID, and
+// PortalUsed == false; a non-positive generated CorpseID
+// fails closed with no owner delivery. The returned
+// completion owns an independent CorpseID copy. The
+// CorpseID is NOT exposed through
+// ImmediateDeathPersistenceResult.
+func completionWithNormalPending(
+	req store.DeathEntryRequest,
+	template sim.ImmediateDeathCompletion,
+	result store.DeathEntryResult,
+) (sim.ImmediateDeathCompletion, error) {
+	out := sim.CloneImmediateDeathCompletion(template)
+	if req.NewbieHomeRespawn {
+		out.Pending = nil
+		return out, nil
+	}
+	if result.CorpseID <= 0 {
+		return sim.ImmediateDeathCompletion{}, fmt.Errorf(
+			"persist: death executor corpse id=%d: %w", result.CorpseID, ErrDeathExecutorInvalid)
+	}
+	pending := &sim.PendingDeathRuntime{
+		EffectiveCost:    int(req.EffectiveDeathCost),
+		DeathTimeSeconds: req.DeathTimeSeconds,
+		PortalUsed:       false,
+	}
+	corpseID := result.CorpseID
+	pending.CorpseID = &corpseID
+	if err := sim.ValidatePendingDeathRuntime(pending); err != nil {
+		return sim.ImmediateDeathCompletion{}, fmt.Errorf("persist: death executor normal pending: %w", err)
+	}
+	out.Pending = pending
+	return out, nil
+}
+
+// completionWithRecoveredPending attaches the authoritative
+// lost-ack pending state to the frozen completion template
+// (spec §9.5.1k): the recovered pending snapshot —
+// already proven compatible with the attempted death by
+// proveDeathCommit — maps through the shared recovery
+// mapper. A nil recovered row yields Pending = nil. The
+// original plan alone is never used.
+func completionWithRecoveredPending(
+	req store.DeathEntryRequest,
+	template sim.ImmediateDeathCompletion,
+	recovered *store.PendingDeathSnapshot,
+) (sim.ImmediateDeathCompletion, error) {
+	out := sim.CloneImmediateDeathCompletion(template)
+	pending, err := MapPendingDeathRecovery(sim.CharacterID(req.Character.ID), recovered)
+	if err != nil {
+		return sim.ImmediateDeathCompletion{}, fmt.Errorf("persist: death executor recovered pending: %w", err)
+	}
+	out.Pending = pending
+	return out, nil
 }
 
 // deathRecovery is the worker-local materialized state for one
