@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.50 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.51 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -7973,9 +7973,10 @@ T5c3a+T5c3b+T5c3c+T5c3d, frozen v0.3.43 in §9.5.1d, T5c3c is
 further split into T5c3c1+T5c3c2+T5c3c3, frozen v0.3.45 in
 §9.5.1f, T5c3c3 is further split into
 T5c3c3a+T5c3c3b+T5c3c3c, frozen v0.3.48 in §9.5.1h, the
-c3c3b recovery contract is frozen v0.3.49 in §9.5.1h, and
+c3c3b recovery contract is frozen v0.3.49 in §9.5.1h,
 T5c3c3c is further split into T5c3c3c1+T5c3c3c2, frozen
-v0.3.50 in §9.5.1i):
+v0.3.50 in §9.5.1i, and the c3c3c2 gameplay contract is
+frozen v0.3.51 in §9.5.1j):
 
 - **T5a — pure/source-faithful death mechanics and immutable plans**
   (§9.5.4–§9.5.14 pure surface; §9.5.17 non-scope).
@@ -10362,11 +10363,11 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
  restored rest threshold, complete per-item resolved
  drop/content facts, resolved newbie-home vs Underworld
  placement, construction of `ImmediateDeathCapture`, the
- owner transition to `DeathPersisting` ONLY after
- reservation work has successfully prepared, and activation
- of that already-prepared reserved work. No
- gateway/protocol. The exact gameplay API is deliberately
- deferred to c3c3c2's own Phase-A source freeze.
+  owner transition to `DeathPersisting` ONLY after
+  reservation work has successfully prepared, and activation
+  of that already-prepared reserved work. No
+  gateway/protocol. The exact gameplay API is frozen in
+  §9.5.1j (v0.3.51 Phase-A source freeze).
 
  Source-order readiness note for future c3c3c2 (binding
  input, not an implementation): pinned source remains
@@ -10398,11 +10399,253 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
  M5-T5-complete is the EIGHTEEN-task set T5a + T5b1a + T5b1b
  + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a + T5c3b +
  T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 +
- T5c3d + T5c4 (M5-T7 wording/task index updated
- accordingly). After this task T5c3c3c1 is `[x]` while
- T5c3c3c2, T5c3d, T5c4, T6, T7, and the M5 exit stay `[ ]`.
+  T5c3d + T5c4 (M5-T7 wording/task index updated
+  accordingly). After this task T5c3c3c1 is `[x]` while
+  T5c3c3c2, T5c3d, T5c4, T6, T7, and the M5 exit stay `[ ]`.
 
- #### 9.5.2 Death disposition: avoided vs cheap vs normal (frozen)
+  #### 9.5.1j M5 zero-HP death orchestration (T5c3c3c2, frozen v0.3.51)
+
+  T5c3c3c2 (depends on T5c3c3a + T5c3c3b + T5c3c3c1 + T5a +
+  T5c3c2; `internal/sim` only) owns the one canonical
+  owner-local zero-HP `Killed` orchestration that future M5-T7
+  combat and every other lethal-damage owner call in the SAME
+  owner turn after lethal health application. No second death
+  system is created: `PlayerLoseHealth` itself gains no
+  automatic world/item resolution in this task. This section
+  freezes the exact runtime/API contract from an independent
+  re-read of the pinned source
+  (`Meridian59/Meridian59@095c07b69e957fb5c49593e6ad488b4c64ba088d`);
+  `meridian59.md` needed no correction and is untouched.
+
+  Source audit reconfirmed (binding order): `player.kod::Killed`
+  runs (1) `piDeathCost = GetDefaultDeathCost()`; (2) `if
+  GetTime() < piLastDeathTime + 2` immediate return with NO
+  stamp; (3) `CancelRescue`; (4) `piLastDeathTime =
+  getTime()`; (5) death-location capture; (6) the Avoided test
+  (logged-on arena-non-real OR `OutOfGrace` prison OR
+  `SafePlayerAttack`); (7) if Avoided: HP = 1, `NewHealth`,
+  `ActivateCheapDeath` on special active items, return with no
+  corpse/drop/Underworld/kill record; (8) otherwise the real
+  Cheap/Normal pipeline. `NewHealth` owns only the health
+  timer (create iff `HP != MaxHP && HP > 0`, cancel at exact
+  equality, otherwise keep) plus the redraw. Token death
+  (`Token.NewUnused`) restores the stored rest-threshold
+  adjustment on the player BEFORE corpse creation and the
+  post-death vitals assignment, and relocates the token to the
+  death room at the death position while the generic cheap
+  drop loop drops nothing. `user.kod::UserGotoDeadRoom` sends
+  a newbie-range death directly to the newbie home and every
+  other death to the Underworld. `uworld.kod::LeaveHold` only
+  invokes `ApplyDeathPenalties`. `soldshld.kod::OwnerDied`
+  effects stay classification-only here (non-scope, §9.5.14).
+
+  Resolved input contract (exact Go names; `internal/sim`
+  only, no Store/session/gateway/PG values, no room IDs, no
+  arena state rediscovery, no honor strings, no Token
+  proto/class, no item classes, no catalog lookup):
+
+  ```go
+  type ImmediateDeathItemPolicy struct {
+      ItemID int64
+
+      DropOnDeath bool
+      RoomAccepts bool
+      SpecialItem bool
+  }
+
+  type ImmediateDeathResolvedInput struct {
+      NowSeconds int64
+
+      DefaultDeathCost int
+      Context DeathContext
+
+      Killer DeathKillerIdentity
+
+      Items []ImmediateDeathItemPolicy
+
+      TokenItemID int64
+      TokenRestoredThreshold int
+
+      StillNewbie bool
+      Murderer    bool
+
+      HasSoldierShield    bool
+      SoldierShieldRank   int
+      KilledByShieldEnemy bool
+
+      NewbieHomePlacement world.Vec3
+      UnderworldPlacement world.Vec3
+
+      RuntimeInputs PlayerVitalsRuntimeInputs
+  }
+  ```
+
+  Derived facts are never duplicated: killer-is-player is
+  `Killer.Kind == DeathKillerCharacter`; frenzy is
+  `Context.FrenzyActive`. `DeathContext.CarriesToken` stays
+  the pure classification fact. Item policies bind 1:1 to the
+  captured durable inventory in exact durable order:
+  `len(Items) == len(durable Items)`, policy `[i].ItemID`
+  equals durable `Items[i].ID`, no reorder/sort/missing/
+  extra/duplicate; index `i` converts to the existing opaque
+  T5a key `base.ItemKeys[i]`, never `Key = ItemID`.
+
+  Token contract: `TokenDeath == false` requires `TokenItemID
+  == 0` and no threshold override; `TokenDeath == true`
+  requires `TokenItemID > 0` identifying exactly one captured
+  item, with the already-resolved post-unuse rest threshold
+  validating in the canonical 10..100 domain. The restored
+  threshold applies BEFORE `PlanPostDeathVitals` (pinned
+  source order); the resulting `PostVitals.RestThreshold`
+  carries it. The token is removed from the resulting durable
+  inventory and becomes an affected ground item through the
+  existing `BuildImmediateDeathCapture` token-relocation
+  path, with zero PK protection even for a player killer.
+
+  Orchestration outcome (explicit result, not inferred from
+  life state; errors are contract/validation failures, never
+  ordinary Blocked/Avoided outcomes):
+
+  ```go
+  type ImmediateDeathDisposition uint8
+
+  const (
+      ImmediateDeathBlocked ImmediateDeathDisposition = iota
+      ImmediateDeathAvoided
+      ImmediateDeathAccepted
+  )
+
+  type ImmediateDeathOrchestrationResult struct {
+      Disposition ImmediateDeathDisposition
+      Plan        DeathDispositionPlan
+      Hooks       ImmediateDeathHooks
+      Token       DeathAttemptToken
+      Capture     ImmediateDeathCapture
+  }
+  ```
+
+  `Token`/`Capture` are meaningful only for
+  `ImmediateDeathAccepted`. No Store request, revision,
+  corpse DB ID, or Saver state is exposed.
+
+  Ephemeral last-death state: one owner-local `lastDeathSeconds
+  int64` on the player entity, zero-initialized (matching the
+  source property initialization). Ephemeral only: not
+  `PlayerDurableState`, not Store, never persisted, never on
+  the wire. It rides the SAME entity object through cell
+  handoff, is discarded on removal, and restarts at 0 on a
+  fresh entity. A read-only owner/test inspection helper
+  exposes it. No PG field, no migration.
+
+  Frozen call sequence for one zero-HP orchestration call
+  (conceptually `PlayerOrchestrateImmediateDeath(id,
+  reservation, input)`; exact Go names may differ only as
+  noted):
+
+  ```text
+  1. structural validation with zero mutation (reservation
+     non-nil with transferred ownership; entity exists,
+     resident, player, Alive, HP == 0, complete durable
+     shadow present else ErrPlayerDurableStateMissing,
+     death epoch != MaxUint64; NowSeconds >= 0;
+     DefaultDeathCost domain; RuntimeInputs valid; BOTH
+     placements valid world positions; killer identity valid;
+     HasSoldierShield rank 1..10 when present; probe
+     DeathDisposition via PlanDeathDisposition plus full
+     item-policy alignment and Token contract-shape checks
+     against that probe)
+  2. double-death guard DeathBlockedByDoubleDeath(
+     lastDeathSeconds, NowSeconds)
+  3. if BLOCKED: Cancel reservation; lastDeathSeconds
+     unchanged; HP/epoch/life/runtime/position/durable
+     unchanged; no Store work; return Blocked (not an error)
+  4. stamp lastDeathSeconds = NowSeconds
+  5. branch DeathDisposition via the SAME pure
+     PlanDeathDisposition (identical to the probe; the probe
+     is host-language contract validation, this is the
+     source-semantic routing; observable state order
+     guard -> stamp -> branch matches source)
+  6. if Avoided: HP = 1 with exactly one commitVitals event
+     plus NewHealth-equivalent reconcileHealth from the
+     current tick; life stays Alive; no epoch increment, no
+     quiesce, no BuildImmediateDeathCapture, no corpse, no
+     pending, no kill record, no Store work; Cancel
+     reservation; return Avoided
+  7. otherwise (Cheap/Normal): deep-freeze the durable
+     shadow, death position, and vitals; predict the
+     post-begin token {EntityID, CharacterID, Epoch =
+     deathEpoch + 1} (valid: exhaustion already rejected);
+     compose the existing pure T5a helpers only
+     (PlanDeathDisposition already held, PlanCorpse,
+     PlanDeathDrops, DecodeDeathAdvancementInputs,
+     PlanDeathAdvancement, GuardianAngelMailEligible,
+     PlanImmediateDeathHooks, PlanPostDeathVitals with the
+     token-restored threshold already applied, PlanPendingDeath,
+     BuildImmediateDeathCapture with the predicted token);
+     select Placement (NewbieHomeRespawn ? NewbieHomePlacement
+     : UnderworldPlacement) and require Pending phase None
+     for newbie-home vs Pending for every other real death
+     (never inferred from cost alone)
+  8. reservation.PrepareImmediateDeathWork(capture,
+     RuntimeInputs) while STILL Alive; Prepare failure ->
+     Cancel, Alive, HP 0, epoch unchanged, no quiesce, no
+     activation, no leaked permit, error returned (lastDeath
+     stays stamped per source order; a correct
+     pre-validation makes this a tripwire-impossible path)
+  9. PlayerBeginDeathPersistence (deathEpoch++, life =
+     DeathPersisting, existing c3b quiesce); the returned
+     token MUST equal the prediction (single-owner
+     invariant; mismatch -> Cancel + error, unreachable by
+     construction since no mutation can interleave)
+  10. reservation.ActivateImmediateDeathWork() in the SAME
+     owner turn (incapable of queue-full by the c3c3c1
+     permit proof)
+  11. return RealDeathAccepted with Plan/Hooks/Token/Capture
+  ```
+
+  Reservation-composition resolution (binding): the existing
+  c3c3c1 seam is SUFFICIENT with no additive extension and
+  no executor redesign. The predicted-token order above
+  guarantees no validation/mapping error remains possible
+  after `PlayerBeginDeathPersistence` mutates the entity:
+  `Prepare` (the only fallible reservation operation) runs
+  strictly before begin, and `Activate` (the only
+  post-begin reservation operation) is infallible by the
+  frozen c3c3c1 permit proof. The forbidden orders
+  (begin-then-Prepare, begin-then-TrySubmit) do not exist in
+  this path. A begin failure after successful Prepare is
+  unreachable in the single-owner turn (every begin
+  precondition is already proven in step 1); its handler
+  Cancels the reservation with no persistence job and no
+  leaked permit.
+
+  lastDeath semantics (binding): blocked attempts leave
+  `lastDeathSeconds` unchanged; Avoided, Cheap, and Normal
+  all stamp `NowSeconds`; exactly `NowSeconds ==
+  LastDeathSeconds + 2` proceeds. Structural validation
+  errors (step 1) leave it unchanged. No `time.Now()`; no
+  sim `uint32` tick interpreted as whole Unix time.
+
+  Real-death liveness: after acceptance the live entity
+  stays quiesced in `DeathPersisting` with NO live
+  post-death placement/vitals/durable install and NO
+  post-death runtime initialization; installation happens
+  only after c3c3b persistence/recovery returns through the
+  existing c3c3a completion ingress. Advance the five-effect
+  `DeathAdvancementPlan`, corpse, drops, PK metadata, and
+  kill audit exclusively through the frozen capture.
+
+  Non-scope (binding): T5c3d, T5c4, M5-T6, M5-T7 combat
+  integration, automatic world/content resolution,
+  PG/catalog lookup, Store transaction changes, new
+  recovery path, new executor/worker/queue/goroutine,
+  `CancelRescue`/`RemoveAllEnchantments`/special-item-loss/
+  SoldierShield persistence, GuardianAngel mail delivery,
+  guild/faction/justice systems, corpse expiry worker, SQL,
+  migration, generated code, gateway/proto/session,
+  `PlayerLoseHealth` automatic dispatch.
+
+  #### 9.5.2 Death disposition: avoided vs cheap vs normal (frozen)
 
 Three dispositions, semantically distinct:
 

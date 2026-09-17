@@ -1,4 +1,4 @@
-# Voxilian Backend — Implementation Plan (v1.34)
+# Voxilian Backend — Implementation Plan (v1.35)
 
 > Source of truth for WHAT: `docs/backend-spec.md` (v0.3.50).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
@@ -450,9 +450,9 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   construction of `ImmediateDeathCapture`, owner transition
   to `DeathPersisting` ONLY after reservation work has
   successfully prepared, activation of that already-prepared
-  reserved work. No gateway/protocol. Exact gameplay API
-  deferred to c3c3c2's own Phase-A source freeze.
-  Spec: §9.5.1, §9.5.1i.
+   reserved work. No gateway/protocol. Exact gameplay API
+   frozen in spec §9.5.1j (v0.3.51 Phase-A source freeze).
+   Spec: §9.5.1, §9.5.1i, §9.5.1j.
 - [ ] **M5-T5c3d** Pending-death / Portal / Underworld-exit async
   lifecycle (depends on T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5b2a + T5b2b + T5c2a + T5c2b;
   `internal/sim` + `internal/persist`): recovered pending-death
@@ -639,6 +639,31 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.35: freeze M5 zero-HP death orchestration (docs only,
+  spec v0.3.50 -> v0.3.51 new §9.5.1j; implementation
+  deferred to Phase B): independent re-read of pinned
+  `Meridian59/Meridian59@095c07b` (`player.kod::Killed`
+  8-step order, `NewHealth` timer-only semantics, Token
+  `NewUnused` threshold-restore-before-vitals order,
+  `user.kod::UserGotoDeadRoom` newbie-home vs Underworld
+  routing, `uworld.kod::LeaveHold` penalties-only,
+  `soldshld.kod` classification-only non-scope;
+  `meridian59.md` untouched); exact `internal/sim` contract
+  (`ImmediateDeathItemPolicy`, `ImmediateDeathResolvedInput`,
+  `ImmediateDeathDisposition`,
+  `ImmediateDeathOrchestrationResult`, ephemeral
+  `lastDeathSeconds` + inspection helper); source-faithful
+  call sequence (structural pre-validation with probe
+  disposition, double-death guard, stamp, branch disposition,
+  Avoided HP=1 + reconcile, predicted-token Prepare-before-
+  begin with no reservation API change, begin token-equality
+  invariant, infallible same-turn Activate); lastDeath
+  semantics (blocked/structural-error unchanged; Avoided/
+  Cheap/Normal stamp; Prepare failure stays stamped);
+  binding non-scope (T5c3d/T5c4/T6/T7/combat integration/
+  Store/SQL/gateway). Checkbox state unchanged: T5c3c3c2
+  still `[ ]`.
 
 - v1.34: split M5-T5c3c3c into reservation-first T5c3c3c1 +
   orchestration-later T5c3c3c2 (docs only, spec v0.3.49 ->
