@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.51 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.52 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -7965,18 +7965,19 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
 
 #### 9.5.1 Ownership split and the two-phase lifecycle
 
-M5-T5 is SEVENTEEN tasks (this section is their shared boundary;
-the former single T5c is split into T5c1–T5c4, frozen v0.3.39 in
-§9.5.1a, T5c2 is further split into T5c2a+T5c2b, frozen
-v0.3.40 in §9.5.1b, T5c3 is further split into
-T5c3a+T5c3b+T5c3c+T5c3d, frozen v0.3.43 in §9.5.1d, T5c3c is
-further split into T5c3c1+T5c3c2+T5c3c3, frozen v0.3.45 in
-§9.5.1f, T5c3c3 is further split into
-T5c3c3a+T5c3c3b+T5c3c3c, frozen v0.3.48 in §9.5.1h, the
-c3c3b recovery contract is frozen v0.3.49 in §9.5.1h,
-T5c3c3c is further split into T5c3c3c1+T5c3c3c2, frozen
-v0.3.50 in §9.5.1i, and the c3c3c2 gameplay contract is
-frozen v0.3.51 in §9.5.1j):
+ M5-T5 is TWENTY tasks (this section is their shared boundary;
+ the former single T5c is split into T5c1–T5c4, frozen v0.3.39 in
+ §9.5.1a, T5c2 is further split into T5c2a+T5c2b, frozen
+ v0.3.40 in §9.5.1b, T5c3 is further split into
+ T5c3a+T5c3b+T5c3c+T5c3d, frozen v0.3.43 in §9.5.1d, T5c3c is
+ further split into T5c3c1+T5c3c2+T5c3c3, frozen v0.3.45 in
+ §9.5.1f, T5c3c3 is further split into
+ T5c3c3a+T5c3c3b+T5c3c3c, frozen v0.3.48 in §9.5.1h, the
+ c3c3b recovery contract is frozen v0.3.49 in §9.5.1h,
+ T5c3c3c is further split into T5c3c3c1+T5c3c3c2, frozen
+ v0.3.50 in §9.5.1i, the c3c3c2 gameplay contract is
+ frozen v0.3.51 in §9.5.1j, and T5c3d is further split into
+ T5c3d1+T5c3d2+T5c3d3, frozen v0.3.52 in §9.5.1k):
 
 - **T5a — pure/source-faithful death mechanics and immutable plans**
   (§9.5.4–§9.5.14 pure surface; §9.5.17 non-scope).
@@ -8130,29 +8131,57 @@ frozen v0.3.51 in §9.5.1j):
   on T5c3c3a + T5c3c3b + T5c3c3c1 + T5a + T5c3c2. The exact
   gameplay API is deferred to c3c3c2's own Phase-A source
   freeze.
-- **T5c3d — pending-death / Portal / Underworld-exit async
-  lifecycle** (§9.5.1d): the already-durable second phase —
-  recovered pending-death lifecycle, Portal-of-Life runtime
-  transition using the existing pure T5a planner +
-  `persist.CommitPortalOfLife`, Portal result/recovery through the
-  same off-owner rule, the authoritative Underworld EXIT
-  transition, `PlanDeathPenalties` using the current durable
-  pending cost, `persist.CommitDeathPenalties`, exactly-once
-  pending   consumption, recovery after stale/semantic/ambiguous
-  results, and owner-only final live-state apply. `internal/sim`
-  + `internal/persist`. Depends on T5c3c1 + T5c3c2 + T5c3c3a +
-  T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5b2a + T5b2b + T5c2a + T5c2b. `C->S 120 respawn_ack` is NOT the semantic synonym
-  for Underworld `LeaveHold` / `ApplyDeathPenalties`: T5c4 owns
-  opcode 120 transport/state routing while T5c3d owns the
-  gameplay event "player actually leaves the Underworld".
-- **T5c4 — gateway death wire/state integration + reconnect E2E**:
-  gateway/state-machine routing, rate-gated C→S 120 handling, critical
-  S→C 214 / 215 delivery, session/Presence/NetEntityID composition,
-  reconnect/end-to-end proof reusing the existing 120/214/215 codecs
-  (no second protocol). Depends on T5c3a + T5c3b + T5c3c1 + T5c3c2 +
-  T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d + the existing M4 gateway/presence/fanout foundation.
+ - **T5c3d1 — authoritative pending-death owner state +
+   immediate-completion handoff + respawn-release primitive**
+   (§9.5.1k): the store-independent `PendingDeathRuntime`
+   value, owner-local pending state on the player entity,
+   the extended immediate-death completion carrying
+   authoritative pending state (normal-success construction
+   from `DeathEntryResult`, proven-lost-ack construction
+   from the recovered pending snapshot), atomic owner
+   install, pending inspection, the authoritative
+   recovery/hydration seam, and the owner-local
+   respawn-release transition `AwaitingRespawn -> Alive`.
+   `internal/sim` + the narrow `internal/persist`
+   recovery mapper. Depends on T5c3c3a + T5c3c3b +
+   T5c3c3c2 + T5c2a. No Portal calculation/commit, no
+   Portal async worker, no Underworld `LeaveHold`, no
+   `PlanDeathPenalties` / `CommitDeathPenalties`, no
+   penalty RNG, no pending deletion, no gateway opcode
+   120, no 214 / 215 transport.
+ - **T5c3d2 — Portal-of-Life async runtime transition**
+   (§9.5.1k, future): Portal target/runtime contract,
+   `PlanPortalOfLife`, portal attempt
+   correlation/serialization, off-owner
+   `CommitPortalOfLife`, stale/ambiguous materialized
+   recovery, and the authoritative owner update of
+   effective cost + portal-used state. Depends on T5c3d1
+   + T5a + T5b2a + T5c2a + T5c2b. No Underworld-exit
+   penalties.
+ - **T5c3d3 — authoritative Underworld-exit penalty
+   transition + exactly-once pending consumption**
+   (§9.5.1k, future): the actual authoritative
+   Underworld `LeaveHold` event, the current pending
+   cost snapshot, resolved penalty inputs,
+   `PlanDeathPenalties` with deterministic owner RNG,
+   the complete post-penalty Character state, off-owner
+   `CommitDeathPenalties`, stale/ambiguous recovery,
+   the exactly-once pending deletion proof, and the
+   owner-only final apply + pending clear. Depends on
+   T5c3d1 + T5c3d2 + T5a + T5b2b + T5c2a + T5c2b.
+   C→S 120 `respawn_ack` is NOT the synonym for
+   Underworld `LeaveHold` / `ApplyDeathPenalties`: T5c4
+   owns opcode 120 transport/state routing while T5c3d3
+   owns the gameplay event "player actually leaves the
+   Underworld".
+ - **T5c4 — gateway death wire/state integration + reconnect E2E**:
+   gateway/state-machine routing, rate-gated C→S 120 handling, critical
+   S→C 214 / 215 delivery, session/Presence/NetEntityID composition,
+   reconnect/end-to-end proof reusing the existing 120/214/215 codecs
+   (no second protocol). Depends on T5c3a + T5c3b + T5c3c1 + T5c3c2 +
+   T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2 + T5c3d3 + the existing M4 gateway/presence/fanout foundation.
 
-M5-T5-complete is `T5a + T5b1a + T5b1b + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d + T5c4` (EIGHTEEN tasks).
+ M5-T5-complete is `T5a + T5b1a + T5b1b + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2 + T5c3d3 + T5c4` (TWENTY tasks).
 
 Ledger contract (binding on T5b2a/T5b2b): Portal-of-Life writes ZERO
 ledger rows. Underworld-exit death penalties write ZERO ledger rows.
@@ -10391,17 +10420,17 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
  tick interpreted as Unix/absolute seconds. That API is
  deliberately NOT finished in c3c3c1.
 
- Downstream graph (binding): T5c3d now depends on T5c3c1 +
- T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5b2a +
- T5b2b + T5c2a + T5c2b; T5c4 depends on T5c3a + T5c3b +
- T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 +
- T5c3d + the existing M4 gateway/presence/fanout foundation;
- M5-T5-complete is the EIGHTEEN-task set T5a + T5b1a + T5b1b
- + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a + T5c3b +
- T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 +
-  T5c3d + T5c4 (M5-T7 wording/task index updated
-  accordingly). After this task T5c3c3c1 is `[x]` while
-  T5c3c3c2, T5c3d, T5c4, T6, T7, and the M5 exit stay `[ ]`.
+  Downstream graph (binding): T5c3d now depends on T5c3c1 +
+  T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5b2a +
+  T5b2b + T5c2a + T5c2b; T5c4 depends on T5c3a + T5c3b +
+  T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 +
+  T5c3d + the existing M4 gateway/presence/fanout foundation;
+  M5-T5-complete is the EIGHTEEN-task set T5a + T5b1a + T5b1b
+  + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a + T5c3b +
+  T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 +
+   T5c3d + T5c4 (M5-T7 wording/task index updated
+   accordingly). After this task T5c3c3c1 is `[x]` while
+   T5c3c3c2, T5c3d, T5c4, T6, T7, and the M5 exit stay `[ ]`.
 
   #### 9.5.1j M5 zero-HP death orchestration (T5c3c3c2, frozen v0.3.51)
 
@@ -10635,15 +10664,165 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
   `DeathAdvancementPlan`, corpse, drops, PK metadata, and
   kill audit exclusively through the frozen capture.
 
-  Non-scope (binding): T5c3d, T5c4, M5-T6, M5-T7 combat
-  integration, automatic world/content resolution,
-  PG/catalog lookup, Store transaction changes, new
-  recovery path, new executor/worker/queue/goroutine,
-  `CancelRescue`/`RemoveAllEnchantments`/special-item-loss/
-  SoldierShield persistence, GuardianAngel mail delivery,
-  guild/faction/justice systems, corpse expiry worker, SQL,
-  migration, generated code, gateway/proto/session,
-  `PlayerLoseHealth` automatic dispatch.
+   Non-scope (binding): T5c3d, T5c4, M5-T6, M5-T7 combat
+   integration, automatic world/content resolution,
+   PG/catalog lookup, Store transaction changes, new
+   recovery path, new executor/worker/queue/goroutine,
+   `CancelRescue`/`RemoveAllEnchantments`/special-item-loss/
+   SoldierShield persistence, GuardianAngel mail delivery,
+   guild/faction/justice systems, corpse expiry worker, SQL,
+   migration, generated code, gateway/proto/session,
+   `PlayerLoseHealth` automatic dispatch.
+
+   #### 9.5.1k M5 pending-death owner lifecycle split (T5c3d1+T5c3d2+T5c3d3, frozen v0.3.52)
+
+   The former single T5c3d combined three separate
+   correctness boundaries — authoritative pending-death
+   state reaching the sim owner, the Portal-of-Life async
+   mutation, and the actual Underworld `LeaveHold` /
+   penalty planning plus exactly-once async pending
+   consumption — so it is split into T5c3d1+T5c3d2+T5c3d3
+   (this section supersedes the T5c3d paragraph of §9.5.1
+   for the task split only; §9.5.1d stays otherwise
+   frozen). `meridian59.md` is untouched: this task
+   changes no Meridian mechanics.
+
+   A more important existing gap makes d1 a prerequisite:
+   `store.CommitDeathEntry` generates the CorpseID inside
+   the PG transaction and may insert `pending_deaths`,
+   while `sim.ImmediateDeathCompletion` carries token,
+   placement, vitals, runtime inputs, and durable — but no
+   pending cost, death time, CorpseID, or portal-used
+   state. Normal c3c3b success receives
+   `store.DeathEntryResult.CorpseID` but the executor
+   delivers its prebuilt completion without that ID, and
+   lost-ack recovery loads the exact
+   `PendingDeathSnapshot` only to prove the commit before
+   discarding it. Before Portal or Underworld exit can be
+   safe, the owner must hold the exact authoritative
+   pending state.
+
+   T5c3d1 (depends on T5c3c3a + T5c3c3b + T5c3c3c2 +
+   T5c2a; `internal/sim` + the narrow
+   `internal/persist` recovery mapper) owns the
+   store-independent `PendingDeathRuntime` value
+   (`EffectiveCost` 0..100, `DeathTimeSeconds` >= 0,
+   optional `CorpseID` with nil valid and non-nil
+   pointing at an ID > 0, `PortalUsed` bool; absence of
+   pending death is a nil pointer with no redundant
+   `Active` boolean; no Store revision, Saver revision,
+   `CharacterSnapshot`, PG handle, session ID, or
+   NetEntityID), owner-local pending state on the player
+   entity (nil for every generic entity; nil for a new
+   player unless authoritative hydration installs one;
+   preserved across same-entity cell handoff; discarded
+   on entity removal; fresh re-add starts nil unless
+   hydrated again; NOT part of `PlayerDurableState`),
+   the extended immediate-death completion carrying
+   authoritative pending state (the older c3c3a rule is
+   superseded by d1 ONLY for this pending lifecycle
+   field; still no revision, Saver state, PG handle,
+   Store request/result, or PK-protection rows),
+   normal-success construction from `DeathEntryResult`
+   (`NewbieHomeRespawn == true` carries nil even though
+   the transaction still created a corpse;
+   `NewbieHomeRespawn == false` carries the exact
+   effective cost, death time, generated CorpseID, and
+   `PortalUsed == false` with `CorpseID > 0` validated
+   before owner delivery; no PG reload on normal
+   success; no CorpseID exposure through
+   `ImmediateDeathPersistenceResult`), proven-lost-ack
+   construction from the recovered pending snapshot
+   (nil stays nil; non-nil maps exact cost, exact death
+   time, deep-copied optional CorpseID, exact
+   portal-used; no `CommitDeathEntry` replay; the
+   already-authoritative pending data is retained
+   instead of discarded), atomic owner install (all of
+   placement, vitals, runtime inputs, durable, AND
+   pending prevalidated/frozen before any live
+   mutation; duplicate detection still BEFORE payload
+   validation so a redelivered completion with a
+   malformed/different pending payload stays an exact
+   zero-mutation Duplicate; on validation error life
+   remains `DeathPersisting` with the same token
+   retryable and position/vitals/runtime/history/
+   durable/pending unchanged; after install the
+   durable AND pending are replaced with life ->
+   `AwaitingRespawn` and no remaining fallible
+   operation; no `PlayerVitalsObserver` replay),
+   read-only pending inspection (unknown ->
+   `ErrEntityNotFound`; generic / player-without-pending
+   -> zero, false, nil; player-with-pending ->
+   deep-copied value, true, nil; allowed while
+   `DeathPersisting`, `AwaitingRespawn`, `Alive`, and
+   `MIGRATING`), the authoritative owner hydration seam
+   (resident player, life `== PlayerLifeAlive`, nil
+   valid as authoritative "no pending death"; no Store
+   read, no Portal/penalty mechanics), and the
+   owner-local respawn-release transition
+   `AwaitingRespawn -> Alive` (first release with the
+   exact current token moves life to `Alive` and
+   NOTHING ELSE — position, vitals, runtime, durable,
+   pending, death epoch, last-death seconds, history,
+   and identity preserved; exact-token repeat while
+   `Alive` is a zero-mutation Duplicate; `DeathPersisting`,
+   wrong CharacterID, wrong/zero epoch, generic entity,
+   and unknown old EntityID follow the existing
+   mismatch/not-found conventions with `MIGRATING` ->
+   `ErrCellHandoffRequired` and no CharacterID-only
+   fallback). `PlayerReleaseRespawn` is NOT Underworld
+   `LeaveHold`, `ApplyDeathPenalties`, pending deletion,
+   or Portal: after an Underworld-bound release life is
+   `Alive` with pending STILL active, so ordinary
+   gameplay mutation/input is accepted while the
+   delayed-death phase remains outstanding; after a
+   direct newbie-home release life is `Alive` with
+   pending nil. Deep-copy the optional CorpseID pointer
+   at every ownership boundary: caller mutation of the
+   pointed value after installation, inspection, or
+   completion submission MUST NOT mutate live sim
+   state. T5c3d1 adds NO Portal executor, penalty
+   executor, worker, goroutine, queue, reservation, or
+   new Store transaction; it only extends the
+   already-existing immediate death executor's
+   completion content. Existing c3c3b recovery rules
+   (no blind replay, exact `expected+1` proof, semantic
+   character/item comparison, pending-shape proof,
+   Saver reconciliation, owner-only mutation,
+   `ErrDeathCommitUnproven`) are NOT weakened.
+
+   T5c3d2 (depends on T5c3d1 + T5a + T5b2a + T5c2a +
+   T5c2b; future) owns the Portal target/runtime
+   contract, `PlanPortalOfLife`, portal attempt
+   correlation/serialization, off-owner
+   `CommitPortalOfLife`, stale/ambiguous materialized
+   recovery, and the authoritative owner update of
+   effective cost + portal-used state. No
+   Underworld-exit penalties.
+
+   T5c3d3 (depends on T5c3d1 + T5c3d2 + T5a + T5b2b +
+   T5c2a + T5c2b; future) owns the actual
+   authoritative Underworld `LeaveHold` event, the
+   current pending cost snapshot, resolved penalty
+   inputs, `PlanDeathPenalties` with deterministic
+   owner RNG, the complete post-penalty Character
+   state, off-owner `CommitDeathPenalties`,
+   stale/ambiguous recovery, the exactly-once pending
+   deletion proof, and the owner-only final apply +
+   pending clear. C→S 120 remains NOT synonymous with
+   `LeaveHold`.
+
+   Downstream graph (binding): T5c4 now depends on
+   T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b +
+   T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2 + T5c3d3 + the
+   existing M4 gateway/presence/fanout foundation;
+   M5-T5-complete is the TWENTY-task set T5a + T5b1a +
+   T5b1b + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a +
+   T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b +
+   T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2 + T5c3d3 + T5c4
+   (M5-T7 wording/task index updated accordingly).
+   After this task T5c3d1, T5c3d2, T5c3d3, T5c4, T6, T7,
+   and the M5 exit stay `[ ]`.
 
   #### 9.5.2 Death disposition: avoided vs cheap vs normal (frozen)
 

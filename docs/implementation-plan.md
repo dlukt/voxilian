@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.35)
+# Voxilian Backend — Implementation Plan (v1.36)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.50).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.52).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -453,20 +453,48 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
    reserved work. No gateway/protocol. Exact gameplay API
    frozen in spec §9.5.1j (v0.3.51 Phase-A source freeze).
    Spec: §9.5.1, §9.5.1i, §9.5.1j.
-- [ ] **M5-T5c3d** Pending-death / Portal / Underworld-exit async
-  lifecycle (depends on T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5b2a + T5b2b + T5c2a + T5c2b;
-  `internal/sim` + `internal/persist`): recovered pending-death
-  lifecycle, Portal-of-Life runtime transition (pure T5a planner +
-  `persist.CommitPortalOfLife`), authoritative Underworld EXIT
-  transition, `PlanDeathPenalties` over the current durable pending
-  cost, `persist.CommitDeathPenalties`, exactly-once pending
-  consumption, stale/semantic/ambiguous recovery, owner-only final
-  apply. C→S 120 `respawn_ack` is NOT the synonym for Underworld
-  `LeaveHold`/`ApplyDeathPenalties` (T5c4 owns opcode 120 transport;
-  T5c3d owns "player actually leaves the Underworld").
-  Spec: §9.5.1, §9.5.1d.
+- [ ] **M5-T5c3d1** Authoritative pending-death owner state +
+  immediate-completion handoff + respawn-release primitive
+  (depends on T5c3c3a + T5c3c3b + T5c3c3c2 + T5c2a;
+  `internal/sim` + the narrow `internal/persist` recovery
+  mapper): store-independent `PendingDeathRuntime` value,
+  owner-local pending state on the player entity,
+  immediate-death completion carrying authoritative pending
+  state (normal-success construction from `DeathEntryResult`,
+  proven-lost-ack construction from the recovered pending
+  snapshot), atomic owner install, pending inspection,
+  authoritative recovery/hydration seam, owner-local
+  respawn-release transition `AwaitingRespawn -> Alive`
+  (NOT Underworld `LeaveHold`, NOT penalty consumption).
+  No Portal calculation/commit, no Portal async worker, no
+  Underworld `LeaveHold`, no `PlanDeathPenalties` /
+  `CommitDeathPenalties`, no penalty RNG, no pending
+  deletion, no gateway opcode 120, no 214 / 215 transport.
+  Spec: §9.5.1, §9.5.1k.
+- [ ] **M5-T5c3d2** Portal-of-Life async runtime transition
+  (depends on T5c3d1 + T5a + T5b2a + T5c2a + T5c2b):
+  Portal target/runtime contract, `PlanPortalOfLife`,
+  portal attempt correlation/serialization, off-owner
+  `CommitPortalOfLife`, stale/ambiguous materialized
+  recovery, authoritative owner update of effective cost +
+  portal-used state. No Underworld-exit penalties.
+  Spec: §9.5.1, §9.5.1k.
+- [ ] **M5-T5c3d3** Authoritative Underworld-exit penalty
+  transition + exactly-once pending consumption (depends on
+  T5c3d1 + T5c3d2 + T5a + T5b2b + T5c2a + T5c2b): actual
+  authoritative Underworld `LeaveHold` event, current pending
+  cost snapshot, resolved penalty inputs,
+  `PlanDeathPenalties` with deterministic owner RNG,
+  complete post-penalty Character state, off-owner
+  `CommitDeathPenalties`, stale/ambiguous recovery,
+  exactly-once pending deletion proof, owner-only final
+  apply + pending clear. C→S 120 `respawn_ack` is NOT the
+  synonym for Underworld `LeaveHold` /
+  `ApplyDeathPenalties` (T5c4 owns opcode 120 transport;
+  T5c3d3 owns "player actually leaves the Underworld").
+  Spec: §9.5.1, §9.5.1k.
 - [ ] **M5-T5c4** Gateway death wire/state integration + reconnect E2E
-  (depends on T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d + the existing M4
+  (depends on T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2 + T5c3d3 + the existing M4
   gateway/presence/fanout foundation): gateway/state-machine routing, rate-gated C→S 120
   handling, critical S→C 214 / 215 delivery,
   session/Presence/NetEntityID composition, reconnect/end-to-end
@@ -475,7 +503,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
 - [ ] **M5-T6** Personal/world-light intents: `115 rest`, `116 eat` (hunger/vigor effects), `105 use` (skill/item dispatch incl. Second Wind), `119 safety_toggle`, `117/118 → 209` chat (+channel rules, length caps, rate limits). Owner of these opcodes: this task, no other. Spec: §6.3, §9.
 - [ ] **M5-T7** Authoritative attack/cast runtime integration (depends on
   M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a,   M5-T4b1, M5-T4b2,
-  M5-T5-complete (T5a+T5b1a+T5b1b+T5b2a+T5b2b+T5c1+T5c2a+T5c2b+T5c3a+T5c3b+T5c3c1+T5c3c2+T5c3c3a+T5c3c3b+T5c3c3c1+T5c3c3c2+T5c3d+T5c4), M5-T6). Owns real C→S 103
+  M5-T5-complete (T5a+T5b1a+T5b1b+T5b2a+T5b2b+T5c1+T5c2a+T5c2b+T5c3a+T5c3b+T5c3c1+T5c3c2+T5c3c3a+T5c3c3b+T5c3c3c1+T5c3c3c2+T5c3d1+T5c3d2+T5c3d3+T5c4), M5-T6). Owns real C→S 103
   attack routing, real C→S 104 cast routing, typed sim-owner combat
   commands, composition of T1/T2/T3a/T3b mechanics, authoritative T4
   HP/mana/vigor mutation, T5 death handoff, T6 safety/personal-state
@@ -607,9 +635,11 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M5-T5c3c3b | M5-T5c3c3a, M5-T5c2a, M5-T5c2b | `backend/voxilian/internal/persist` + narrow sim reconciliation/revision support (bounded off-owner `CommitDeathEntry` execution, T5c2a recovery, no blind replay, no live-entity mutation) |
 | M5-T5c3c3c1 | M5-T5c3c3b | `backend/voxilian/internal/persist` (guaranteed bounded executor reservation + prepared activation seam) + one narrow store-independent interface in `backend/voxilian/internal/sim` (no `PlayerLifeState` mutation, no zero-HP/T5a/double-death/placement/gateway work) |
 | M5-T5c3c3c2 | M5-T5c3c3a, M5-T5c3c3b, M5-T5c3c3c1, M5-T5a, M5-T5c3c2 | `backend/voxilian/internal/sim` (zero-HP orchestration, double-death gate, resolved T5a/placement composition over the c3c3c1 reservation; no gateway work) |
-| M5-T5c3d | M5-T5c3c1, M5-T5c3c2, M5-T5c3c3a, M5-T5c3c3b, M5-T5c3c3c1, M5-T5c3c3c2, M5-T5b2a, M5-T5b2b, M5-T5c2a, M5-T5c2b | `backend/voxilian/internal/sim` + `internal/persist` (pending-death / Portal / Underworld-exit async lifecycle) |
-| M5-T5c4 | M5-T5c3a, M5-T5c3b, M5-T5c3c1, M5-T5c3c2, M5-T5c3c3a, M5-T5c3c3b, M5-T5c3c3c1, M5-T5c3c3c2, M5-T5c3d + existing M4 gateway/presence/fanout foundation | `backend/voxilian/internal/{sim,gateway}` (death wire/state integration + reconnect E2E, existing 120/214/215 codecs) |
-| M5-T7 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2, M5-T5a, M5-T5b1a, M5-T5b1b, M5-T5b2a, M5-T5b2b, M5-T5c1, M5-T5c2a, M5-T5c2b, M5-T5c3a, M5-T5c3b, M5-T5c3c1, M5-T5c3c2, M5-T5c3c3a, M5-T5c3c3b, M5-T5c3c3c1, M5-T5c3c3c2, M5-T5c3d, M5-T5c4, M5-T6 | `backend/voxilian/internal/{sim,gateway}` (authoritative 103/104 runtime integration) |
+| M5-T5c3d1 | M5-T5c3c3a, M5-T5c3c3b, M5-T5c3c3c2, M5-T5c2a | `backend/voxilian/internal/sim` (authoritative pending-death owner state, extended immediate-death completion, respawn-release primitive) + narrow `backend/voxilian/internal/persist` recovery mapper (no Portal/penalty/gateway work) |
+| M5-T5c3d2 | M5-T5c3d1, M5-T5a, M5-T5b2a, M5-T5c2a, M5-T5c2b | `backend/voxilian/internal/sim` + `internal/persist` (Portal-of-Life async runtime transition; no Underworld-exit penalties) |
+| M5-T5c3d3 | M5-T5c3d1, M5-T5c3d2, M5-T5a, M5-T5b2b, M5-T5c2a, M5-T5c2b | `backend/voxilian/internal/sim` + `internal/persist` (authoritative Underworld-exit penalty transition + exactly-once pending consumption) |
+| M5-T5c4 | M5-T5c3a, M5-T5c3b, M5-T5c3c1, M5-T5c3c2, M5-T5c3c3a, M5-T5c3c3b, M5-T5c3c3c1, M5-T5c3c3c2, M5-T5c3d1, M5-T5c3d2, M5-T5c3d3 + existing M4 gateway/presence/fanout foundation | `backend/voxilian/internal/{sim,gateway}` (death wire/state integration + reconnect E2E, existing 120/214/215 codecs) |
+| M5-T7 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2, M5-T5a, M5-T5b1a, M5-T5b1b, M5-T5b2a, M5-T5b2b, M5-T5c1, M5-T5c2a, M5-T5c2b, M5-T5c3a, M5-T5c3b, M5-T5c3c1, M5-T5c3c2, M5-T5c3c3a, M5-T5c3c3b, M5-T5c3c3c1, M5-T5c3c3c2, M5-T5c3d1, M5-T5c3d2, M5-T5c3d3, M5-T5c4, M5-T6 | `backend/voxilian/internal/{sim,gateway}` (authoritative 103/104 runtime integration) |
 | M6-T1…T3 | M5-T1…T5 | `backend/voxilian/internal/sim` (progression) |
 | M7-T1 | M9-T1 (seed pipeline) + M1-T6b | `backend/voxilian/internal/sim`, `seed/` fixtures |
 | M7-T2a…c, T3, T4 | M4-T1…T3a, M1-T7b | `backend/voxilian/internal/sim` |
@@ -639,6 +669,47 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.36: split M5-T5c3d into owner-first T5c3d1 +
+  Portal-later T5c3d2 + Underworld-exit-last T5c3d3 (docs
+  only, spec v0.3.51 -> v0.3.52 new §9.5.1k; split only):
+  T5c3d1 (authoritative pending-death owner state +
+  immediate-completion handoff + respawn-release
+  primitive; depends on T5c3c3a + T5c3c3b + T5c3c3c2 +
+  T5c2a; `internal/sim` + the narrow `internal/persist`
+  recovery mapper; owns the store-independent
+  `PendingDeathRuntime` value, owner-local pending
+  state, extended immediate-death completion with
+  normal-success construction from `DeathEntryResult`
+  and proven-lost-ack construction from the recovered
+  pending snapshot, atomic owner install, pending
+  inspection, authoritative recovery/hydration seam,
+  and the owner-local `AwaitingRespawn -> Alive`
+  respawn-release transition that is NOT Underworld
+  `LeaveHold`/penalty consumption; no Portal
+  calculation/commit, no Portal async worker, no
+  Underworld `LeaveHold`, no `PlanDeathPenalties` /
+  `CommitDeathPenalties`, no penalty RNG, no pending
+  deletion, no gateway opcode 120, no 214 / 215
+  transport) + T5c3d2 (Portal-of-Life async runtime
+  transition; depends on T5c3d1 + T5a + T5b2a + T5c2a +
+  T5c2b; no Underworld-exit penalties) + T5c3d3
+  (authoritative Underworld-exit penalty transition +
+  exactly-once pending consumption; depends on T5c3d1 +
+  T5c3d2 + T5a + T5b2b + T5c2a + T5c2b; C→S 120 remains
+  NOT synonymous with `LeaveHold`); T5c4 now depends on
+  T5c3a+T5c3b+T5c3c1+T5c3c2+T5c3c3a+T5c3c3b+T5c3c3c1+
+  T5c3c3c2+T5c3d1+T5c3d2+T5c3d3 + the M4
+  gateway/presence/fanout foundation; M5-T7 now depends
+  on the TWENTY-task M5-T5 set
+  (T5a+T5b1a+T5b1b+T5b2a+T5b2b+T5c1+T5c2a+T5c2b+T5c3a+T5c3b+
+  T5c3c1+T5c3c2+T5c3c3a+T5c3c3b+T5c3c3c1+T5c3c3c2+T5c3d1+
+  T5c3d2+T5c3d3+T5c4); task-index rows updated
+  accordingly. `meridian59.md` untouched. Checkbox state
+  unchanged: T5a/T5b1a/T5b1b/T5b2a/T5b2b/T5c1/T5c2a/T5c2b/
+  T5c3a/T5c3b/T5c3c1/T5c3c2/T5c3c3a/T5c3c3b/T5c3c3c1/
+  T5c3c3c2 `[x]`, T5c3d1/T5c3d2/T5c3d3/T5c4/T6/T7 and M5
+  exit `[ ]`.
 
 - v1.35: freeze M5 zero-HP death orchestration (docs only,
   spec v0.3.50 -> v0.3.51 new §9.5.1j; implementation
