@@ -320,6 +320,27 @@ func (e *Engine) PlayerOrchestrateImmediateDeath(id EntityID, res ImmediateDeath
 			return fail(fmt.Errorf("sim: death token threshold %d without token death: %w", in.TokenRestoredThreshold, ErrInvalidDeathInput))
 		}
 	}
+	// Real-death advancement-field prevalidation (still step 1
+	// structural validation): for the selected REAL route the
+	// selected advancement fields are host-language contract
+	// input, so a malformed value fails before the guard/stamp
+	// and never consumes lastDeath. Avoided deaths never consume
+	// these fields, so they are not inspected on that route. The
+	// player stays Alive with no interleaving live mutation, so
+	// the bytes decoded here equal the bytes later frozen into
+	// the base capture; the precomputed plan is reused verbatim
+	// below (post-stamp path tripwire-only).
+	var preAdv DeathAdvancementPlan
+	if probe.Disposition == DeathCheap || probe.Disposition == DeathNormal {
+		points, gain, err := DecodeDeathAdvancementInputs(ent.durable.Advancement)
+		if err != nil {
+			return fail(err)
+		}
+		preAdv, err = PlanDeathAdvancement(probe.Disposition, points, gain)
+		if err != nil {
+			return fail(err)
+		}
+	}
 
 	// Step 2: source double-death guard over resolved whole
 	// seconds (strict <; exactly +2 proceeds). Inputs are
@@ -392,16 +413,12 @@ func (e *Engine) PlayerOrchestrateImmediateDeath(id EntityID, res ImmediateDeath
 		res.CancelImmediateDeathWork()
 		return ImmediateDeathOrchestrationResult{}, err
 	}
-	points, gain, err := DecodeDeathAdvancementInputs(base.Durable.Advancement)
-	if err != nil {
-		res.CancelImmediateDeathWork()
-		return ImmediateDeathOrchestrationResult{}, err
-	}
-	adv, err := PlanDeathAdvancement(plan.Disposition, points, gain)
-	if err != nil {
-		res.CancelImmediateDeathWork()
-		return ImmediateDeathOrchestrationResult{}, err
-	}
+	// Reuse the pre-stamp advancement plan validated against the
+	// same immutable owner state (no interleaving live mutation
+	// between predecode and this capture). Build below still
+	// defensively recomputes from the frozen base and is
+	// guaranteed to agree.
+	adv := preAdv
 	angel := GuardianAngelMailEligible(plan.DeathCost, in.StillNewbie, in.Murderer)
 	postVitals, err := PlanPostDeathVitals(PostDeathVitalsInput{
 		Vitals:            working,

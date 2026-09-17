@@ -1053,6 +1053,149 @@ func TestDeathOrchestrationNoAliases(t *testing.T) {
 	}
 }
 
+// O. Real-death advancement-field prevalidation (M5-T5c3c3c2 fix):
+// malformed selected advancement fields are host-language
+// structural validation for the selected REAL route, so they fail
+// BEFORE the source-semantic lastDeath stamp with zero mutation.
+func TestDeathOrchestrationAdvancementPrevalidation(t *testing.T) {
+	cases := []struct {
+		name string
+		adv  string
+	}{
+		{"malformed-adv-points", `{"adv_points":"oops","gain_chance":10}`},
+		{"malformed-gain-chance", `{"adv_points":5,"gain_chance":1.5}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := orchEngine(t)
+			d := testFullDurableState()
+			d.Advancement = []byte(tc.adv)
+			id := addFullStatePlayer(t, e, testCharacterID(), world.Vec3{X: 4, Y: 0, Z: 4}, d)
+
+			beforeSnap, err := e.Entity(id)
+			if err != nil {
+				t.Fatalf("Entity: %v", err)
+			}
+			beforeVitals, _, err := e.PlayerVitalsOf(id)
+			if err != nil {
+				t.Fatalf("PlayerVitalsOf: %v", err)
+			}
+			beforeRuntime, _, err := e.PlayerVitalsRuntimeOf(id)
+			if err != nil {
+				t.Fatalf("PlayerVitalsRuntimeOf: %v", err)
+			}
+			beforeDurable, ok, err := e.PlayerDurableStateOf(id)
+			if err != nil || !ok {
+				t.Fatalf("PlayerDurableStateOf: %v %v", ok, err)
+			}
+			ent, err := e.registry.lookup(id)
+			if err != nil {
+				t.Fatalf("lookup: %v", err)
+			}
+			beforeEpoch := ent.deathEpoch
+
+			in := baseOrchInput(1000)
+			fake := newFakeReservation(e, id)
+			if _, err := e.PlayerOrchestrateImmediateDeath(id, fake, in); err == nil {
+				t.Fatalf("expected error")
+			} else if !errors.Is(err, ErrInvalidDeathInput) {
+				t.Fatalf("error = %v, want ErrInvalidDeathInput", err)
+			}
+			if v := mustLastDeath(t, e, id); v != 0 {
+				t.Fatalf("lastDeath = %d, want unchanged 0", v)
+			}
+			if mustLife(t, e, id) != PlayerLifeAlive {
+				t.Fatalf("life changed")
+			}
+			afterVitals, _, err := e.PlayerVitalsOf(id)
+			if err != nil {
+				t.Fatalf("PlayerVitalsOf: %v", err)
+			}
+			if afterVitals.HP != 0 {
+				t.Fatalf("HP = %d, want 0", afterVitals.HP)
+			}
+			if afterVitals != beforeVitals {
+				t.Fatalf("vitals changed: %+v vs %+v", afterVitals, beforeVitals)
+			}
+			afterRuntime, _, err := e.PlayerVitalsRuntimeOf(id)
+			if err != nil {
+				t.Fatalf("PlayerVitalsRuntimeOf: %v", err)
+			}
+			if !reflect.DeepEqual(afterRuntime, beforeRuntime) {
+				t.Fatalf("runtime changed: %+v vs %+v", afterRuntime, beforeRuntime)
+			}
+			if ent, _ := e.registry.lookup(id); ent.deathEpoch != beforeEpoch {
+				t.Fatalf("epoch = %d, want unchanged %d", ent.deathEpoch, beforeEpoch)
+			}
+			afterSnap, _ := e.Entity(id)
+			if afterSnap != beforeSnap {
+				t.Fatalf("snapshot changed (position moved)")
+			}
+			if afterSnap.Position != beforeSnap.Position {
+				t.Fatalf("position changed")
+			}
+			afterDurable, ok, _ := e.PlayerDurableStateOf(id)
+			if !ok || !reflect.DeepEqual(beforeDurable, afterDurable) {
+				t.Fatalf("durable changed")
+			}
+			if fake.prepareCalls != 0 || fake.activateCalls != 0 || fake.cancelCalls != 1 {
+				t.Fatalf("fake prepare=%d activate=%d cancel=%d, want 0/0/1",
+					fake.prepareCalls, fake.activateCalls, fake.cancelCalls)
+			}
+		})
+	}
+}
+
+// P. Avoided death never consumes real-death advancement fields
+// (M5-T5c3c3c2 fix): malformed selected fields that WOULD fail a
+// real death still produce the source-faithful Avoided result.
+func TestDeathOrchestrationAvoidedMalformedAdvancement(t *testing.T) {
+	for _, ctx := range []DeathContext{
+		{ArenaNonRealDeath: true},
+		{PrisonRoom: true},
+		{SafePlayerAttack: true},
+	} {
+		e := orchEngine(t)
+		d := testFullDurableState()
+		d.Advancement = []byte(`{"adv_points":"oops","gain_chance":"also-oops"}`)
+		id := addFullStatePlayer(t, e, testCharacterID(), world.Vec3{X: 4, Y: 0, Z: 4}, d)
+
+		in := baseOrchInput(77)
+		in.Context = ctx
+		fake := newFakeReservation(e, id)
+		got, err := e.PlayerOrchestrateImmediateDeath(id, fake, in)
+		if err != nil {
+			t.Fatalf("ctx %+v: %v", ctx, err)
+		}
+		if got.Disposition != ImmediateDeathAvoided {
+			t.Fatalf("ctx %+v disposition = %d, want Avoided", ctx, uint8(got.Disposition))
+		}
+		if got.Plan.Disposition != DeathAvoided {
+			t.Fatalf("ctx %+v plan = %v, want avoided", ctx, got.Plan.Disposition)
+		}
+		if v := mustLastDeath(t, e, id); v != 77 {
+			t.Fatalf("ctx %+v lastDeath = %d, want 77", ctx, v)
+		}
+		v, _, err := e.PlayerVitalsOf(id)
+		if err != nil {
+			t.Fatalf("PlayerVitalsOf: %v", err)
+		}
+		if v.HP != 1 {
+			t.Fatalf("ctx %+v HP = %d, want 1", ctx, v.HP)
+		}
+		if mustLife(t, e, id) != PlayerLifeAlive {
+			t.Fatalf("ctx %+v life not Alive", ctx)
+		}
+		if ent, _ := e.registry.lookup(id); ent.deathEpoch != 0 {
+			t.Fatalf("ctx %+v epoch = %d, want 0", ctx, ent.deathEpoch)
+		}
+		if fake.cancelCalls != 1 || fake.prepareCalls != 0 || fake.activateCalls != 0 {
+			t.Fatalf("ctx %+v fake calls cancel=%d prepare=%d activate=%d, want 1/0/0",
+				ctx, fake.cancelCalls, fake.prepareCalls, fake.activateCalls)
+		}
+	}
+}
+
 // Inspection contract for the ephemeral timestamp.
 func TestDeathOrchestrationLastDeathInspection(t *testing.T) {
 	e := orchEngine(t)
