@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.52 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.53 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -7965,7 +7965,7 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
 
 #### 9.5.1 Ownership split and the two-phase lifecycle
 
- M5-T5 is TWENTY tasks (this section is their shared boundary;
+ M5-T5 is TWENTY-ONE tasks (this section is their shared boundary;
  the former single T5c is split into T5c1–T5c4, frozen v0.3.39 in
  §9.5.1a, T5c2 is further split into T5c2a+T5c2b, frozen
  v0.3.40 in §9.5.1b, T5c3 is further split into
@@ -7976,8 +7976,10 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
  c3c3b recovery contract is frozen v0.3.49 in §9.5.1h,
  T5c3c3c is further split into T5c3c3c1+T5c3c3c2, frozen
  v0.3.50 in §9.5.1i, the c3c3c2 gameplay contract is
- frozen v0.3.51 in §9.5.1j, and T5c3d is further split into
- T5c3d1+T5c3d2+T5c3d3, frozen v0.3.52 in §9.5.1k):
+ frozen v0.3.51 in §9.5.1j, T5c3d is further split into
+ T5c3d1+T5c3d2+T5c3d3, frozen v0.3.52 in §9.5.1k, and
+ T5c3d2 is further split into T5c3d2a+T5c3d2b, frozen
+ v0.3.53 in §9.5.1k):
 
 - **T5a — pure/source-faithful death mechanics and immutable plans**
   (§9.5.4–§9.5.14 pure surface; §9.5.17 non-scope).
@@ -8149,39 +8151,103 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
    `PlanDeathPenalties` / `CommitDeathPenalties`, no
    penalty RNG, no pending deletion, no gateway opcode
    120, no 214 / 215 transport.
- - **T5c3d2 — Portal-of-Life async runtime transition**
-   (§9.5.1k, future): Portal target/runtime contract,
-   `PlanPortalOfLife`, portal attempt
-   correlation/serialization, off-owner
-   `CommitPortalOfLife`, stale/ambiguous materialized
-   recovery, and the authoritative owner update of
-   effective cost + portal-used state. Depends on T5c3d1
-   + T5a + T5b2a + T5c2a + T5c2b. No Underworld-exit
-   penalties.
- - **T5c3d3 — authoritative Underworld-exit penalty
-   transition + exactly-once pending consumption**
-   (§9.5.1k, future): the actual authoritative
-   Underworld `LeaveHold` event, the current pending
-   cost snapshot, resolved penalty inputs,
-   `PlanDeathPenalties` with deterministic owner RNG,
-   the complete post-penalty Character state, off-owner
-   `CommitDeathPenalties`, stale/ambiguous recovery,
-   the exactly-once pending deletion proof, and the
-   owner-only final apply + pending clear. Depends on
-   T5c3d1 + T5c3d2 + T5a + T5b2b + T5c2a + T5c2b.
+  - **T5c3d2a — Portal-of-Life owner attempt +
+    immutable current-state capture + typed owner
+    completion/abort** (§9.5.1k): the store-independent
+    `PortalOfLifeResolvedInput` value, the per-entity
+    ephemeral Portal-attempt epoch + `PortalAttemptToken`
+    (NOT the `DeathAttemptToken` epoch, NOT a Store
+    revision, NOT an OpID), per-entity Portal in-flight
+    state, `PlanPortalOfLife` + `ReducePendingDeathCost`
+    composition (proposed 5..80 vs lowers-only expected
+    effective cost), the immutable complete current
+    character capture (`PortalOfLifeCapture`: current
+    position + current vitals + complete deep-frozen
+    durable shadow + deep-frozen pending-before + target
+    corpse + proposed/expected costs), the
+    store-independent sim-domain Portal work-reservation
+    interface (`PreparePortalOfLifeWork` /
+    `ActivatePortalOfLifeWork` /
+    `CancelPortalOfLifeWork`; non-blocking; no persist/
+    Store/revision/PG/result-channel/closure), the
+    Prepare-before-attempt ordering (validate, plan,
+    reduce, freeze capture with the predicted
+    `portalEpoch + 1` token, Prepare, ONLY then
+    `portalEpoch++` + install attempt + same-turn
+    Activate), the canonical owner-local orchestration
+    operation, once-per-pending attempt serialization
+    (`ErrPortalAttemptInFlight`), epoch exhaustion
+    (`ErrPortalAttemptExhausted`), the typed success
+    completion (`PortalOfLifeCompletion`: token +
+    authoritative pending with `PortalUsed == true`) with
+    Applied vs Duplicate (duplicate-before-payload-
+    validation) owner apply, the definitive owner abort
+    primitive (exact abort clears in-flight with pending
+    unchanged; never undoes a success; repeated exact
+    abort idempotent; late success after abort is
+    `ErrPortalAttemptMismatch`), the same-mailbox typed
+    completion/abort ingress, and the hydration guard
+    (in-flight Portal rejects
+    `PlayerInstallRecoveredPendingDeath` with
+    `ErrPortalAttemptInFlight`). `internal/sim` only.
+    Depends on T5c3d1 + T5a. No Store/PG/Saver/persist
+    work: no Portal executor, no Store mapper, no
+    `CommitPortalOfLife` call, no Saver calls, no PG
+    recovery, no lost-ack proof, no `ReconcileSaver` /
+    `ResolveReconciled`, no worker/goroutine/queue, no
+    world `CorpsePortal` object, no caster mana charging,
+    no spell targeting, no gateway/proto/session, no
+    Underworld `LeaveHold`, no `PlanDeathPenalties` /
+    `CommitDeathPenalties`, no pending deletion. Valid
+    resident life states are `PlayerLifeAwaitingRespawn`
+    OR `PlayerLifeAlive` (`DeathPersisting` rejected;
+    `MIGRATING` keeps `ErrCellHandoffRequired`); an
+    `Alive` player stays `Alive` with ordinary gameplay
+    accepted while Portal persistence is in flight.
+  - **T5c3d2b — bounded off-owner Portal persistence +
+    in-critical-callback lost-ack proof** (§9.5.1k,
+    future): the Store-domain Portal mapper, the bounded
+    Portal executor/reservation implementation, off-owner
+    `CommitPortalOfLife`, the exact callback expected
+    revision, the lost-ack materialized proof, normal +
+    proven-lost-ack owner completion, definite-no-
+    execution owner abort, and bounded owner ingress
+    redelivery. Depends on T5c3d2a + T5b2a + T5c2a +
+    T5c2b. No Underworld-exit penalties. Future d2b MUST
+    use the frozen in-critical-callback recovery rule
+    below: after a PROVEN Portal lost-ack it MUST NOT
+    call `ReconcileSaver` / `ResolveReconciled` (that
+    would discard newer character snapshots captured
+    while the Portal Store operation was in flight for a
+    still gameplay-active character).
+  - **T5c3d3 — authoritative Underworld-exit penalty
+    transition + exactly-once pending consumption**
+    (§9.5.1k, future): the actual authoritative
+    Underworld `LeaveHold` event, the current pending
+    cost snapshot, resolved penalty inputs,
+    `PlanDeathPenalties` with deterministic owner RNG,
+    the complete post-penalty Character state, off-owner
+    `CommitDeathPenalties`, stale/ambiguous recovery,
+    the exactly-once pending deletion proof, and the
+    owner-only final apply + pending clear. Depends on
+    T5c3d1 + T5c3d2a + T5c3d2b + T5a + T5b2b + T5c2a +
+    T5c2b. T5c3d3 Underworld `LeaveHold` MUST NOT consume
+    pending penalties while a Portal attempt against that
+    pending death remains in flight (exact d3 API
+    deferred).
    C→S 120 `respawn_ack` is NOT the synonym for
    Underworld `LeaveHold` / `ApplyDeathPenalties`: T5c4
    owns opcode 120 transport/state routing while T5c3d3
    owns the gameplay event "player actually leaves the
    Underworld".
- - **T5c4 — gateway death wire/state integration + reconnect E2E**:
-   gateway/state-machine routing, rate-gated C→S 120 handling, critical
-   S→C 214 / 215 delivery, session/Presence/NetEntityID composition,
-   reconnect/end-to-end proof reusing the existing 120/214/215 codecs
-   (no second protocol). Depends on T5c3a + T5c3b + T5c3c1 + T5c3c2 +
-   T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2 + T5c3d3 + the existing M4 gateway/presence/fanout foundation.
+  - **T5c4 — gateway death wire/state integration + reconnect E2E**:
+    gateway/state-machine routing, rate-gated C→S 120 handling, critical
+    S→C 214 / 215 delivery, session/Presence/NetEntityID composition,
+    reconnect/end-to-end proof reusing the existing 120/214/215 codecs
+    (no second protocol). Depends on T5c3a + T5c3b + T5c3c1 + T5c3c2 +
+    T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b + T5c3d3 + the existing M4 gateway/presence/fanout foundation.
 
- M5-T5-complete is `T5a + T5b1a + T5b1b + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2 + T5c3d3 + T5c4` (TWENTY tasks).
+  M5-T5-complete is `T5a + T5b1a + T5b1b + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b + T5c3d3 + T5c4` (TWENTY-ONE tasks).
 
 Ledger contract (binding on T5b2a/T5b2b): Portal-of-Life writes ZERO
 ledger rows. Underworld-exit death penalties write ZERO ledger rows.
@@ -10677,7 +10743,7 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
    migration, generated code, gateway/proto/session,
    `PlayerLoseHealth` automatic dispatch.
 
-   #### 9.5.1k M5 pending-death owner lifecycle split (T5c3d1+T5c3d2+T5c3d3, frozen v0.3.52)
+   #### 9.5.1k M5 pending-death owner lifecycle split (T5c3d1+T5c3d2a+T5c3d2b+T5c3d3, frozen v0.3.52/v0.3.53)
 
    The former single T5c3d combined three separate
    correctness boundaries — authoritative pending-death
@@ -10687,7 +10753,10 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
    consumption — so it is split into T5c3d1+T5c3d2+T5c3d3
    (this section supersedes the T5c3d paragraph of §9.5.1
    for the task split only; §9.5.1d stays otherwise
-   frozen). `meridian59.md` is untouched: this task
+   frozen), and the former monolithic T5c3d2 is further
+   split into T5c3d2a+T5c3d2b (v0.3.53; this paragraph
+   supersedes the T5c3d2 paragraph of §9.5.1 for the
+   split only). `meridian59.md` is untouched: this task
    changes no Meridian mechanics.
 
    A more important existing gap makes d1 a prerequisite:
@@ -10794,17 +10863,220 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
    Saver reconciliation, owner-only mutation,
    `ErrDeathCommitUnproven`) are NOT weakened.
 
-   T5c3d2 (depends on T5c3d1 + T5a + T5b2a + T5c2a +
-   T5c2b; future) owns the Portal target/runtime
-   contract, `PlanPortalOfLife`, portal attempt
-   correlation/serialization, off-owner
-   `CommitPortalOfLife`, stale/ambiguous materialized
-   recovery, and the authoritative owner update of
-   effective cost + portal-used state. No
-   Underworld-exit penalties.
+   T5c3d2a (depends on T5c3d1 + T5a; `internal/sim`
+   only) owns the Portal owner attempt lifecycle: the
+   store-independent `PortalOfLifeResolvedInput` value
+   (`NowSeconds` resolved whole-second time, `SpellPower`
+   1..99, `TargetCorpseID > 0`; no Store ID lookup,
+   no corpse query, no spell catalog query, no
+   caster/session lookup, no PG lookup, no wall clock),
+   the per-entity ephemeral Portal-attempt epoch with
+   the immutable `PortalAttemptToken`
+   (`EntityID`/`CharacterID`/`Epoch`, all nonzero when
+   valid; NOT the `DeathAttemptToken` epoch, NOT a Store
+   revision, NOT an OpID, NOT a NetEntityID, NOT a
+   session ID — a reconnect/hydrated player may already
+   carry `pendingDeath` while its fresh live entity has
+   local `deathEpoch == 0`, so Portal correlation MUST
+   survive that valid owner shape while `EntityID`
+   still protects removal/re-add ABA), the owner-local
+   ephemeral per-entity Portal state (`portalEpoch`
+   `uint64`, `portalInFlight` bool, private
+   `portalAttempt` retaining at minimum target
+   `CorpseID`, pending `DeathTimeSeconds`, pending
+   `EffectiveCost` before Portal, and expected
+   effective cost after Portal; new entity epoch 0 with
+   no in-flight attempt; handoff preserves on same
+   entity; remove discards; fresh re-add restarts at
+   epoch 0 with no attempt; no persistence), stable
+   sim errors matched with `errors.Is`
+   (`ErrPortalUnavailable`, `ErrPortalAttemptInFlight`,
+   `ErrPortalAttemptMismatch`,
+   `ErrPortalAttemptExhausted`; existing validation
+   errors stay appropriate for malformed time/power/
+   input; Store errors are never reused in sim), the
+   valid target life states (`PlayerLifeAwaitingRespawn`
+   OR `PlayerLifeAlive` — `AwaitingRespawn` is the
+   transport/gameplay release barrier, not the Meridian
+   pending-death phase, so Portal may become valid
+   after immediate death persistence but before or
+   after the later respawn-release barrier;
+   `DeathPersisting` rejected because authoritative
+   pending state has not yet arrived; `MIGRATING`
+   keeps `ErrCellHandoffRequired`), the required
+   pending preconditions (`pendingDeath != nil`,
+   `PortalUsed == false`, `CorpseID != nil`,
+   `*CorpseID > 0`, `TargetCorpseID > 0`,
+   `TargetCorpseID == *CorpseID`; no pending, expired
+   corpse, already-used, or wrong-target corpse each
+   yield `ErrPortalUnavailable` with no Store call),
+   corpse age (`age = NowSeconds -
+   Pending.DeathTimeSeconds`, requiring `NowSeconds >=
+   0` and `NowSeconds >= DeathTimeSeconds`; no
+   negative age, no silent clamp, no second wall clock,
+   no new 60-second or 600-second upper validation
+   rule — the pure planner owns its formula domain),
+   pure composition of ONLY the existing T5a helpers
+   (`PlanPortalOfLife` over pending cost + age + power
+   with `CorpseAlreadyUsed = pending.PortalUsed`, then
+   `ReducePendingDeathCost` over pending cost +
+   proposed; `ProposedCost` is the Store proposal
+   5..80, `ExpectedEffectiveCost` is the lowers-only
+   owner result, so e.g. pending cost 0 with proposed
+   5+ still consumes the Portal with expected
+   effective 0 and the attempt MUST NOT be skipped
+   merely because cost does not decrease), the
+   immutable complete current character capture
+   (`PortalOfLifeCapture`: token + CURRENT
+   authoritative position + CURRENT authoritative
+   vitals + CURRENT complete deep-frozen durable
+   shadow + deep-frozen `PendingBefore` + target
+   corpse + proposed/expected costs; no
+   runtime-input snapshot is persisted by Portal; no
+   caller alias may reach `Advancement`/`Spells`/
+   `Skills`/`Items`/`Enchants`/`PendingBefore.CorpseID`),
+   the ONE store-independent sim work-reservation
+   interface (`PreparePortalOfLifeWork` /
+   `ActivatePortalOfLifeWork` /
+   `CancelPortalOfLifeWork`; no persist type, no Store
+   type, no revision, no PG handle, no result channel,
+   no func closure; all methods non-blocking with
+   respect to PG/network/disk; future d2b implements
+   it; d2a tests use an instrumented fake), the
+   binding Prepare-before-owner-mutation sequence
+   (validate identity/life/pending/input/durable/epoch;
+   `PlanPortalOfLife`; `ReducePendingDeathCost`;
+   deep-freeze the complete capture with the predicted
+   `portalEpoch + 1` token;
+   `reservation.PreparePortalOfLifeWork(capture)`;
+   ONLY after Prepare succeeds: `portalEpoch++`,
+   assert actual token == predicted token, install the
+   private attempt with `portalInFlight = true`, then
+   `reservation.ActivatePortalOfLifeWork()` in the
+   SAME owner turn with NO fallible Portal preparation
+   after `portalInFlight = true`; on Prepare failure
+   Cancel exactly once with `portalEpoch` unchanged,
+   `portalInFlight` false, pending unchanged, player
+   otherwise unchanged), the canonical owner-local
+   orchestration operation (reservation ownership
+   transfers in: every pre-accept error Cancels,
+   successful attempt Activates exactly once; nil
+   reservation is a structural error with zero player
+   mutation), one-at-a-time serialization (second
+   begin while in flight yields
+   `ErrPortalAttemptInFlight` with zero mutation, no
+   second Prepare, no second epoch increment), the
+   typed success completion (`PortalOfLifeCompletion`:
+   token + authoritative complete pending with
+   `PortalUsed == true`, `DeathTimeSeconds` equal to
+   the targeted pending death, `EffectiveCost` equal
+   to this attempt's expected effective cost,
+   `CorpseID` nil allowed — the corpse may have
+   expired after commit before recovery — else equal
+   to the attempt target; no Store revision/result)
+   with owner apply (`Applied` vs `Duplicate`:
+   first exact apply validates EntityID/CharacterID/
+   Portal epoch/in-flight attempt plus the CURRENT
+   live pending still identifying the same
+   pre-attempt pending death, then validates/freezes
+   the completion pending; on success replaces
+   `pendingDeath` ONLY, clears in-flight/private
+   attempt, leaves `portalEpoch` unchanged, and
+   preserves life state, position, vitals, runtime,
+   durable, `deathEpoch`, `lastDeathSeconds`, history,
+   and movement — Portal persistence MUST NOT roll
+   back current gameplay state; duplicate with the
+   same token epoch already resolved and live pending
+   `PortalUsed == true` returns `Duplicate` nil
+   BEFORE validating the redelivered payload with
+   exact zero mutation; an old completion for a
+   definitively aborted attempt yields
+   `ErrPortalAttemptMismatch` and never becomes
+   Duplicate), the definitive owner abort primitive
+   (first exact abort clears in-flight with pending
+   unchanged and `portalEpoch` unchanged, for later d2b
+   use ONLY when it knows no authoritative Store
+   mutation was accepted/executed; repeated exact
+   abort idempotent no-op; abort MUST NEVER undo a
+   successful Portal, clear `PortalUsed`, or
+   raise/lower cost; same token already succeeded
+   yields `ErrPortalAttemptMismatch`), the SAME
+   `Engine.ingress` mailbox typed completion/abort
+   commands with frozen-before-publication payloads
+   and identical admission semantics
+   (pre-cancel context error, not-running
+   `ErrEngineNotRunning`, full-mailbox
+   `ErrSimIngressFull`, post-admission caller cancel
+   does not retract, capacity-1 result channels),
+   respawn release during the attempt (begin while
+   `AwaitingRespawn`, release to `Alive`, later exact
+   completion succeeds with life staying `Alive`),
+   normal gameplay during the attempt (Portal MUST
+   NOT reuse the death life-state gate: no
+   `DeathPersisting`/`AwaitingRespawn` transition at
+   begin; an `Alive` player stays `Alive` with
+   ordinary gameplay accepted), and the hydration
+   serialization (while in flight,
+   `PlayerInstallRecoveredPendingDeath` rejects with
+   `ErrPortalAttemptInFlight` after its existing
+   entity/resident-player/`Alive` checks but before
+   payload validation/install, preserving the frozen
+   d1 error precedence with no partial hydration).
+   d2a owns ONLY the victim pending-death transition
+   planning/correlation: it does NOT spawn a world
+   `CorpsePortal`, charge caster mana, perform spell
+   targeting, resolve corpse world existence, send
+   spell result packets, move the victim through the
+   portal, trigger `LeaveHold`, or apply death
+   penalties — those belong to later spell/world/
+   gateway integration, and the caller invokes this
+   owner operation only after upstream gameplay has
+   resolved the valid target/cast facts.
 
-   T5c3d3 (depends on T5c3d1 + T5c3d2 + T5a + T5b2b +
-   T5c2a + T5c2b; future) owns the actual
+   T5c3d2b (depends on T5c3d2a + T5b2a + T5c2a +
+   T5c2b; future) owns the bounded off-owner Portal
+   persistence: the Store-domain Portal mapper, the
+   bounded Portal executor/reservation implementation,
+   off-owner `CommitPortalOfLife`, the exact callback
+   expected revision, the lost-ack materialized proof,
+   normal + proven-lost-ack owner completion, the
+   definite-no-execution owner abort, and bounded
+   owner ingress redelivery. No Underworld-exit
+   penalties.
+
+   Future d2b recovery rule (binding, frozen v0.3.53):
+   for Portal, DO NOT copy the c3c3b post-error
+   `WriteCriticalSet` returns reconcile-required, then
+   `ReconcileSaver`, then `ResolveReconciled` pattern
+   for a proven lost acknowledgement. Reason: the
+   Portal target may remain gameplay-active while PG
+   I/O runs, `ResolveReconciled` discards ALL pending
+   Saver snapshots, and a newer Player snapshot may
+   have arrived during the Portal attempt. Future d2b
+   MUST instead use this pattern: `Saver.WriteCriticalSet`
+   owns the character gate; the callback receives the
+   exact expected revision E; `Store.CommitPortalOfLife`
+   runs; on Store success the callback succeeds
+   normally; on an ambiguous/error Store result, while
+   still INSIDE the `CriticalSet` callback, perform a
+   read-only `DeathCharacterRecovery` into worker-local
+   values; if the materialized state PROVES this Portal
+   committed, the callback returns normal success
+   revision E+1, so the existing `WriteCriticalSet`
+   success bookkeeping accepts E+1, clears pending
+   snapshots `<=` this critical generation, and
+   PRESERVES newer pending snapshots `>` this
+   generation; otherwise the callback returns error,
+   the Saver remains reconcile-blocked, with NO Store
+   replay and NO Portal owner success completion.
+   Future d2b MUST NOT call `ReconcileSaver` /
+   `ResolveReconciled` after a PROVEN Portal lost-ack.
+   This rule is frozen here because it materially
+   affects the d2a attempt lifecycle; it is NOT
+   implemented in d2a.
+
+   T5c3d3 (depends on T5c3d1 + T5c3d2a + T5c3d2b +
+   T5a + T5b2b + T5c2a + T5c2b; future) owns the actual
    authoritative Underworld `LeaveHold` event, the
    current pending cost snapshot, resolved penalty
    inputs, `PlanDeathPenalties` with deterministic
@@ -10813,18 +11085,27 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
    stale/ambiguous recovery, the exactly-once pending
    deletion proof, and the owner-only final apply +
    pending clear. C→S 120 remains NOT synonymous with
-   `LeaveHold`.
+   `LeaveHold`. Future d3 serialization note (frozen
+   v0.3.53, exact d3 API deferred): T5c3d3 Underworld
+   `LeaveHold` MUST NOT consume pending penalties
+   while a Portal attempt against that pending death
+   remains in flight. No penalties are implemented
+   here.
 
-   Downstream graph (binding): T5c4 now depends on
+   Downstream graph (binding): T5c3d3 now depends on
+   T5c3d1 + T5c3d2a + T5c3d2b + T5a + T5b2b + T5c2a +
+   T5c2b; T5c4 now depends on
    T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b +
-   T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2 + T5c3d3 + the
+   T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b +
+   T5c3d3 + the
    existing M4 gateway/presence/fanout foundation;
-   M5-T5-complete is the TWENTY-task set T5a + T5b1a +
+   M5-T5-complete is the TWENTY-ONE-task set T5a + T5b1a +
    T5b1b + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a +
    T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b +
-   T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2 + T5c3d3 + T5c4
+   T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b +
+   T5c3d3 + T5c4
    (M5-T7 wording/task index updated accordingly).
-   After this task T5c3d1, T5c3d2, T5c3d3, T5c4, T6, T7,
+   After this task T5c3d1, T5c3d2a, T5c3d2b, T5c3d3, T5c4, T6, T7,
    and the M5 exit stay `[ ]`.
 
   #### 9.5.2 Death disposition: avoided vs cheap vs normal (frozen)
