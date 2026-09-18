@@ -127,10 +127,6 @@ func (e *Engine) PlayerPendingDeathOf(id EntityID) (PendingDeathRuntime, bool, e
 // Owner-local: call only from the sim owner goroutine
 // (Run/Step) or in Step-driven tests.
 func (e *Engine) PlayerInstallRecoveredPendingDeath(id EntityID, pending *PendingDeathRuntime) error {
-	if err := ValidatePendingDeathRuntime(pending); err != nil {
-		return err
-	}
-	frozen := freezePendingDeathRuntime(pending)
 	ent, err := e.resolvePlayerAnyLife(id)
 	if err != nil {
 		return err
@@ -138,6 +134,10 @@ func (e *Engine) PlayerInstallRecoveredPendingDeath(id EntityID, pending *Pendin
 	if ent.lifeState != PlayerLifeAlive {
 		return fmt.Errorf("%w: id %d life %d", ErrPlayerNotAlive, uint64(id), uint8(ent.lifeState))
 	}
+	if err := ValidatePendingDeathRuntime(pending); err != nil {
+		return err
+	}
+	frozen := freezePendingDeathRuntime(pending)
 	ent.pendingDeath = frozen
 	return nil
 }

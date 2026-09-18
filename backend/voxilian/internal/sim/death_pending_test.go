@@ -442,6 +442,155 @@ func TestPendingDeathHydration(t *testing.T) {
 	}
 }
 
+// TestPendingDeathHydrationValidationOrder proves the frozen
+// §9.5.1k hydration precedence: entity exists -> RESIDENT
+// player -> Alive -> payload validates. A malformed payload
+// never masks entity/life errors, and every failure is zero
+// mutation.
+func TestPendingDeathHydrationValidationOrder(t *testing.T) {
+	malformed := &PendingDeathRuntime{
+		EffectiveCost:    -1,
+		DeathTimeSeconds: -1,
+	}
+
+	// Unknown EntityID + malformed payload -> ErrEntityNotFound.
+	t.Run("unknown", func(t *testing.T) {
+		e := newPlayerEngine(t, nil)
+		if err := e.PlayerInstallRecoveredPendingDeath(EntityID(9999), malformed); !errors.Is(err, ErrEntityNotFound) {
+			t.Fatalf("unknown+malformed = %v; want ErrEntityNotFound", err)
+		}
+	})
+
+	// Generic entity + malformed payload -> ErrEntityNotPlayer.
+	t.Run("generic", func(t *testing.T) {
+		e := newPlayerEngine(t, nil)
+		gen, err := e.AddEntity(world.Vec3{X: 3, Y: 0, Z: 3})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := e.PlayerInstallRecoveredPendingDeath(gen.ID, malformed); !errors.Is(err, ErrEntityNotPlayer) {
+			t.Fatalf("generic+malformed = %v; want ErrEntityNotPlayer", err)
+		}
+	})
+
+	// MIGRATING player + malformed payload ->
+	// ErrCellHandoffRequired with pending unchanged.
+	t.Run("migrating", func(t *testing.T) {
+		e := newPlayerEngine(t, nil)
+		snap, err := e.AddPlayerEntity(testCharacterID(),
+			world.Vec3{X: 1, Y: 0, Z: 1}, testVitals(), testRuntimeInputs())
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := snap.ID
+		if err := e.PlayerInstallRecoveredPendingDeath(id, pendingFixture(55, 900, int64ptr(77), true)); err != nil {
+			t.Fatal(err)
+		}
+		live, err := e.Entity(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dest := world.CellCoord{X: live.Cell.X + 1, Z: live.Cell.Z}
+		final := world.Vec3{X: float64(int32(dest.X) * 32), Y: 0, Z: 1}
+		if _, err := e.registry.beginHandoff(id, OwnerRef{Cell: live.Cell, Generation: live.OwnershipGeneration}, dest, final); err != nil {
+			t.Fatalf("beginHandoff: %v", err)
+		}
+		if err := e.PlayerInstallRecoveredPendingDeath(id, malformed); !errors.Is(err, ErrCellHandoffRequired) {
+			t.Fatalf("migrating+malformed = %v; want ErrCellHandoffRequired", err)
+		}
+		still, ok := pendingOf(t, e, id)
+		if !ok {
+			t.Fatalf("migrating hydration cleared pending")
+		}
+		requirePendingEqual(t, still, PendingDeathRuntime{
+			EffectiveCost: 55, DeathTimeSeconds: 900,
+			CorpseID: int64ptr(77), PortalUsed: true,
+		}, "migrating precedence")
+		e.registry.abortHandoff(id)
+	})
+
+	// Locked DeathPersisting player + malformed payload ->
+	// ErrPlayerNotAlive with pending unchanged.
+	t.Run("locked", func(t *testing.T) {
+		e := newPlayerEngine(t, nil)
+		dying, err := e.AddPlayerEntity(CharacterID(4242),
+			world.Vec3{X: 4, Y: 0, Z: 4}, zeroHPVitals(t), testRuntimeInputs())
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := dying.ID
+		if err := e.PlayerInstallRecoveredPendingDeath(id, pendingFixture(55, 900, int64ptr(77), true)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.PlayerBeginDeathPersistence(id); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.PlayerInstallRecoveredPendingDeath(id, malformed); !errors.Is(err, ErrPlayerNotAlive) {
+			t.Fatalf("locked+malformed = %v; want ErrPlayerNotAlive", err)
+		}
+		still, ok := pendingOf(t, e, id)
+		if !ok {
+			t.Fatalf("locked hydration cleared pending")
+		}
+		requirePendingEqual(t, still, PendingDeathRuntime{
+			EffectiveCost: 55, DeathTimeSeconds: 900,
+			CorpseID: int64ptr(77), PortalUsed: true,
+		}, "locked precedence")
+	})
+
+	// Alive player + malformed payload -> validation error
+	// with zero mutation (existing pending unchanged).
+	t.Run("alive", func(t *testing.T) {
+		e := newPlayerEngine(t, nil)
+		snap, err := e.AddPlayerEntityWithDurableState(testCharacterID(),
+			world.Vec3{X: 1, Y: 0, Z: 1}, testVitals(), testRuntimeInputs(), testFullDurableState())
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := snap.ID
+		if err := e.PlayerInstallRecoveredPendingDeath(id, pendingFixture(55, 900, int64ptr(77), true)); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.PlayerInstallRecoveredPendingDeath(id, malformed); err == nil {
+			t.Fatalf("alive+malformed accepted")
+		} else if errors.Is(err, ErrEntityNotFound) || errors.Is(err, ErrEntityNotPlayer) ||
+			errors.Is(err, ErrCellHandoffRequired) || errors.Is(err, ErrPlayerNotAlive) {
+			t.Fatalf("alive+malformed = %v; want validation error, not entity/life error", err)
+		}
+		still, ok := pendingOf(t, e, id)
+		if !ok {
+			t.Fatalf("alive invalid hydration cleared pending")
+		}
+		requirePendingEqual(t, still, PendingDeathRuntime{
+			EffectiveCost: 55, DeathTimeSeconds: 900,
+			CorpseID: int64ptr(77), PortalUsed: true,
+		}, "alive precedence")
+		if st, _ := lifeOf(t, e, id); st != PlayerLifeAlive {
+			t.Fatalf("life = %d, want Alive", uint8(st))
+		}
+	})
+
+	// Alive player + nil -> success, pending cleared.
+	t.Run("nil", func(t *testing.T) {
+		e := newPlayerEngine(t, nil)
+		snap, err := e.AddPlayerEntityWithDurableState(testCharacterID(),
+			world.Vec3{X: 1, Y: 0, Z: 1}, testVitals(), testRuntimeInputs(), testFullDurableState())
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := snap.ID
+		if err := e.PlayerInstallRecoveredPendingDeath(id, pendingFixture(55, 900, int64ptr(77), true)); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.PlayerInstallRecoveredPendingDeath(id, nil); err != nil {
+			t.Fatalf("nil hydration = %v; want nil", err)
+		}
+		if _, ok := pendingOf(t, e, id); ok {
+			t.Fatalf("nil hydration left pending")
+		}
+	})
+}
+
 // releaseUnderworldPlayer builds an AwaitingRespawn player
 // with the given pending state and returns its token.
 func releaseUnderworldPlayer(t *testing.T, e *Engine, charID CharacterID, pending *PendingDeathRuntime) (EntityID, DeathAttemptToken) {
