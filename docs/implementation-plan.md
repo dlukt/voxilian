@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.39)
+# Voxilian Backend — Implementation Plan (v1.40)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.55).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.56).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -509,22 +509,59 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   `ReconcileSaver` / `ResolveReconciled` after a proven
   Portal lost-ack).
   Spec: §9.5.1, §9.5.1k.
-- [ ] **M5-T5c3d3** Authoritative Underworld-exit penalty
-  transition + exactly-once pending consumption (depends on
-  T5c3d1 + T5c3d2a + T5c3d2b1 + T5c3d2b2 + T5a + T5b2b + T5c2a + T5c2b): actual
-  authoritative Underworld `LeaveHold` event, current pending
-  cost snapshot, resolved penalty inputs,
-  `PlanDeathPenalties` with deterministic owner RNG,
-  complete post-penalty Character state, off-owner
-  `CommitDeathPenalties`, stale/ambiguous recovery,
-  exactly-once pending deletion proof, owner-only final
-  apply + pending clear. C→S 120 `respawn_ack` is NOT the
-  synonym for Underworld `LeaveHold` /
+- [ ] **M5-T5c3d3a** Authoritative Underworld-exit penalty
+  owner attempt + gameplay quiesce + frozen retryable
+  post-penalty capture + typed owner
+  completion/retryable transition (depends on T5c3d1
+  + T5c3d2a + T5c3d2b2 + T5a; `internal/sim` only):
+  actual authoritative Underworld `LeaveHold` penalty
+  event, narrowly resolved penalty inputs
+  (`DefaultDeathCost` + `FrenzyActive`; every other
+  input derived from the live entity), source flag
+  interpretation (`MURDERER 0x000002`, `OUTLAW
+  0x000008`, `HAUNTED 0x000100`, `TUTORIAL 0x000800`),
+  exactly one `PlanDeathPenalties` call with
+  deterministic owner RNG per live attempt, exact
+  complete post-penalty `PlayerVitals` +
+  `PlayerDurableState`, new appended
+  `PlayerLifeDeathPenaltyPersisting` gameplay-quiesce
+  life state, frozen retryable `DeathPenaltyCapture`
+  (post-penalty state + pre-consumption
+  `PendingBefore`), penalty attempt token/epoch,
+  Store-independent provider/reservation interfaces
+  with Reserve-before-RNG ordering, Prepare-while-Alive
+  then epoch++/attempt/life-lock then Activate,
+  lock-on-activation-failure, exact-plan retry without
+  RNG, definitive pre-Store retryable notification,
+  typed same-mailbox completion/retryable ingress,
+  owner-only final apply + pending clear, Portal /
+  hydration / respawn-release serialization, `Step`
+  quiesce. No Store, no PG, no Saver implementation,
+  no queue/worker, no `CommitDeathPenalties`, no
+  recovery, no lost-ack proof, no gateway/proto/session.
+  C→S 120 `respawn_ack` is NOT the synonym for
+  Underworld `LeaveHold` /
   `ApplyDeathPenalties` (T5c4 owns opcode 120 transport;
-  T5c3d3 owns "player actually leaves the Underworld").
+  T5c3d3a owns "player actually leaves the Underworld").
+  Spec: §9.5.1, §9.5.1k.
+- [ ] **M5-T5c3d3b** Bounded penalty persistence executor +
+  Store mapping + in-critical-callback
+  pending-deletion/lost-ack proof (depends on T5c3d3a
+  + T5c3d2b1 + T5b2b + T5c2a + T5c2b): concrete bounded
+  `PenaltyExecutor` implementing
+  `DeathPenaltyWorkProvider` (Reserve owns queue permit
+  + Saver critical slot before owner RNG), CPU-only
+  Prepare, Store mapper (`ExpectedPendingCost =
+  PendingBefore.EffectiveCost`), exactly one
+  `CommitDeathPenalties` in one reserved `Execute`
+  callback, in-callback materialized proof
+  (`E+1` + content + `Pending == nil`), proven-lost-ack
+  success vs `ErrDeathPenaltyCommitUnproven`
+  fail-closed, pre-Store-only retryable notification,
+  owner success completion/redelivery. No gateway.
   Spec: §9.5.1, §9.5.1k.
 - [ ] **M5-T5c4** Gateway death wire/state integration + reconnect E2E
-  (depends on T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b1 + T5c3d2b2 + T5c3d3 + the existing M4
+  (depends on T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b1 + T5c3d2b2 + T5c3d3a + T5c3d3b + the existing M4
   gateway/presence/fanout foundation): gateway/state-machine routing, rate-gated C→S 120
   handling, critical S→C 214 / 215 delivery,
   session/Presence/NetEntityID composition, reconnect/end-to-end
@@ -533,7 +570,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
 - [ ] **M5-T6** Personal/world-light intents: `115 rest`, `116 eat` (hunger/vigor effects), `105 use` (skill/item dispatch incl. Second Wind), `119 safety_toggle`, `117/118 → 209` chat (+channel rules, length caps, rate limits). Owner of these opcodes: this task, no other. Spec: §6.3, §9.
 - [ ] **M5-T7** Authoritative attack/cast runtime integration (depends on
   M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a,   M5-T4b1, M5-T4b2,
-  M5-T5-complete (T5a+T5b1a+T5b1b+T5b2a+T5b2b+T5c1+T5c2a+T5c2b+T5c3a+T5c3b+T5c3c1+T5c3c2+T5c3c3a+T5c3c3b+T5c3c3c1+T5c3c3c2+T5c3d1+T5c3d2a+T5c3d2b1+T5c3d2b2+T5c3d3+T5c4), M5-T6). Owns real C→S 103
+  M5-T5-complete (T5a+T5b1a+T5b1b+T5b2a+T5b2b+T5c1+T5c2a+T5c2b+T5c3a+T5c3b+T5c3c1+T5c3c2+T5c3c3a+T5c3c3b+T5c3c3c1+T5c3c3c2+T5c3d1+T5c3d2a+T5c3d2b1+T5c3d2b2+T5c3d3a+T5c3d3b+T5c4), M5-T6). Owns real C→S 103
   attack routing, real C→S 104 cast routing, typed sim-owner combat
   commands, composition of T1/T2/T3a/T3b mechanics, authoritative T4
   HP/mana/vigor mutation, T5 death handoff, T6 safety/personal-state
@@ -669,9 +706,10 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | M5-T5c3d2a | M5-T5c3d1, M5-T5a | `backend/voxilian/internal/sim` (Portal-of-Life owner attempt, immutable current-state capture, typed owner completion/abort; no Store/persist/PG/Saver/worker work) |
 | M5-T5c3d2b1 | M5-T5c1, M5-T5c3d2a | `backend/voxilian/internal/sim` (reserved Saver critical slot / generation seam only: existing-gate + critical-generation reservation, execution-time revisions; no Store/persist/PG/Portal-executor/recovery work) |
 | M5-T5c3d2b2 | M5-T5c3d2a, M5-T5c3d2b1, M5-T5b2a, M5-T5c2a, M5-T5c2b | `backend/voxilian/internal/persist` + Store-domain Portal mapper (bounded off-owner `CommitPortalOfLife`, in-critical-callback lost-ack proof; no Underworld-exit penalties) |
-| M5-T5c3d3 | M5-T5c3d1, M5-T5c3d2a, M5-T5c3d2b1, M5-T5c3d2b2, M5-T5a, M5-T5b2b, M5-T5c2a, M5-T5c2b | `backend/voxilian/internal/sim` + `internal/persist` (authoritative Underworld-exit penalty transition + exactly-once pending consumption) |
-| M5-T5c4 | M5-T5c3a, M5-T5c3b, M5-T5c3c1, M5-T5c3c2, M5-T5c3c3a, M5-T5c3c3b, M5-T5c3c3c1, M5-T5c3c3c2, M5-T5c3d1, M5-T5c3d2a, M5-T5c3d2b1, M5-T5c3d2b2, M5-T5c3d3 + existing M4 gateway/presence/fanout foundation | `backend/voxilian/internal/{sim,gateway}` (death wire/state integration + reconnect E2E, existing 120/214/215 codecs) |
-| M5-T7 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2, M5-T5a, M5-T5b1a, M5-T5b1b, M5-T5b2a, M5-T5b2b, M5-T5c1, M5-T5c2a, M5-T5c2b, M5-T5c3a, M5-T5c3b, M5-T5c3c1, M5-T5c3c2, M5-T5c3c3a, M5-T5c3c3b, M5-T5c3c3c1, M5-T5c3c3c2, M5-T5c3d1, M5-T5c3d2a, M5-T5c3d2b1, M5-T5c3d2b2, M5-T5c3d3, M5-T5c4, M5-T6 | `backend/voxilian/internal/{sim,gateway}` (authoritative 103/104 runtime integration) |
+| M5-T5c3d3a | M5-T5c3d1, M5-T5c3d2a, M5-T5c3d2b2, M5-T5a | `backend/voxilian/internal/sim` (authoritative Underworld-exit penalty owner attempt + gameplay quiesce + frozen retryable capture + typed completion/retryable; no Store/persist/PG/Saver/queue/worker/gateway work) |
+| M5-T5c3d3b | M5-T5c3d3a, M5-T5c3d2b1, M5-T5b2b, M5-T5c2a, M5-T5c2b | `backend/voxilian/internal/persist` + Store-domain penalty mapper (bounded off-owner `CommitDeathPenalties` execution, in-critical-callback lost-ack proof; no gateway work) |
+| M5-T5c4 | M5-T5c3a, M5-T5c3b, M5-T5c3c1, M5-T5c3c2, M5-T5c3c3a, M5-T5c3c3b, M5-T5c3c3c1, M5-T5c3c3c2, M5-T5c3d1, M5-T5c3d2a, M5-T5c3d2b1, M5-T5c3d2b2, M5-T5c3d3a, M5-T5c3d3b + existing M4 gateway/presence/fanout foundation | `backend/voxilian/internal/{sim,gateway}` (death wire/state integration + reconnect E2E, existing 120/214/215 codecs) |
+| M5-T7 | M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a, M5-T4b1, M5-T4b2, M5-T5a, M5-T5b1a, M5-T5b1b, M5-T5b2a, M5-T5b2b, M5-T5c1, M5-T5c2a, M5-T5c2b, M5-T5c3a, M5-T5c3b, M5-T5c3c1, M5-T5c3c2, M5-T5c3c3a, M5-T5c3c3b, M5-T5c3c3c1, M5-T5c3c3c2, M5-T5c3d1, M5-T5c3d2a, M5-T5c3d2b1, M5-T5c3d2b2, M5-T5c3d3a, M5-T5c3d3b, M5-T5c4, M5-T6 | `backend/voxilian/internal/{sim,gateway}` (authoritative 103/104 runtime integration) |
 | M6-T1…T3 | M5-T1…T5 | `backend/voxilian/internal/sim` (progression) |
 | M7-T1 | M9-T1 (seed pipeline) + M1-T6b | `backend/voxilian/internal/sim`, `seed/` fixtures |
 | M7-T2a…c, T3, T4 | M4-T1…T3a, M1-T7b | `backend/voxilian/internal/sim` |
@@ -701,6 +739,56 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.40: split M5-T5c3d3 into owner-first T5c3d3a +
+  persistence-later T5c3d3b (docs only, spec
+  v0.3.55 -> v0.3.56 extends §9.5.1k + §9.5.1; split only):
+  T5c3d3a (authoritative Underworld-exit penalty owner
+  attempt + gameplay quiesce + frozen retryable
+  post-penalty capture + typed owner
+  completion/retryable transition; depends on T5c3d1
+  + T5c3d2a + T5c3d2b2 + T5a; `internal/sim` only;
+  owns the `LeaveHold` owner event, narrow resolved
+  inputs, source flag interpretation
+  (MURDERER/OUTLAW/HAUNTED/TUTORIAL bits), exactly one
+  `PlanDeathPenalties` per live attempt, complete
+  post-penalty state, `PlayerLifeDeathPenaltyPersisting`
+  quiesce, frozen retryable capture, token/epoch,
+  Store-independent provider/reservation with
+  Reserve-before-RNG, Prepare-while-Alive ordering,
+  lock-on-activation-failure, exact-plan retry without
+  RNG, pre-Store retryable notification, same-mailbox
+  typed completion/retryable ingress, owner-only final
+  apply; no Store/PG/Saver/queue/worker/gateway) +
+  T5c3d3b (bounded penalty persistence executor +
+  Store mapping + in-critical-callback
+  pending-deletion/lost-ack proof; depends on T5c3d3a
+  + T5c3d2b1 + T5b2b + T5c2a + T5c2b; freezes the
+  binding future rule that concrete Reserve owns the
+  queue permit + Saver critical slot before owner RNG
+  rolls, Prepare is CPU-only, the mapper uses
+  `PendingBefore.EffectiveCost`, and the proven
+  lost-ack path returns E+1 inside the held-gate
+  callback with no reconcile/resolve/replay; no
+  gateway); split rationale frozen (full post-penalty
+  Character persistence requires gameplay quiesce;
+  infrastructure retry must not reroll penalty RNG);
+  T5c3d3a now depends on
+  T5c3d1+T5c3d2a+T5c3d2b2+T5a; T5c3d3b now depends on
+  T5c3d3a+T5c3d2b1+T5b2b+T5c2a+T5c2b; T5c4 now depends on
+  T5c3a+T5c3b+T5c3c1+T5c3c2+T5c3c3a+T5c3c3b+T5c3c3c1+
+  T5c3c3c2+T5c3d1+T5c3d2a+T5c3d2b1+T5c3d2b2+T5c3d3a+T5c3d3b
+  + the M4 gateway/presence/fanout foundation; M5-T7 now depends
+  on the TWENTY-THREE-task M5-T5 set
+  (T5a+T5b1a+T5b1b+T5b2a+T5b2b+T5c1+T5c2a+T5c2b+T5c3a+T5c3b+
+  T5c3c1+T5c3c2+T5c3c3a+T5c3c3b+T5c3c3c1+T5c3c3c2+T5c3d1+
+  T5c3d2a+T5c3d2b1+T5c3d2b2+T5c3d3a+T5c3d3b+T5c4); task-index rows updated
+  accordingly. `meridian59.md` untouched.
+  Checkbox state unchanged: T5a/T5b1a/T5b1b/T5b2a/T5b2b/
+  T5c1/T5c2a/T5c2b/T5c3a/T5c3b/T5c3c1/T5c3c2/T5c3c3a/
+  T5c3c3b/T5c3c3c1/T5c3c3c2/T5c3d1/T5c3d2a/T5c3d2b1/
+  T5c3d2b2 `[x]`,
+  T5c3d3a/T5c3d3b/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v1.39: freeze M5 Portal persistence execution contract
   (docs only, spec v0.3.54 -> v0.3.55 extends §9.5.1k +

@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.55 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.56 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -7971,7 +7971,7 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
 
 #### 9.5.1 Ownership split and the two-phase lifecycle
 
- M5-T5 is TWENTY-TWO tasks (this section is their shared boundary;
+ M5-T5 is TWENTY-THREE tasks (this section is their shared boundary;
  the former single T5c is split into T5c1–T5c4, frozen v0.3.39 in
  §9.5.1a, T5c2 is further split into T5c2a+T5c2b, frozen
  v0.3.40 in §9.5.1b, T5c3 is further split into
@@ -7987,8 +7987,9 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
   T5c3d2 is further split into T5c3d2a+T5c3d2b, frozen
   v0.3.53 in §9.5.1k, T5c3d2b is further split into
   T5c3d2b1+T5c3d2b2, frozen v0.3.54 in §9.5.1k, and the
-  d2b2 Portal persistence execution contract is frozen
-  v0.3.55 in §9.5.1k):
+   d2b2 Portal persistence execution contract is frozen
+   v0.3.55 in §9.5.1k, and T5c3d3 is further split into
+   T5c3d3a+T5c3d3b, frozen v0.3.56 in §9.5.1k):
 
 - **T5a — pure/source-faithful death mechanics and immutable plans**
   (§9.5.4–§9.5.14 pure surface; §9.5.17 non-scope).
@@ -8262,24 +8263,84 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
     character). The existing public `persist`
     `CommitPortalOfLife` T5c2b adapter behavior is
     unchanged and stays off the reservation path.
-  - **T5c3d3 — authoritative Underworld-exit penalty
-    transition + exactly-once pending consumption**
-    (§9.5.1k, future): the actual authoritative
-    Underworld `LeaveHold` event, the current pending
-    cost snapshot, resolved penalty inputs,
-    `PlanDeathPenalties` with deterministic owner RNG,
-    the complete post-penalty Character state, off-owner
-    `CommitDeathPenalties`, stale/ambiguous recovery,
-    the exactly-once pending deletion proof, and the
-    owner-only final apply + pending clear. Depends on
-    T5c3d1 + T5c3d2a + T5c3d2b1 + T5c3d2b2 + T5a + T5b2b + T5c2a +
-    T5c2b. T5c3d3 Underworld `LeaveHold` MUST NOT consume
+  - **T5c3d3a — authoritative Underworld-exit penalty
+    owner attempt + gameplay quiesce + frozen retryable
+    post-penalty capture + typed owner
+    completion/retryable transition** (§9.5.1k):
+    the actual authoritative Underworld `LeaveHold`
+    event, the current pending cost snapshot, narrowly
+    resolved penalty inputs (`DefaultDeathCost` +
+    `FrenzyActive` only; pending cost, still-newbie,
+    murderer, stamina, and spell/skill inputs are
+    derived from the live entity, never
+    caller-supplied), source flag interpretation
+    (`MURDERER = 0x000002`, `OUTLAW = 0x000008`,
+    `HAUNTED = 0x000100`, `TUTORIAL = 0x000800`;
+    still-newbie means `Flags & 0x000800 == 0`),
+    exactly one `PlanDeathPenalties` call with
+    deterministic owner RNG per live attempt, the exact
+    complete post-penalty `PlayerVitals` +
+    `PlayerDurableState` (outlaw/haunted clears +
+    ability losses only; `ReevaluatePK`/`QuitGuild`
+    stay classification-only hooks), the new player
+    life state `PlayerLifeDeathPenaltyPersisting`
+    (gameplay-quiesced: no movement translation, no
+    health/mana/rest timer mutation, ordinary
+    Player* mutation rejected), the frozen retryable
+    penalty capture (complete POST-penalty
+    vitals/durable plus PRE-consumption `PendingBefore`;
+    future Store mapping MUST use
+    `PendingBefore.EffectiveCost`, never
+    `Plan.ScaledCost`), the penalty attempt
+    token/epoch, the Store-independent
+    `DeathPenaltyWorkProvider` / `DeathPenaltyWorkReservation`
+    interfaces with Reserve-before-RNG ordering
+    (infrastructure capacity failure consumes zero
+    RNG and mutates nothing), Prepare-while-Alive
+    then epoch++/attempt-install/life-lock then
+    Activate in the same owner turn, lock-on-activation-failure
+    (no unlock, no reroll), exact-plan retry without
+    consuming RNG again, the definitive pre-Store
+    retryable owner notification (`Applied` vs
+    idempotent `Duplicate`), the typed same-mailbox
+    completion/retryable ingress, and the owner-only
+    final apply + pending clear. `internal/sim` only:
+    no Store, no PG, no Saver implementation, no queue/worker,
+    no `CommitDeathPenalties`, no recovery, no
+    lost-ack proof, no gateway/proto/session. Depends
+    on T5c3d1 + T5c3d2a + T5c3d2b2 + T5a.
+    T5c3d3a Underworld `LeaveHold` MUST NOT consume
     pending penalties while a Portal attempt against that
-    pending death remains in flight (exact d3 API
-    deferred).
+    pending death remains in flight.
+  - **T5c3d3b — bounded penalty persistence executor +
+    Store mapping + in-critical-callback
+    pending-deletion/lost-ack proof** (§9.5.1k,
+    future): the concrete bounded `PenaltyExecutor`
+    implementing `DeathPenaltyWorkProvider` (Reserve
+    synchronously owns one bounded queue permit PLUS
+    one Saver `ReserveCriticalSet` slot BEFORE owner
+    RNG rolls), the CPU-only Prepare (map + freeze,
+    no Saver/queue acquisition, no Store I/O), the
+    Store mapper (complete capture post-penalty
+    character with `ExpectedRevision = 0` placeholder;
+    `ExpectedPendingCost =
+    PendingBefore.EffectiveCost`), exactly one
+    `CommitDeathPenalties` inside exactly one reserved
+    `Execute` callback, the in-callback materialized
+    proof (recovered revision `== E+1` exactly, semantic
+    post-penalty content equality, `Pending == nil`
+    as the exactly-once deletion proof; proven path
+    returns `E+1` as ordinary reserved success with no
+    replay/reconcile; unproven path is
+    `ErrDeathPenaltyCommitUnproven` fail-closed), the
+    pre-Store-only typed retryable owner notification
+    (never after the critical callback begins), and
+    owner success completion/redelivery. Depends on
+    T5c3d3a + T5c3d2b1 + T5b2b + T5c2a + T5c2b. No
+    gateway.
    C→S 120 `respawn_ack` is NOT the synonym for
    Underworld `LeaveHold` / `ApplyDeathPenalties`: T5c4
-   owns opcode 120 transport/state routing while T5c3d3
+   owns opcode 120 transport/state routing while T5c3d3a
    owns the gameplay event "player actually leaves the
    Underworld".
    - **T5c4 — gateway death wire/state integration + reconnect E2E**:
@@ -8287,9 +8348,9 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
      S→C 214 / 215 delivery, session/Presence/NetEntityID composition,
      reconnect/end-to-end proof reusing the existing 120/214/215 codecs
      (no second protocol). Depends on T5c3a + T5c3b + T5c3c1 + T5c3c2 +
-     T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b1 + T5c3d2b2 + T5c3d3 + the existing M4 gateway/presence/fanout foundation.
+     T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b1 + T5c3d2b2 + T5c3d3a + T5c3d3b + the existing M4 gateway/presence/fanout foundation.
 
-   M5-T5-complete is `T5a + T5b1a + T5b1b + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b1 + T5c3d2b2 + T5c3d3 + T5c4` (TWENTY-TWO tasks).
+    M5-T5-complete is `T5a + T5b1a + T5b1b + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b1 + T5c3d2b2 + T5c3d3a + T5c3d3b + T5c4` (TWENTY-THREE tasks).
 
 Ledger contract (binding on T5b2a/T5b2b): Portal-of-Life writes ZERO
 ledger rows. Underworld-exit death penalties write ZERO ledger rows.
@@ -10785,7 +10846,7 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
    migration, generated code, gateway/proto/session,
    `PlayerLoseHealth` automatic dispatch.
 
-    #### 9.5.1k M5 pending-death owner lifecycle split (T5c3d1+T5c3d2a+T5c3d2b1+T5c3d2b2+T5c3d3, frozen v0.3.52/v0.3.53/v0.3.54/v0.3.55)
+    #### 9.5.1k M5 pending-death owner lifecycle split (T5c3d1+T5c3d2a+T5c3d2b1+T5c3d2b2+T5c3d3a+T5c3d3b, frozen v0.3.52/v0.3.53/v0.3.54/v0.3.55/v0.3.56)
 
     The former single T5c3d combined three separate
     correctness boundaries — authoritative pending-death
@@ -10804,7 +10865,10 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
     and the d2b2 Portal persistence execution contract
     below is frozen v0.3.55 (this paragraph supersedes
     the d2b2 "future" paragraph of §9.5.1 for the
-    execution contract only; no task is split again).
+    execution contract only), and T5c3d3 is further
+    split into T5c3d3a+T5c3d3b (v0.3.56; this paragraph
+    supersedes the T5c3d3 paragraph of §9.5.1 for the
+    split only; no task is split again).
     `meridian59.md` is untouched: this task
     changes no Meridian mechanics.
 
@@ -11371,37 +11435,200 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
     materially affects the d2a attempt lifecycle; it is
     NOT implemented in d2a.
 
-    T5c3d3 (depends on T5c3d1 + T5c3d2a + T5c3d2b1 +
-    T5c3d2b2 + T5a + T5b2b + T5c2a + T5c2b; future) owns the actual
-   authoritative Underworld `LeaveHold` event, the
-   current pending cost snapshot, resolved penalty
-   inputs, `PlanDeathPenalties` with deterministic
-   owner RNG, the complete post-penalty Character
-   state, off-owner `CommitDeathPenalties`,
-   stale/ambiguous recovery, the exactly-once pending
-   deletion proof, and the owner-only final apply +
-   pending clear. C→S 120 remains NOT synonymous with
-   `LeaveHold`. Future d3 serialization note (frozen
-   v0.3.53, exact d3 API deferred): T5c3d3 Underworld
-   `LeaveHold` MUST NOT consume pending penalties
-   while a Portal attempt against that pending death
-   remains in flight. No penalties are implemented
-   here.
+    T5c3d3a (depends on T5c3d1 + T5c3d2a + T5c3d2b2 +
+    T5a; `internal/sim` only) owns the actual
+    authoritative Underworld `LeaveHold` penalty owner
+    attempt: the owner-local `LeaveHold` event (NOT C→S
+    120 `respawn_ack`, NOT Portal use, NOT ordinary
+    movement input; T5c4 owns opcode 120 transport),
+    narrowly resolved `UnderworldExitResolvedInput`
+    (`DefaultDeathCost` 1..100 + `FrenzyActive` bool
+    only — pending cost, still-newbie, murderer,
+    stamina, vitals, and spell/skill inputs are
+    derived from the live entity, never
+    caller-supplied), source flag interpretation over
+    the authoritative `PlayerDurableState.Flags`
+    (`MURDERER = 0x000002`, `OUTLAW = 0x000008`,
+    `HAUNTED = 0x000100`, `TUTORIAL = 0x000800`;
+    murderer means `Flags & 0x000002 != 0`,
+    still-newbie means `Flags & 0x000800 == 0`;
+    successful-plan application clears `0x000008`
+    when `ClearOutlaw` and `0x000100` when
+    `ClearHaunted`, preserving every unrelated bit;
+    murderer is NEVER cleared by `ReevaluatePK`,
+    which stays a future justice hook, as `QuitGuild`
+    stays a future guild hook), exactly one
+    `PlanDeathPenalties` call with the injected
+    deterministic owner RNG per live attempt (existing
+    T5a planner and binding order unchanged: frenzy
+    clears haunted only; full cost clears outlaw +
+    re-evaluates PK + clears haunted; newbie
+    non-murderer scales cost/3 with no HP roll, else
+    the HP d100; post-HP guild-quit classification;
+    murderer -2 else -1; spells then skills in exact
+    current order with stamina then cost rolls), the
+    exact complete post-penalty `PlayerVitals`
+    (`plan.VitalsAfter`) + `PlayerDurableState`
+    (deep clone, flag clears, per-loss `Kind + ID`
+    application with `FromAbility` match, order/
+    membership/`AtrophyFlag` preserved, still
+    validating), the new appended (never renumbered)
+    player life state
+    `PlayerLifeDeathPenaltyPersisting` (frozen plan,
+    persistence result not yet owner-applied;
+    ordinary gameplay mutation/input rejects it
+    through the existing active-player gate; `Step`
+    performs no movement translation and no
+    health/mana/rest timer mutation while
+    preserving movement state, deadline slots,
+    runtime inputs, stomach anchor, position, and
+    history sampling), the per-entity ephemeral
+    `penaltyEpoch` + private frozen `penaltyAttempt`
+    (independent of `deathEpoch`/`portalEpoch`/Saver
+    revision/`OpID`/session/`NetEntityID`; handoff
+    preserves, removal discards, fresh re-add starts
+    at zero; wrap is stable
+    `ErrDeathPenaltyAttemptExhausted` with zero
+    mutation and zero RNG), the Store-independent
+    `DeathPenaltyWorkProvider`
+    (`ReserveDeathPenaltyWork(characterID)`) /
+    `DeathPenaltyWorkReservation`
+    (`Prepare`/`Activate`/`Cancel`, no
+    Store/persist/revision/result-channel types)
+    interfaces, the canonical first-attempt order
+    (structural validation with zero mutation and
+    zero RNG; provider Reserve in the same owner
+    turn with reservation failure consuming zero RNG
+    and mutating nothing; exactly one
+    `PlanDeathPenalties`; deep-frozen
+    `DeathPenaltyCapture` with complete POST-penalty
+    vitals/durable, PRE-consumption `PendingBefore`,
+    position, token, and plan — future Store mapping
+    MUST use `PendingBefore.EffectiveCost` as
+    `ExpectedPendingCost`, NEVER `Plan.ScaledCost`;
+    `PrepareDeathPenaltyWork` while life is still
+    `Alive`; ONLY then `penaltyEpoch++`, private
+    attempt install, life lock, and
+    `ActivateDeathPenaltyWork` in the same owner
+    turn), lock-on-activation-failure (definitive
+    pre-publication Activate error KEEPS life locked,
+    the exact frozen capture, and the consumed epoch
+    with `persistenceActive == false` — no unlock, no
+    reroll; deliberately different from Portal),
+    Prepare-failure-Alive return (capacity admission
+    already happened in Reserve, so a Prepare failure
+    is a contract/invariant problem: Cancel, no owner
+    mutation, no automatic retry/reroll), exact-plan
+    retry without RNG (`PlayerRetryDeathPenaltyPersistence`
+    reuses the exact frozen capture, never calls the
+    planner, never reads RNG, never increments the
+    epoch), the definitive pre-Store retryable owner
+    notification (`PlayerMarkDeathPenaltyPersistenceRetryable`
+    flips `persistenceActive` true -> false only,
+    `Applied` first then idempotent `Duplicate`;
+    a Store-crossed path MUST NEVER call it), the
+    typed same-mailbox retryable/completion ingress
+    (existing 256-command mailbox, no second mailbox,
+    no closures, result channels buffered capacity
+    1), and the token-only success completion
+    (`PlayerAcceptDeathPenaltyCompletion` installs
+    EXACTLY the stored capture — vitals, durable,
+    `pendingDeath = nil`, attempt cleared, life ->
+    `Alive` — preserving position, identities,
+    epochs, `lastDeathSeconds`, runtime
+    inputs/deadline slots, and history, with no RNG
+    and no `PlayerVitalsObserver` replay;
+    post-success same-token is a zero-mutation
+    `Duplicate` unless a NEW pending death exists;
+    mismatch/ABA follow the existing
+    not-found/handoff/mismatch conventions with no
+    `CharacterID` fallback). Serialization: Portal
+    begin, pending hydration, and respawn release all
+    reject `PenaltyPersisting`, so no pending state
+    can change underneath the frozen attempt. Stable
+    sim errors (`ErrDeathPenaltyUnavailable`,
+    `ErrDeathPenaltyAttemptMismatch`,
+    `ErrDeathPenaltyAttemptExhausted`,
+    `ErrDeathPenaltyPersistenceActive`; `errors.Is`;
+    no Store errors in sim). No Store, no PG, no Saver
+    implementation, no queue/worker, no
+    `CommitDeathPenalties`, no recovery, no lost-ack
+    proof, no gateway/proto/session, no justice/guild
+    runtime. C→S 120 remains NOT synonymous with
+    `LeaveHold`. Serialization note (frozen v0.3.53,
+    kept): T5c3d3a Underworld `LeaveHold` MUST NOT
+    consume pending penalties while a Portal attempt
+    against that pending death remains in flight.
 
-    Downstream graph (binding): T5c3d3 now depends on
-    T5c3d1 + T5c3d2a + T5c3d2b1 + T5c3d2b2 + T5a + T5b2b + T5c2a +
+    Why the split is mandatory (binding): death
+    penalties persist a COMPLETE post-penalty
+    `CharacterSnapshot` (vitals, flags, spells,
+    skills) while atomically deleting `pending_deaths`,
+    so the victim MUST be gameplay-quiesced for the
+    authoritative attempt (a live pre-penalty snapshot
+    could otherwise overwrite penalty effects); and
+    `PlanDeathPenalties` consumes deterministic RNG in
+    frozen order (HP, then spells, then skills), so a
+    definite pre-Store failure MUST NOT unlock and
+    reroll — the exact plan/capture is retained and
+    infrastructure retry reuses it until it commits
+    and is owner-applied or the process/entity is
+    discarded to authoritative reconnect recovery.
+
+    T5c3d3b (depends on T5c3d3a + T5c3d2b1 + T5b2b +
+    T5c2a + T5c2b; future) owns the bounded penalty
+    persistence executor: the concrete bounded
+    `PenaltyExecutor` implementing
+    `DeathPenaltyWorkProvider` whose Reserve
+    synchronously/non-blockingly owns one bounded
+    queue permit PLUS one Saver `ReserveCriticalSet`
+    slot for the Character BEFORE returning success
+    (inside the sim owner turn, before RNG; failure
+    releases partial ownership with zero RNG and zero
+    owner mutation — differing from Portal, whose
+    concrete reservation acquires the Saver slot in
+    Prepare, because d3a cannot afford an
+    infrastructure failure after consuming rolls),
+    the CPU-only Prepare (map + freeze only, no Saver,
+    no queue, no PG, no Store, no recovery), the Store
+    mapper (complete post-penalty character,
+    `ExpectedRevision = 0` placeholder,
+    `ExpectedPendingCost =
+    PendingBefore.EffectiveCost`), exactly one
+    `CommitDeathPenalties` inside exactly one
+    `CriticalSetReservation.Execute` callback with
+    Store at most once, the in-held-callback
+    read-only lost-ack proof (recovered revision `==
+    E+1` exactly, semantic post-penalty content
+    equality, `Pending == nil`; proven path returns
+    `E+1` as ordinary reserved success with no
+    replay/reconcile/resolve; unproven path is stable
+    `ErrDeathPenaltyCommitUnproven` fail-closed with
+    no success completion, no retryable notification,
+    and no Store replay), the typed pre-Store-only
+    retryable notification (only when the reserved
+    callback was NEVER invoked; never unlocks, only
+    enables exact frozen-capture retry — deliberately
+    different from Portal's owner abort), and owner
+    success completion/redelivery. No gateway. The
+    already-frozen T5b2b transaction behavior is
+    unchanged. No penalties are implemented here.
+
+    Downstream graph (binding): T5c3d3a now depends on
+    T5c3d1 + T5c3d2a + T5c3d2b2 + T5a; T5c3d3b now
+    depends on T5c3d3a + T5c3d2b1 + T5b2b + T5c2a +
     T5c2b; T5c4 now depends on
     T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b +
     T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b1 +
-    T5c3d2b2 + T5c3d3 + the
+    T5c3d2b2 + T5c3d3a + T5c3d3b + the
     existing M4 gateway/presence/fanout foundation;
-    M5-T5-complete is the TWENTY-TWO-task set T5a + T5b1a +
+    M5-T5-complete is the TWENTY-THREE-task set T5a + T5b1a +
     T5b1b + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a +
     T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b +
     T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b1 +
-    T5c3d2b2 + T5c3d3 + T5c4
+    T5c3d2b2 + T5c3d3a + T5c3d3b + T5c4
     (M5-T7 wording/task index updated accordingly).
-    After this task T5c3d1, T5c3d2a, T5c3d2b1, T5c3d2b2, T5c3d3, T5c4, T6, T7,
+    After this task T5c3d3a, T5c3d3b, T5c4, T6, T7,
     and the M5 exit stay `[ ]`.
 
   #### 9.5.2 Death disposition: avoided vs cheap vs normal (frozen)
