@@ -34,8 +34,8 @@ var (
 
 // ingressCommand is the private typed command union the owner
 // mailbox carries (spec §5.2.10 + §9.5.1h + §9.5.1k): exactly generic add,
-// player add, remove, move, immediate-death completion, and the two
-// Portal-of-Life commands. Gateway-facing code can never submit
+// player add, remove, move, immediate-death completion, the two
+// Portal-of-Life commands, and the two penalty commands. Gateway-facing code can never submit
 // arbitrary closures: there is no func(*Engine) command.
 type ingressCommand interface {
 	// execute runs the command on the sim owner goroutine and
@@ -215,6 +215,69 @@ func (c ingressPortalAbort) fail(err error) {
 	c.res <- ingressPortalAbortResult{err: err}
 }
 
+// ingressDeathPenaltyRetryableResult is the typed completion
+// of one penalty retryable-notification command, preserving
+// the exact owner-local
+// PlayerMarkDeathPenaltyPersistenceRetryable semantics.
+type ingressDeathPenaltyRetryableResult struct {
+	disp DeathPenaltyRetryDisposition
+	err  error
+}
+
+// ingressDeathPenaltyRetryable is the typed pre-Store
+// penalty-retryable owner command (spec §9.5.1k): it
+// carries one DeathPenaltyAttemptToken only and the owner
+// executes the normal
+// PlayerMarkDeathPenaltyPersistenceRetryable path on the
+// SAME bounded mailbox.
+type ingressDeathPenaltyRetryable struct {
+	token DeathPenaltyAttemptToken
+	res   chan ingressDeathPenaltyRetryableResult
+}
+
+func (c ingressDeathPenaltyRetryable) execute(e *Engine) {
+	disp, err := e.PlayerMarkDeathPenaltyPersistenceRetryable(c.token)
+	c.res <- ingressDeathPenaltyRetryableResult{disp: disp, err: err}
+}
+
+func (c ingressDeathPenaltyRetryable) fail(err error) {
+	c.res <- ingressDeathPenaltyRetryableResult{err: err}
+}
+
+// ingressDeathPenaltyCompletionResult is the typed completion
+// of one penalty success-completion command, preserving the
+// exact owner-local PlayerAcceptDeathPenaltyCompletion
+// semantics (Applied vs Duplicate vs error).
+type ingressDeathPenaltyCompletionResult struct {
+	disp DeathPenaltyCompletionDisposition
+	err  error
+}
+
+// ingressDeathPenaltyCompletion is the typed authoritative
+// penalty-completion owner command (spec §9.5.1k): it
+// carries one DeathPenaltyCompletion value only (the
+// attempt token; the post-penalty state is already frozen
+// on the entity) and the owner executes the normal
+// PlayerAcceptDeathPenaltyCompletion path. It uses the
+// SAME bounded mailbox and admission rules as every other
+// ingress command; the future d3b executor redelivers the
+// SAME completion/token after ErrSimIngressFull, and a
+// redelivery after the first apply resolves as the
+// existing zero-mutation Duplicate result.
+type ingressDeathPenaltyCompletion struct {
+	completion DeathPenaltyCompletion
+	res        chan ingressDeathPenaltyCompletionResult
+}
+
+func (c ingressDeathPenaltyCompletion) execute(e *Engine) {
+	disp, err := e.PlayerAcceptDeathPenaltyCompletion(c.completion)
+	c.res <- ingressDeathPenaltyCompletionResult{disp: disp, err: err}
+}
+
+func (c ingressDeathPenaltyCompletion) fail(err error) {
+	c.res <- ingressDeathPenaltyCompletionResult{err: err}
+}
+
 // ingressState is the run-ownership coordination only: whether a Run
 // currently owns the engine. It MUST NOT become a mutex protecting
 // normal sim entity state — mutable sim stays single-owner, and the
@@ -356,6 +419,43 @@ func (e *Engine) EnqueuePortalOfLifeAbort(ctx context.Context, token PortalAttem
 	cmd := ingressPortalAbort{token: token, res: make(chan ingressPortalAbortResult, 1)}
 	if err := e.admit(ctx, cmd); err != nil {
 		return PortalAbortAborted, err
+	}
+	res := <-cmd.res
+	return res.disp, res.err
+}
+
+// EnqueueDeathPenaltyPersistenceRetryable submits one
+// pre-Store penalty retryable notification through the sim
+// owner (spec §9.5.1k). It uses the SAME bounded mailbox
+// and admission rules as every other ingress command and
+// returns the real owner-local result (Applied vs
+// idempotent Duplicate vs terminal mismatch). On admission
+// or execution error the disposition is meaningless —
+// check err first.
+func (e *Engine) EnqueueDeathPenaltyPersistenceRetryable(ctx context.Context, token DeathPenaltyAttemptToken) (DeathPenaltyRetryDisposition, error) {
+	cmd := ingressDeathPenaltyRetryable{token: token, res: make(chan ingressDeathPenaltyRetryableResult, 1)}
+	if err := e.admit(ctx, cmd); err != nil {
+		return DeathPenaltyRetryApplied, err
+	}
+	res := <-cmd.res
+	return res.disp, res.err
+}
+
+// EnqueueDeathPenaltyCompletion submits one authoritative
+// penalty success completion through the sim owner (spec
+// §9.5.1k). It uses the SAME bounded mailbox and admission
+// rules as every other ingress command and returns the real
+// owner-local result: admitted commands are authoritative
+// and the owner invokes the normal
+// PlayerAcceptDeathPenaltyCompletion path (same
+// token/lifecycle validation, Applied vs zero-mutation
+// Duplicate semantics, exact frozen-capture install). On
+// admission or execution error the disposition is
+// meaningless — check err first.
+func (e *Engine) EnqueueDeathPenaltyCompletion(ctx context.Context, completion DeathPenaltyCompletion) (DeathPenaltyCompletionDisposition, error) {
+	cmd := ingressDeathPenaltyCompletion{completion: completion, res: make(chan ingressDeathPenaltyCompletionResult, 1)}
+	if err := e.admit(ctx, cmd); err != nil {
+		return DeathPenaltyCompletionApplied, err
 	}
 	res := <-cmd.res
 	return res.disp, res.err

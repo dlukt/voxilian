@@ -509,7 +509,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   `ReconcileSaver` / `ResolveReconciled` after a proven
   Portal lost-ack).
   Spec: §9.5.1, §9.5.1k.
-- [ ] **M5-T5c3d3a** Authoritative Underworld-exit penalty
+- [x] **M5-T5c3d3a** Authoritative Underworld-exit penalty
   owner attempt + gameplay quiesce + frozen retryable
   post-penalty capture + typed owner
   completion/retryable transition (depends on T5c3d1

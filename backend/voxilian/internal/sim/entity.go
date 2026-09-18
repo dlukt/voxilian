@@ -155,6 +155,25 @@ type entity struct {
 	portalInFlight bool
 	portalAttempt  portalAttemptState
 
+	// Penalty attempt epoch + private attempt (spec
+	// §9.5.1k, M5-T5c3d3a): the owner-local ephemeral
+	// Underworld-exit penalty lifecycle, independent of
+	// the immediate-death deathEpoch and the Portal
+	// portalEpoch. penaltyEpoch counts successfully
+	// begun penalty attempts for this entity (0 until
+	// the first begin); penaltyAttempt is the private
+	// frozen capture plus its persistence-active flag,
+	// non-nil only while lifeState is
+	// PlayerLifeDeathPenaltyPersisting. Both ride this
+	// SAME entity object through cell handoff (the
+	// migration record owns the same object), are
+	// discarded with the entity on removal, and restart
+	// at zero/nil on a fresh entity (fresh re-add
+	// starts epoch 0 with no attempt). Neither field is
+	// persisted or sent on the wire.
+	penaltyEpoch   uint64
+	penaltyAttempt *penaltyAttemptState
+
 	// pendingDeath is the authoritative owner-local
 	// pending-death runtime state (spec §9.5.1k,
 	// M5-T5c3d1): character-aggregate child runtime

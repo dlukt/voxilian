@@ -195,10 +195,23 @@ func (e *Engine) Step() {
 		if ent == nil {
 			continue
 		}
+		if ent.isPlayer && ent.lifeState == PlayerLifeDeathPenaltyPersisting {
+			// A penalty-quiesced player performs NO gameplay
+			// progression (spec §9.5.1k, M5-T5c3d3a): no
+			// movement translation (hence no handoff), no
+			// health/mana/rest timer mutation. Deadline
+			// slots, runtime inputs, movement input state,
+			// and the stomach anchor are preserved, not
+			// disarmed or re-anchored. History sampling
+			// below still continues at the unchanged
+			// position.
+			ent.history.Append(PositionSample{Tick: tick, Position: ent.position})
+			continue
+		}
 		if update, emit := e.stepEntity(ent, tick); emit && e.movement != nil {
 			e.movement.OnMovement(update)
 		}
-		if ent.isPlayer && ent.lifeState != PlayerLifeDeathPersisting {
+		if ent.isPlayer && ent.lifeState != PlayerLifeDeathPersisting && ent.lifeState != PlayerLifeDeathPenaltyPersisting {
 			// A DeathPersisting player has no armed deadlines
 			// (begin canceled them) and MUST remain quiescent:
 			// skip the vitals runtime while history sampling

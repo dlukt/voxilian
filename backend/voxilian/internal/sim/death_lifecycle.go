@@ -42,6 +42,19 @@ const (
 	// transport/gameplay respawn-release phase (T5c4/T5c3d) has not
 	// yet completed. T5c3c1 provides NO transition out of it.
 	PlayerLifeAwaitingRespawn
+	// PlayerLifeDeathPenaltyPersisting means an authoritative
+	// Underworld-exit penalty plan is already frozen while its
+	// persistence result is not yet owner-applied (spec
+	// §9.5.1k, M5-T5c3d3a). The entity remains resident but
+	// gameplay progression is paused: ordinary gameplay
+	// mutation/input rejects this state through the existing
+	// active-player gate, Step performs no movement
+	// translation and no health/mana/rest timer mutation
+	// (deadline slots are preserved, not disarmed), and the
+	// lock persists across pre-Store infrastructure failure
+	// so infrastructure retry reuses the same frozen plan.
+	// Appended without renumbering the existing values.
+	PlayerLifeDeathPenaltyPersisting
 )
 
 // DeathAttemptToken correlates one immediate-death persistence
