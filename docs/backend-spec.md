@@ -10420,17 +10420,20 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
  tick interpreted as Unix/absolute seconds. That API is
  deliberately NOT finished in c3c3c1.
 
-  Downstream graph (binding): T5c3d now depends on T5c3c1 +
+  v0.3.52 supersede note: the old T5c3d/EIGHTEEN-task downstream graph is superseded by
+  §9.5.1k; current binding graph is d1+d2+d3 and TWENTY tasks.
+
+  Downstream graph (SUPERSEDED — not binding; retained as history): T5c3d depended on T5c3c1 +
   T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5b2a +
-  T5b2b + T5c2a + T5c2b; T5c4 depends on T5c3a + T5c3b +
+  T5b2b + T5c2a + T5c2b; T5c4 depended on T5c3a + T5c3b +
   T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 +
   T5c3d + the existing M4 gateway/presence/fanout foundation;
-  M5-T5-complete is the EIGHTEEN-task set T5a + T5b1a + T5b1b
+  M5-T5-complete was the EIGHTEEN-task set T5a + T5b1a + T5b1b
   + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a + T5c3b +
   T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 +
    T5c3d + T5c4 (M5-T7 wording/task index updated
-   accordingly). After this task T5c3c3c1 is `[x]` while
-   T5c3c3c2, T5c3d, T5c4, T6, T7, and the M5 exit stay `[ ]`.
+   accordingly). After that task T5c3c3c1 was `[x]` while
+   T5c3c3c2, T5c3d, T5c4, T6, T7, and the M5 exit stayed `[ ]`.
 
   #### 9.5.1j M5 zero-HP death orchestration (T5c3c3c2, frozen v0.3.51)
 
