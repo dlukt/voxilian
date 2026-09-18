@@ -485,7 +485,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   abort, same-mailbox typed completion/abort ingress,
   hydration serialization. No Store/PG/Saver/persist.
   Spec: §9.5.1, §9.5.1k.
-- [ ] **M5-T5c3d2b1** Reserved Saver critical slot /
+- [x] **M5-T5c3d2b1** Reserved Saver critical slot /
   generation seam for active-player Portal persistence
   (depends on T5c1 + T5c3d2a; `internal/sim` only): one
   generic Store-independent Saver primitive reserving the

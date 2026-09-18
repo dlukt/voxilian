@@ -188,6 +188,14 @@ type saverEntry struct {
 	pending  *pendingJob
 	inflight bool
 	seq      uint64
+	// reserved marks one live CriticalSetReservation holding
+	// this key's gate with an already-allocated critical
+	// generation (spec §9.5.1k, M5-T5c3d2b1). Gate
+	// exclusivity permits at most one live reservation per
+	// key. Untrack rejects reserved keys; MarkDirty keeps
+	// working (it needs no gate) with generations newer
+	// than the reserved one.
+	reserved bool
 	// gate serializes this key's persistence callbacks: exactly
 	// ONE saver write owner at a time. Capacity 1, pre-filled;
 	// acquire = receive, release = send. Never held with mu.
@@ -261,8 +269,12 @@ func (s *Saver) Track(key AggregateKey, knownRevision int64) error {
 }
 
 // Untrack removes a clean tracked aggregate. It rejects dirty,
-// in-flight, or reconcile-blocked keys so unsaved state is never
-// silently abandoned: flush or reconcile first.
+// in-flight, reservation-held, or reconcile-blocked keys so unsaved
+// state is never silently abandoned: flush or reconcile first.
+// A live CriticalSetReservation reports ErrSaverUntrackDirty
+// (same domain: the gate is owned elsewhere with an allocated
+// critical generation); after Cancel/Execute with no pending,
+// in-flight, or blocked state, Untrack succeeds.
 func (s *Saver) Untrack(key AggregateKey) error {
 	if err := key.validate(); err != nil {
 		return err
@@ -273,7 +285,7 @@ func (s *Saver) Untrack(key AggregateKey) error {
 	if !ok {
 		return fmt.Errorf("%w: %v", ErrAggregateNotTracked, key)
 	}
-	if e.blocked || e.pending != nil || e.inflight {
+	if e.blocked || e.pending != nil || e.inflight || e.reserved {
 		return fmt.Errorf("%w: %v", ErrSaverUntrackDirty, key)
 	}
 	delete(s.entries, key)

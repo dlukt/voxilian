@@ -207,42 +207,11 @@ func (s *Saver) WriteCriticalSet(ctx context.Context, keys []AggregateKey, write
 	}
 
 	// Validate the callback result against the captured expected
-	// set. Callback order is not trusted; exactly one
-	// expected+1 result per participant is required.
-	expFor := make(map[AggregateKey]int64, len(ordered))
-	for _, er := range expected {
-		expFor[er.Key] = er.Revision
-	}
-	newFor := make(map[AggregateKey]int64, len(ordered))
-	var detail error
-	if len(results) != len(ordered) {
-		detail = fmt.Errorf("%w: critical-set result count %d want %d",
-			ErrSaverRevisionInvariant, len(results), len(ordered))
-	} else {
-		for _, r := range results {
-			exp, ok := expFor[r.Key]
-			if !ok {
-				detail = fmt.Errorf("%w: critical-set result extra key %v",
-					ErrSaverRevisionInvariant, r.Key)
-				break
-			}
-			if _, dup := newFor[r.Key]; dup {
-				detail = fmt.Errorf("%w: critical-set result duplicate key %v",
-					ErrSaverRevisionInvariant, r.Key)
-				break
-			}
-			if r.Revision < 0 || r.Revision != exp+1 {
-				detail = fmt.Errorf("%w: critical-set result %v expected %d got %d",
-					ErrSaverRevisionInvariant, r.Key, exp+1, r.Revision)
-				break
-			}
-			newFor[r.Key] = r.Revision
-		}
-		if detail == nil && len(newFor) != len(ordered) {
-			detail = fmt.Errorf("%w: critical-set result missing key",
-				ErrSaverRevisionInvariant)
-		}
-	}
+	// set via the shared helper (identical rule as reserved
+	// CriticalSetReservation.Execute: callback order is not
+	// trusted; exactly one expected+1 result per participant
+	// is required).
+	newFor, detail := validateCriticalSetResults(expected, results)
 	if detail != nil {
 		// The callback already executed, so malformed success
 		// results are commit-ambiguous from the Saver's
