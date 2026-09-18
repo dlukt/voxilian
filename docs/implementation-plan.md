@@ -495,7 +495,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   success/error semantics. No Store, no persist, no Portal
   executor, no PG, no recovery.
   Spec: §9.5.1, §9.5.1k.
-- [ ] **M5-T5c3d2b2** Bounded off-owner Portal
+- [x] **M5-T5c3d2b2** Bounded off-owner Portal
   executor + Store mapping + in-critical-callback
   lost-ack proof (depends on T5c3d2a + T5c3d2b1 + T5b2a
   + T5c2a + T5c2b): Portal Store mapper, bounded Portal

@@ -29,18 +29,26 @@ import (
 // captures, activation/cancellation counts, and an
 // optional Prepare failure.
 type fakePortalReservation struct {
-	prepares   []PortalOfLifeCapture
-	activates  int
-	cancels    int
-	prepareErr error
+	prepares    []PortalOfLifeCapture
+	activates   int
+	cancels     int
+	prepareErr  error
+	activateErr error
 }
+
+// errActivateBoom is the scripted definitive pre-publication
+// Activate failure for the v0.3.55 rollback proof.
+var errActivateBoom = errors.New("test: activate boom")
 
 func (f *fakePortalReservation) PreparePortalOfLifeWork(c PortalOfLifeCapture) error {
 	f.prepares = append(f.prepares, c)
 	return f.prepareErr
 }
 
-func (f *fakePortalReservation) ActivatePortalOfLifeWork() { f.activates++ }
+func (f *fakePortalReservation) ActivatePortalOfLifeWork() error {
+	f.activates++
+	return f.activateErr
+}
 
 func (f *fakePortalReservation) CancelPortalOfLifeWork() { f.cancels++ }
 
@@ -979,4 +987,89 @@ func TestEnqueuePortalOfLifeCompletionAliasing(t *testing.T) {
 	corpse = 666666
 	live, _ := pendingOf(t, e, res.Token.EntityID)
 	requirePendingEqual(t, live, PendingDeathRuntime{EffectiveCost: 5, DeathTimeSeconds: 100, CorpseID: int64ptr(500), PortalUsed: true}, "aliasing")
+}
+
+// TestPortalActivateErrorRollback proves the v0.3.55
+// activation refinement: a definitive pre-publication
+// Activate error rolls back synchronously in the same
+// owner turn — portalInFlight and the private attempt
+// clear, pending and all gameplay state stay unchanged,
+// the incremented portalEpoch stays consumed (never
+// reused), and the activation error returns. No typed
+// abort is involved.
+func TestPortalActivateErrorRollback(t *testing.T) {
+	e := newPlayerEngine(t, nil)
+	id, _ := portalAwaitingPlayer(t, e, testCharacterID(), portalPending())
+	r := &fakePortalReservation{activateErr: errActivateBoom}
+	_, err := e.PlayerOrchestratePortalOfLife(id, portalInput(100, 50, 500), r)
+	if !errors.Is(err, errActivateBoom) {
+		t.Fatalf("orchestrate err = %v, want activation error", err)
+	}
+	if r.activates != 1 || r.cancels != 0 {
+		t.Fatalf("activates=%d cancels=%d, want 1/0 (no Cancel on the Activate path)", r.activates, r.cancels)
+	}
+	ent := portalEnt(t, e, id)
+	if ent.portalInFlight {
+		t.Fatal("portalInFlight still set after Activate error")
+	}
+	if ent.portalAttempt != (portalAttemptState{}) {
+		t.Fatalf("private attempt not cleared: %+v", ent.portalAttempt)
+	}
+	if ent.portalEpoch != 1 {
+		t.Fatalf("portalEpoch = %d, want 1 (kept consumed, never reused)", ent.portalEpoch)
+	}
+	live, ok, lerr := e.PlayerPendingDeathOf(id)
+	if lerr != nil || !ok {
+		t.Fatalf("pending = %+v,%v,%v; want live pending", live, ok, lerr)
+	}
+	requirePendingEqual(t, live, PendingDeathRuntime{EffectiveCost: 80, DeathTimeSeconds: 100, CorpseID: int64ptr(500)}, "pending unchanged")
+	// A retry consumes a FRESH epoch: stale tokens can never
+	// later become valid.
+	r2 := &fakePortalReservation{}
+	res2 := beginPortal(t, e, id, portalInput(100, 50, 500), r2)
+	if res2.Token.Epoch != 2 {
+		t.Fatalf("retry epoch = %d, want 2", res2.Token.Epoch)
+	}
+}
+
+// TestClonePortalOfLifeCapture proves the additive pure
+// clone helper deep-copies every mutable capture domain
+// with no entity mutation and no validation side effect.
+func TestClonePortalOfLifeCapture(t *testing.T) {
+	e := newPlayerEngine(t, nil)
+	id, _ := portalAwaitingPlayer(t, e, testCharacterID(), portalPending())
+	r := &fakePortalReservation{}
+	beginPortal(t, e, id, portalInput(100, 50, 500), r)
+	if len(r.prepares) != 1 {
+		t.Fatalf("prepares = %d, want 1", len(r.prepares))
+	}
+	clone := ClonePortalOfLifeCapture(r.prepares[0])
+	// Poison every mutable domain of the source.
+	clone.Durable.Advancement[0] = 'X'
+	if len(clone.Durable.Spells) > 0 {
+		clone.Durable.Spells[0].Ability++
+	}
+	if len(clone.Durable.Skills) > 0 {
+		clone.Durable.Skills[0].Ability++
+	}
+	if len(clone.Durable.Items) > 0 {
+		clone.Durable.Items[0].Enchants[0] = 'X'
+	}
+	*clone.PendingBefore.CorpseID = 999999
+	orig := r.prepares[0]
+	if orig.Durable.Advancement[0] == 'X' {
+		t.Fatal("clone aliases Advancement")
+	}
+	if len(orig.Durable.Spells) > 0 && orig.Durable.Spells[0].Ability == clone.Durable.Spells[0].Ability {
+		t.Fatal("clone aliases Spells")
+	}
+	if len(orig.Durable.Skills) > 0 && orig.Durable.Skills[0].Ability == clone.Durable.Skills[0].Ability {
+		t.Fatal("clone aliases Skills")
+	}
+	if len(orig.Durable.Items) > 0 && orig.Durable.Items[0].Enchants[0] == 'X' {
+		t.Fatal("clone aliases Item.Enchants")
+	}
+	if *orig.PendingBefore.CorpseID != 500 {
+		t.Fatalf("clone aliases PendingBefore.CorpseID: %d", *orig.PendingBefore.CorpseID)
+	}
 }

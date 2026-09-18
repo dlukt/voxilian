@@ -148,13 +148,27 @@ func freezePortalOfLifeCapture(c PortalOfLifeCapture) PortalOfLifeCapture {
 	return c
 }
 
+// ClonePortalOfLifeCapture deep-copies a Portal capture
+// into independent ownership (spec §9.5.1k, M5-T5c3d2b2):
+// the Durable shadow reuses the T5c3c2 deep-freeze and
+// PendingBefore reuses the d1 deep-freeze (including the
+// optional CorpseID pointer). Position, Vitals, Token,
+// and the cost scalars are plain values. Pure and
+// additive: no entity mutation, no validation side
+// effect, no persistence. It exposes no mutable entity
+// pointers.
+func ClonePortalOfLifeCapture(c PortalOfLifeCapture) PortalOfLifeCapture {
+	return freezePortalOfLifeCapture(c)
+}
+
 // PortalOfLifeWorkReservation is the ONE
 // store-independent sim work-reservation interface for
-// Portal persistence (spec §9.5.1k, M5-T5c3d2a): future
-// T5c3d2b implements it; d2a tests use an instrumented
-// fake. No persist type, no Store type, no revision, no
-// PG handle, no result channel, no func closure. All
-// methods are non-blocking with respect to
+// Portal persistence (spec §9.5.1k, M5-T5c3d2a; activation
+// refined v0.3.55 for M5-T5c3d2b2): the concrete d2b2
+// reservation implements it; d2a tests use an
+// instrumented fake. No persist type, no Store type, no
+// revision, no PG handle, no result channel, no func
+// closure. All methods are non-blocking with respect to
 // PG/network/disk.
 type PortalOfLifeWorkReservation interface {
 	// PreparePortalOfLifeWork validates and freezes the
@@ -167,9 +181,15 @@ type PortalOfLifeWorkReservation interface {
 
 	// ActivatePortalOfLifeWork publishes the
 	// already-prepared work. It runs in the SAME owner
-	// turn as the attempt installation and cannot fail
-	// with queue-full.
-	ActivatePortalOfLifeWork()
+	// turn as the attempt installation. After successful
+	// Prepare it cannot fail with queue-full (the held
+	// queue permit proves queue capacity). A non-nil
+	// error is definitive pre-publication: the job was
+	// NOT published, Store has NOT been called and will
+	// NEVER be called by this reservation, and the
+	// concrete reservation has already released/cancelled
+	// its queue permit + Saver critical reservation.
+	ActivatePortalOfLifeWork() error
 
 	// CancelPortalOfLifeWork abandons the reservation
 	// before activation with no Store call and no queue
@@ -210,12 +230,21 @@ type PortalOfLifeOrchestrationResult struct {
 // after Prepare succeeds: portalEpoch++, assert actual
 // token == predicted token, install the private
 // attempt with portalInFlight=true, then
-// reservation.ActivatePortalOfLifeWork(). There is NO
-// fallible Portal preparation after
-// portalInFlight=true. On Prepare failure the
-// reservation is Cancelled with portalEpoch unchanged,
-// portalInFlight false, pending unchanged, and the
-// player otherwise unchanged: no stranded attempt.
+// reservation.ActivatePortalOfLifeWork() in the
+// SAME owner turn. A definitive pre-publication
+// Activate error (spec §9.5.1k, frozen v0.3.55) rolls
+// back synchronously: portalInFlight and the private
+// attempt clear, pending and all gameplay state stay
+// unchanged, the incremented portalEpoch stays consumed
+// (never reused, so stale tokens can never become
+// valid), and the activation error returns. No typed
+// abort ingress is used for that same-owner-turn
+// failure. There is NO other fallible Portal
+// preparation after portalInFlight=true. On Prepare
+// failure the reservation is Cancelled with portalEpoch
+// unchanged, portalInFlight false, pending unchanged,
+// and the player otherwise unchanged: no stranded
+// attempt.
 //
 // Portal acts on the victim/pending-death character
 // and allows begin while the resident player is
@@ -351,7 +380,20 @@ func (e *Engine) PlayerOrchestratePortalOfLife(id EntityID, input PortalOfLifeRe
 		expectedEffectiveCost: effective,
 	}
 	ent.portalInFlight = true
-	reservation.ActivatePortalOfLifeWork()
+	if err := reservation.ActivatePortalOfLifeWork(); err != nil {
+		// Definitive pre-publication failure in the SAME
+		// owner turn (spec §9.5.1k, frozen v0.3.55): the
+		// job was NOT published and Store will NEVER be
+		// called by this reservation (it already released
+		// its queue permit + Saver critical reservation),
+		// so no typed abort ingress is used. Clear the
+		// attempt, leave pending and all gameplay state
+		// unchanged, KEEP the incremented portalEpoch
+		// consumed, and return the activation error.
+		ent.portalInFlight = false
+		ent.portalAttempt = portalAttemptState{}
+		return PortalOfLifeOrchestrationResult{}, err
+	}
 	return PortalOfLifeOrchestrationResult{
 		Token:                 actual,
 		ProposedCost:          proposed,
