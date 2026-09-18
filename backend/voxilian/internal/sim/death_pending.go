@@ -116,13 +116,19 @@ func (e *Engine) PlayerPendingDeathOf(id EntityID) (PendingDeathRuntime, bool, e
 // (generic -> ErrEntityNotPlayer, MIGRATING ->
 // ErrCellHandoffRequired); life state == Alive
 // (ErrPlayerNotAlive — a locked player cannot be
-// hydrated); the supplied value validates (nil is a
-// valid authoritative "no pending death" value). Every
-// failure is zero mutation: an invalid value installs
-// nothing and leaves the existing pending state
-// unchanged. On success the frozen value (or nil)
-// replaces the live pending state atomically. No Store
-// read occurs here; no Portal/penalty mechanics.
+// hydrated); no live Portal attempt outstanding
+// (ErrPortalAttemptInFlight — hydration must not
+// replace the pending state underneath an attempt;
+// checked after the entity/life gates but before
+// payload validation/install, preserving the frozen
+// d1 error precedence); the supplied value validates
+// (nil is a valid authoritative "no pending death"
+// value). Every failure is zero mutation: an invalid
+// value installs nothing and leaves the existing
+// pending state unchanged. On success the frozen
+// value (or nil) replaces the live pending state
+// atomically. No Store read occurs here; no
+// Portal/penalty mechanics.
 //
 // Owner-local: call only from the sim owner goroutine
 // (Run/Step) or in Step-driven tests.
@@ -133,6 +139,9 @@ func (e *Engine) PlayerInstallRecoveredPendingDeath(id EntityID, pending *Pendin
 	}
 	if ent.lifeState != PlayerLifeAlive {
 		return fmt.Errorf("%w: id %d life %d", ErrPlayerNotAlive, uint64(id), uint8(ent.lifeState))
+	}
+	if ent.portalInFlight {
+		return fmt.Errorf("%w: id %d portal attempt in flight", ErrPortalAttemptInFlight, uint64(id))
 	}
 	if err := ValidatePendingDeathRuntime(pending); err != nil {
 		return err

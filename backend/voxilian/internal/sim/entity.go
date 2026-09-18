@@ -134,6 +134,27 @@ type entity struct {
 	lifeState  PlayerLifeState
 	deathEpoch uint64
 
+	// Portal attempt epoch + in-flight state (spec
+	// §9.5.1k, M5-T5c3d2a): the owner-local ephemeral
+	// Portal-of-Life lifecycle, independent of the
+	// immediate-death deathEpoch (a reconnect/hydrated
+	// player may already carry pendingDeath while its
+	// fresh live entity has deathEpoch == 0).
+	// portalEpoch counts successfully begun Portal
+	// attempts for this entity (0 until the first
+	// begin); portalInFlight reports one outstanding
+	// attempt; portalAttempt is the private immutable
+	// correlation meaningful only while in flight. All
+	// three ride this SAME entity object through cell
+	// handoff (the migration record owns the same
+	// object), are discarded with the entity on
+	// removal, and restart at zero on a fresh entity
+	// (fresh re-add starts epoch 0 with no attempt).
+	// Neither field is persisted or sent on the wire.
+	portalEpoch    uint64
+	portalInFlight bool
+	portalAttempt  portalAttemptState
+
 	// pendingDeath is the authoritative owner-local
 	// pending-death runtime state (spec §9.5.1k,
 	// M5-T5c3d1): character-aggregate child runtime

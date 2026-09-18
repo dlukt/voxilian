@@ -471,7 +471,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   `CommitDeathPenalties`, no penalty RNG, no pending
   deletion, no gateway opcode 120, no 214 / 215 transport.
   Spec: §9.5.1, §9.5.1k.
-- [ ] **M5-T5c3d2a** Portal-of-Life owner attempt +
+- [x] **M5-T5c3d2a** Portal-of-Life owner attempt +
   immutable current-state capture + typed owner
   completion/abort (depends on T5c3d1 + T5a;
   `internal/sim` only): resolved

@@ -33,10 +33,10 @@ var (
 )
 
 // ingressCommand is the private typed command union the owner
-// mailbox carries (spec §5.2.10 + §9.5.1h): exactly generic add,
-// player add, remove, move, and immediate-death completion.
-// Gateway-facing code can never submit arbitrary closures: there
-// is no func(*Engine) command.
+// mailbox carries (spec §5.2.10 + §9.5.1h + §9.5.1k): exactly generic add,
+// player add, remove, move, immediate-death completion, and the two
+// Portal-of-Life commands. Gateway-facing code can never submit
+// arbitrary closures: there is no func(*Engine) command.
 type ingressCommand interface {
 	// execute runs the command on the sim owner goroutine and
 	// delivers its definitive result. It never blocks on the caller:
@@ -157,6 +157,64 @@ func (c ingressImmediateDeathCompletion) fail(err error) {
 	c.res <- ingressDeathCompletionResult{err: err}
 }
 
+// ingressPortalCompletionResult is the typed completion of one
+// Portal-of-Life completion command, preserving the exact
+// owner-local PlayerAcceptPortalOfLifeCompletion semantics
+// (Applied vs Duplicate vs error).
+type ingressPortalCompletionResult struct {
+	disp PortalCompletionDisposition
+	err  error
+}
+
+// ingressPortalCompletion is the typed authoritative
+// Portal-completion owner command (spec §9.5.1k): it carries one
+// already-frozen PortalOfLifeCompletion value only — no lookup,
+// no recovery, no persistence — and the owner executes the normal
+// PlayerAcceptPortalOfLifeCompletion path. It uses the SAME bounded
+// mailbox and admission rules as every other ingress command; the
+// future c3d2b executor redelivers the SAME completion/token after
+// ErrSimIngressFull, and a redelivery after the first apply resolves
+// as the existing zero-mutation Duplicate result.
+type ingressPortalCompletion struct {
+	completion PortalOfLifeCompletion
+	res        chan ingressPortalCompletionResult
+}
+
+func (c ingressPortalCompletion) execute(e *Engine) {
+	disp, err := e.PlayerAcceptPortalOfLifeCompletion(c.completion)
+	c.res <- ingressPortalCompletionResult{disp: disp, err: err}
+}
+
+func (c ingressPortalCompletion) fail(err error) {
+	c.res <- ingressPortalCompletionResult{err: err}
+}
+
+// ingressPortalAbortResult is the typed completion of one
+// Portal-of-Life abort command, preserving the exact owner-local
+// PlayerAbortPortalOfLifeAttempt semantics.
+type ingressPortalAbortResult struct {
+	disp PortalAbortDisposition
+	err  error
+}
+
+// ingressPortalAbort is the typed definitive Portal-abort owner
+// command (spec §9.5.1k): it carries one PortalAttemptToken only
+// and the owner executes the normal
+// PlayerAbortPortalOfLifeAttempt path on the SAME bounded mailbox.
+type ingressPortalAbort struct {
+	token PortalAttemptToken
+	res   chan ingressPortalAbortResult
+}
+
+func (c ingressPortalAbort) execute(e *Engine) {
+	disp, err := e.PlayerAbortPortalOfLifeAttempt(c.token)
+	c.res <- ingressPortalAbortResult{disp: disp, err: err}
+}
+
+func (c ingressPortalAbort) fail(err error) {
+	c.res <- ingressPortalAbortResult{err: err}
+}
+
 // ingressState is the run-ownership coordination only: whether a Run
 // currently owns the engine. It MUST NOT become a mutex protecting
 // normal sim entity state — mutable sim stays single-owner, and the
@@ -261,6 +319,46 @@ func (e *Engine) EnqueueImmediateDeathCompletion(ctx context.Context, completion
 	// command's definitive result (never an ambiguous maybe).
 	res := <-cmd.res
 	return res.snap, res.disp, res.err
+}
+
+// EnqueuePortalOfLifeCompletion submits one authoritative
+// Portal-of-Life completion through the sim owner (spec
+// §9.5.1k). It uses the SAME bounded mailbox and admission rules
+// as every other ingress command and returns the real
+// owner-local result: admitted commands are authoritative and the
+// owner invokes the normal PlayerAcceptPortalOfLifeCompletion
+// path (same token/lifecycle validation, Applied vs
+// zero-mutation Duplicate semantics, pending-only
+// installation). The completion payload is frozen before
+// publication, so caller mutation after this call begins cannot
+// change what the owner applies. On admission or execution error
+// the disposition is meaningless — check err first.
+func (e *Engine) EnqueuePortalOfLifeCompletion(ctx context.Context, completion PortalOfLifeCompletion) (PortalCompletionDisposition, error) {
+	cmd := ingressPortalCompletion{completion: freezePortalOfLifeCompletion(completion), res: make(chan ingressPortalCompletionResult, 1)}
+	if err := e.admit(ctx, cmd); err != nil {
+		return PortalCompletionApplied, err
+	}
+	// Admitted commands are authoritative: later caller cancellation
+	// does NOT retract them, so the caller waits for the exact
+	// command's definitive result (never an ambiguous maybe).
+	res := <-cmd.res
+	return res.disp, res.err
+}
+
+// EnqueuePortalOfLifeAbort submits one definitive Portal-of-Life
+// abort through the sim owner (spec §9.5.1k). It uses the SAME
+// bounded mailbox and admission rules as every other ingress
+// command and returns the real owner-local result (Aborted vs
+// idempotent Duplicate vs terminal mismatch). On admission or
+// execution error the disposition is meaningless — check err
+// first.
+func (e *Engine) EnqueuePortalOfLifeAbort(ctx context.Context, token PortalAttemptToken) (PortalAbortDisposition, error) {
+	cmd := ingressPortalAbort{token: token, res: make(chan ingressPortalAbortResult, 1)}
+	if err := e.admit(ctx, cmd); err != nil {
+		return PortalAbortAborted, err
+	}
+	res := <-cmd.res
+	return res.disp, res.err
 }
 
 // admit performs the deterministic pre-publication checks and the
