@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.38)
+# Voxilian Backend — Implementation Plan (v1.39)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.54).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.55).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -701,6 +701,44 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.39: freeze M5 Portal persistence execution contract
+  (docs only, spec v0.3.54 -> v0.3.55 extends §9.5.1k +
+  §9.5.1; no split, M5-T5 stays TWENTY-TWO tasks):
+  T5c3d2b2 (bounded off-owner Portal executor + Store
+  mapping + in-critical-callback lost-ack proof; depends
+  on T5c3d2a + T5c3d2b1 + T5b2a + T5c2a + T5c2b) execution
+  contract — narrow d2a activation refinement
+  (`ActivatePortalOfLifeWork() error`; queue-full
+  impossible after Prepare; definitive pre-publication
+  error rolls back in the same owner turn with
+  `portalInFlight`/attempt cleared, pending/gameplay
+  unchanged, and the incremented `portalEpoch` kept
+  consumed; no typed abort for that path), bounded
+  Portal executor lifecycle (fixed workers, bounded
+  queue, one-shot `Run`, non-blocking reservation,
+  DeathExecutor shutdown semantics), stable
+  persist-domain sentinels, narrow
+  `PortalExecutionStore` + typed owner-sink seams,
+  Prepare ownership (queue permit + frozen work + d2b1
+  Saver critical slot before `portalEpoch++`), Store
+  mapper + request freeze, exactly-one reserved
+  `Execute` with at-most-once Store, in-callback
+  read-only lost-ack proof (`E+1` + content + pending
+  proof, nil `CorpseID` valid; proven path returns
+  `E+1` preserving newer `MarkDirty`, no
+  `ReconcileSaver`/`ResolveReconciled`/replay; unproven
+  path is `ErrPortalCommitUnproven` fail-closed and
+  never owner-aborts once Store was invoked),
+  definite-pre-execution abort + bounded same-mailbox
+  redelivery, and the unchanged public T5c2b
+  `CommitPortalOfLife` adapter. No Underworld-exit
+  penalties; no Store production change; no SQL/query/
+  migration/generated change. `meridian59.md` untouched.
+  Checkbox state unchanged: T5a/T5b1a/T5b1b/T5b2a/T5b2b/
+  T5c1/T5c2a/T5c2b/T5c3a/T5c3b/T5c3c1/T5c3c2/T5c3c3a/
+  T5c3c3b/T5c3c3c1/T5c3c3c2/T5c3d1/T5c3d2a/T5c3d2b1 `[x]`,
+  T5c3d2b2/T5c3d3/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v1.38: split M5-T5c3d2b into reservation-first
   T5c3d2b1 + executor-later T5c3d2b2 (docs only, spec

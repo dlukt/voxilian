@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.54 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.55 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -7984,9 +7984,11 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
  v0.3.50 in §9.5.1i, the c3c3c2 gameplay contract is
  frozen v0.3.51 in §9.5.1j, T5c3d is further split into
  T5c3d1+T5c3d2+T5c3d3, frozen v0.3.52 in §9.5.1k,
- T5c3d2 is further split into T5c3d2a+T5c3d2b, frozen
- v0.3.53 in §9.5.1k, and T5c3d2b is further split into
- T5c3d2b1+T5c3d2b2, frozen v0.3.54 in §9.5.1k):
+  T5c3d2 is further split into T5c3d2a+T5c3d2b, frozen
+  v0.3.53 in §9.5.1k, T5c3d2b is further split into
+  T5c3d2b1+T5c3d2b2, frozen v0.3.54 in §9.5.1k, and the
+  d2b2 Portal persistence execution contract is frozen
+  v0.3.55 in §9.5.1k):
 
 - **T5a — pure/source-faithful death mechanics and immutable plans**
   (§9.5.4–§9.5.14 pure surface; §9.5.17 non-scope).
@@ -8225,20 +8227,41 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
     owner behavior change.
   - **T5c3d2b2 — bounded off-owner Portal executor +
     Store mapping + in-critical-callback lost-ack proof**
-    (§9.5.1k, future): the Store-domain Portal mapper, the
-    bounded Portal executor/reservation implementation,
-    off-owner `CommitPortalOfLife`, the exact callback
-    expected revision, the lost-ack materialized proof,
-    normal + proven-lost-ack owner completion, the
-    definite-no-execution owner abort, and bounded owner
-    ingress redelivery. Depends on T5c3d2a + T5c3d2b1 +
-    T5b2a + T5c2a + T5c2b. No Underworld-exit penalties.
-    Future d2b2 MUST use the frozen in-critical-callback
-    recovery rule below: after a PROVEN Portal lost-ack it
-    MUST NOT call `ReconcileSaver` / `ResolveReconciled`
-    (that would discard newer character snapshots
-    captured while the Portal Store operation was in
-    flight for a still gameplay-active character).
+    (§9.5.1k, frozen v0.3.55): the Store-domain Portal
+    mapper (`MapPortalOfLifeCapture` with zero request on
+    error, deep-frozen before queue publication), the
+    bounded Portal executor (fixed workers, bounded queue,
+    explicit one-shot `Run`, non-blocking capacity
+    reservation, DeathExecutor shutdown semantics),
+    the concrete `PortalOfLifeWorkReservation`
+    (reserved/prepared/activated/cancelled one-shot state
+    machine owning the queue permit + frozen work + the
+    d2b1 reserved Character Saver critical slot from
+    successful Prepare), off-owner `CommitPortalOfLife`
+    through exactly one reserved `CriticalSetReservation`
+    `Execute` (no ordinary `Saver.WriteCriticalSet`, no
+    Store replay), the exact callback expected revision E,
+    the in-callback read-only lost-ack materialized proof
+    (character `E+1` + semantic content equality +
+    pending-row proof with nil `CorpseID` valid; success
+    returns `E+1` preserving newer `MarkDirty` snapshots;
+    failure returns `ErrPortalCommitUnproven` fail-closed
+    with no owner abort once Store was invoked), normal +
+    proven-lost-ack owner completion (pending-only,
+    `Applied` vs idempotent `Duplicate`, `ErrSimIngressFull`
+    redelivery on the same worker), the
+    definite-no-execution owner abort (typed abort ONLY
+    when Store was never invoked; Store-crossed paths
+    never abort), and bounded owner ingress redelivery.
+    Depends on T5c3d2a + T5c3d2b1 + T5b2a + T5c2a + T5c2b.
+    No Underworld-exit penalties. After a PROVEN Portal
+    lost-ack d2b2 MUST NOT call `ReconcileSaver` /
+    `ResolveReconciled` (that would discard newer
+    character snapshots captured while the Portal Store
+    operation was in flight for a still gameplay-active
+    character). The existing public `persist`
+    `CommitPortalOfLife` T5c2b adapter behavior is
+    unchanged and stays off the reservation path.
   - **T5c3d3 — authoritative Underworld-exit penalty
     transition + exactly-once pending consumption**
     (§9.5.1k, future): the actual authoritative
@@ -10762,7 +10785,7 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
    migration, generated code, gateway/proto/session,
    `PlayerLoseHealth` automatic dispatch.
 
-    #### 9.5.1k M5 pending-death owner lifecycle split (T5c3d1+T5c3d2a+T5c3d2b1+T5c3d2b2+T5c3d3, frozen v0.3.52/v0.3.53/v0.3.54)
+    #### 9.5.1k M5 pending-death owner lifecycle split (T5c3d1+T5c3d2a+T5c3d2b1+T5c3d2b2+T5c3d3, frozen v0.3.52/v0.3.53/v0.3.54/v0.3.55)
 
     The former single T5c3d combined three separate
     correctness boundaries — authoritative pending-death
@@ -10775,9 +10798,13 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
     frozen), the former monolithic T5c3d2 is further
     split into T5c3d2a+T5c3d2b (v0.3.53; this paragraph
     supersedes the T5c3d2 paragraph of §9.5.1 for the
-    split only), and T5c3d2b is further split into
+    split only), T5c3d2b is further split into
     T5c3d2b1+T5c3d2b2 (v0.3.54; this section supersedes
-    the T5c3d2b paragraph of §9.5.1 for the split only).
+    the T5c3d2b paragraph of §9.5.1 for the split only),
+    and the d2b2 Portal persistence execution contract
+    below is frozen v0.3.55 (this paragraph supersedes
+    the d2b2 "future" paragraph of §9.5.1 for the
+    execution contract only; no task is split again).
     `meridian59.md` is untouched: this task
     changes no Meridian mechanics.
 
@@ -11127,14 +11154,162 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
     and the caller may retry later.
 
     T5c3d2b2 (depends on T5c3d2a + T5c3d2b1 + T5b2a +
-    T5c2a + T5c2b; future) owns the bounded off-owner
-    Portal persistence: the Store-domain Portal mapper,
-    the bounded Portal executor/reservation
-    implementation, off-owner `CommitPortalOfLife`, the
-    exact callback expected revision, the lost-ack
-    materialized proof, normal + proven-lost-ack owner
-    completion, the definite-no-execution owner abort,
-    and bounded owner ingress redelivery. No
+    T5c2a + T5c2b; frozen v0.3.55) owns the bounded
+    off-owner Portal persistence execution contract:
+
+    Activation refinement (binding, frozen v0.3.55): the
+    d2a work-reservation interface refines ONLY Portal
+    activation to `ActivatePortalOfLifeWork() error`. After
+    successful Prepare, `ErrPortalExecutorQueueFull` is
+    impossible (the held queue permit proves queue
+    capacity). An Activate error is definitive
+    pre-publication: the job was NOT published, Store has
+    NOT been called and will NEVER be called by this
+    reservation, and the concrete reservation has already
+    released/cancelled its queue permit + Saver critical
+    reservation. `PlayerOrchestratePortalOfLife` handles it
+    in the same owner turn: clear `portalInFlight`, clear
+    the private attempt, leave pending and all gameplay
+    state unchanged, KEEP the incremented `portalEpoch`
+    consumed (never decrement/reuse, so stale tokens can
+    never later become valid), and return the activation
+    error. No typed abort ingress is used for this
+    same-owner-turn failure. No other d2a semantics
+    change.
+
+    Portal executor (binding, frozen v0.3.55): one
+    separate bounded Portal executor in
+    `internal/persist` with fixed worker count, bounded
+    queue, explicit one-shot `Run`, no goroutine per
+    Portal, no unbounded queue, no second completion
+    queue, and non-blocking capacity reservation. Queued-
+    but-not-started work never enters Store after
+    cancellation; second concurrent `Run` reports
+    already-running; second sequential `Run` reports
+    shutdown. Stable persist-domain sentinels matched
+    with `errors.Is` (executor not-running / queue-full
+    / shutdown / already-running / invalid, reservation
+    canceled / not-prepared, `ErrPortalCommitUnproven`);
+    sim Portal gameplay errors are never reused for
+    executor lifecycle failures.
+
+    Store seam (binding, frozen v0.3.55): the narrow
+    `PortalExecutionStore` interface
+    (`CommitPortalOfLife` + `LoadDeathCharacterRecovery`,
+    proven satisfied by `*store.PGStore`) with no
+    unrelated death-entry/item persistence dependency.
+    Owner sink (binding, frozen v0.3.55): the existing
+    typed d2a owner ingress only
+    (`EnqueuePortalOfLifeCompletion` +
+    `EnqueuePortalOfLifeAbort`, proven satisfied by
+    `*sim.Engine`); the worker NEVER mutates a live sim
+    entity directly and there is no CharacterID fallback.
+
+    Reservation + Prepare (binding, frozen v0.3.55):
+    `ReservePortalOfLife` owns exactly one future queue
+    slot (not-running vs queue-full semantics; running
+    jobs hold no permit). Prepare does bounded CPU /
+    in-memory work only, in required order: validate/map/
+    freeze the capture, then acquire
+    `Saver.ReserveCriticalSet` for the character root;
+    only if BOTH succeed is the reservation prepared
+    (owning the queue permit + frozen work + live Saver
+    critical slot, per the v0.3.54 rule). Mapping
+    failure and Saver reservation failure (including
+    busy / reconcile-required / revision-invariant)
+    release the queue permit, terminalize the
+    reservation, and return the cause with zero Store
+    calls. A pure additive sim helper
+    `ClonePortalOfLifeCapture` reuses the existing
+    private freezing rules with no entity mutation.
+
+    Mapper (binding, frozen v0.3.55):
+    `MapPortalOfLifeCapture` returns the ZERO request on
+    every error. Character mapping: ID from the token,
+    `ExpectedRevision = 0` placeholder, Karma/Flags/
+    Spells/Skills/Advancement as the complete CURRENT
+    captured durable state, position as CURRENT capture
+    position in millimeters, Vitals as JSON of CURRENT
+    capture vitals, `CorpseID` from the target,
+    `ProposedCost` from the proposal (never persist
+    `ExpectedEffectiveCost` directly). Validation:
+    nonzero token, valid position/vitals/advancement/
+    durable domains, valid `PendingBefore` with
+    `PortalUsed == false`, non-nil `CorpseID` equal to
+    the target, target > 0, proposed cost 5..80, and
+    `ExpectedEffectiveCost == ReducePendingDeathCost(
+    PendingBefore.EffectiveCost, ProposedCost)`. The
+    mapped request is deep-frozen (Vitals, Advancement,
+    Spells, Skills; no caller aliases) with
+    `ExpectedRevision` staying placeholder until the
+    reserved Saver callback.
+
+    Activate/Cancel/result (binding, frozen v0.3.55):
+    normal Activate publishes exactly one prepared job
+    and never reports queue-full; repeated Activate is a
+    no-second-publication no-op. Shutdown-before-
+    publication cancels the Saver reservation, releases
+    the permit, publishes nothing, calls Store zero
+    times, and returns the shutdown error. Cancel before
+    activation is idempotent (Saver cancel + exactly-once
+    permit release + terminal canceled result, Store
+    zero); cancel after publication is a no-op. The
+    result channel (persist-local, buffered capacity 1,
+    same channel every time after Prepare) never blocks
+    worker progress.
+
+    Execution + proof (binding, frozen v0.3.55): the
+    worker releases the queue permit at dequeue, then
+    executes exactly ONE reserved `Execute` callback
+    (never ordinary `Saver.WriteCriticalSet`). Inside,
+    the callback sets `ExpectedRevision = E` and calls
+    Store AT MOST ONCE. Normal success requires
+    `CharacterRevision == E+1` and `EffectiveCost ==
+    ExpectedEffectiveCost`, then returns `E+1` with the
+    pending-only completion built from the frozen
+    capture (validated through the sim pending domain;
+    no live gameplay state applied back). On ANY Store
+    error — or an impossible nominal success — the
+    callback performs read-only
+    `LoadDeathCharacterRecovery` while still inside the
+    held gate and proves the commit ONLY on: character
+    root exactly `E+1` with semantic content equality
+    (never raw JSON bytes), pending non-nil with exact
+    character/death-time/cost/`PortalUsed == true` and a
+    nil-or-exact corpse identity (nil valid: expiry may
+    NULL it after commit). Proven lost-ack returns
+    `E+1` normally (d2b1 success bookkeeping clears
+    only `gen <= reservedGeneration`, preserves newer
+    snapshots; NO `ReconcileSaver` / `ResolveReconciled`
+    / Store replay) and delivers the completion built
+    from the recovered pending. Unproven/recovery-failed
+    paths return the callback error (semantic mismatch
+    wraps `ErrPortalCommitUnproven`, original Store cause
+    preserved) with the Saver conservatively blocked, no
+    completion, no Store replay, and NEVER a typed abort
+    once Store was invoked.
+
+    Abort + delivery + shutdown (binding, frozen
+    v0.3.55): typed owner abort is permitted ONLY when
+    Store was NEVER invoked (queued shutdown discard,
+    pre-`Execute` cancellation, pre-callback `Execute`
+    failure) via `EnqueuePortalOfLifeAbort` with the
+    frozen token (`Aborted`/`Duplicate` both success),
+    delivered on a short bounded executor-owned
+    non-cancelled context with `ErrSimIngressFull`-only
+    retry and no goroutine per abort. Success completion
+    delivery (`Applied`/`Duplicate` success) retries
+    `ErrSimIngressFull` on the same worker with no Store
+    replay and no second recovery; engine-stop/mismatch/
+    validation errors are terminal with PG authoritative
+    for reconnect. Shutdown stops reservations, discards
+    queued jobs (permit + Saver cancel + Store zero +
+    definitive abort + terminal result), lets a running
+    callback observe cancellation (never aborting solely
+    on cancellation once Store was invoked), and strands
+    no waiter/worker. The existing public `persist`
+    `CommitPortalOfLife` T5c2b adapter behavior is
+    unchanged and stays off the reservation path. No
     Underworld-exit penalties.
 
     Future d2b2 binding rule (binding, frozen v0.3.54):
