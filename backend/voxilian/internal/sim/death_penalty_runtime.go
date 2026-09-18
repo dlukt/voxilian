@@ -213,22 +213,31 @@ type DeathPenaltyWorkProvider interface {
 
 // DeathPenaltyWorkReservation is the ONE store-independent
 // sim work reservation for penalty persistence (spec
-// §9.5.1k, M5-T5c3d3a). No Store/persist/revision/
-// result-channel types. All methods are non-blocking with
-// respect to PG/network/disk. Future d3b contract:
-// Reserve already owns the queue permit + Saver critical
-// slot; Prepare performs ONLY validation/mapping/freezing
-// (never acquires Saver or queue capacity); Activate
-// cannot fail queue-full after successful Reserve but may
-// report a definitive pre-publication executor shutdown.
+// §9.5.1k, M5-T5c3d3a, corrected v0.3.57). No
+// Store/persist/revision/result-channel types. All methods
+// are non-blocking with respect to PG/network/disk. Future
+// d3b contract: Reserve already owns the queue permit +
+// Saver critical slot; Prepare performs ONLY
+// validation/mapping/freezing (never acquires Saver or
+// queue capacity); Activate cannot fail queue-full after
+// successful Reserve but may report a definitive
+// pre-publication executor shutdown. Prepare runs AFTER
+// the owner installed the private attempt and locked
+// gameplay (life `PlayerLifeDeathPenaltyPersisting`),
+// so a Prepare failure retains the lock for exact-plan
+// retry instead of returning to `Alive`.
 type DeathPenaltyWorkReservation interface {
 	// PrepareDeathPenaltyWork validates and freezes the
-	// complete penalty work while no penalty attempt is
-	// live (life still `Alive`). On success the
+	// complete penalty work for the already-installed
+	// private attempt (life is already
+	// `PlayerLifeDeathPenaltyPersisting`; the v0.3.56
+	// "while still Alive" order is superseded by the
+	// v0.3.57 anti-reroll correction). On success the
 	// reservation owns the frozen work privately and the
-	// caller may proceed to the owner-local attempt
-	// installation; on failure the caller cancels and no
-	// attempt goes live.
+	// caller proceeds to activation; on failure the
+	// caller cancels AND retains the owner lock with
+	// the exact frozen capture for exact-plan retry —
+	// the attempt is never unwound to `Alive`.
 	PrepareDeathPenaltyWork(DeathPenaltyCapture) error
 
 	// ActivateDeathPenaltyWork publishes the
@@ -347,17 +356,24 @@ func applyDeathPenaltyPlanToDurable(current PlayerDurableState, plan DeathPenalt
 // pending unchanged, life `Alive`); Phase 3 exactly one
 // `PlanDeathPenalties` (failure: Cancel, zero owner
 // mutation); post-penalty state construction (failure:
-// Cancel, zero owner mutation); `PrepareDeathPenaltyWork`
-// while life is still `Alive` (failure: Cancel, life
-// remains `Alive`, epoch unchanged, no private attempt,
-// zero Activates, no automatic retry/reroll); ONLY after
-// Prepare succeeds: `penaltyEpoch++`, install the private
-// frozen attempt, life = `PlayerLifeDeathPenaltyPersisting`,
-// then `ActivateDeathPenaltyWork` in the SAME owner turn.
-// A definitive pre-publication Activate error KEEPS life
-// locked with the exact private attempt/capture and the
-// consumed epoch (`persistenceActive` stays false): no
-// unlock, no reroll — deliberately different from Portal.
+// Cancel, zero owner mutation); Phase 4 install BEFORE
+// any remaining fallible operation: `penaltyEpoch++`,
+// install the private frozen attempt, life =
+// `PlayerLifeDeathPenaltyPersisting` (frozen v0.3.57;
+// the v0.3.56 Prepare-while-Alive order is superseded
+// because a post-RNG Prepare failure MUST NOT return to
+// `Alive` for a reroll); Phase 5
+// `PrepareDeathPenaltyWork` with the exact frozen
+// capture (failure: Cancel, life STAYS locked with the
+// exact private attempt/capture, the consumed epoch,
+// pending unchanged, and `persistenceActive == false`:
+// no unlock, no reroll); Phase 6
+// `ActivateDeathPenaltyWork` in the SAME owner turn. A
+// definitive pre-publication Activate error likewise
+// KEEPS life locked with the exact private
+// attempt/capture and the consumed epoch
+// (`persistenceActive` stays false): no unlock, no
+// reroll — deliberately different from Portal.
 //
 // A new attempt requires a resident player, life `Alive`,
 // a non-nil pending death, a complete validating durable
@@ -478,12 +494,10 @@ func (e *Engine) PlayerOrchestrateDeathPenalties(id EntityID, input UnderworldEx
 		PendingBefore: *pending,
 		Plan:          frozenPlan,
 	})
-	if err := reservation.PrepareDeathPenaltyWork(capture); err != nil {
-		return fail(err)
-	}
-	// Prepare succeeded: the fallible preparation phase
-	// is over. Install the attempt, lock gameplay, then
-	// activate in the SAME owner turn.
+	// Install the attempt BEFORE any remaining fallible
+	// Prepare/Activate operation (frozen v0.3.57): once
+	// RNG was consumed, no failure below may unwind to
+	// `Alive` for a reroll.
 	ent.penaltyEpoch++
 	actual := DeathPenaltyAttemptToken{
 		EntityID:    ent.id,
@@ -499,6 +513,18 @@ func (e *Engine) PlayerOrchestrateDeathPenalties(id EntityID, input UnderworldEx
 	}
 	ent.penaltyAttempt = &penaltyAttemptState{capture: capture, persistenceActive: false}
 	ent.lifeState = PlayerLifeDeathPenaltyPersisting
+	if err := reservation.PrepareDeathPenaltyWork(capture); err != nil {
+		// Prepare failure after install: the reservation
+		// never became prepared, so Cancel it — but KEEP
+		// life locked with the exact private
+		// attempt/capture and the consumed epoch
+		// (`persistenceActive` stays false) so
+		// infrastructure retry reuses the same frozen
+		// plan: no unlock, no reroll, pending unchanged,
+		// zero Activates.
+		reservation.CancelDeathPenaltyWork()
+		return DeathPenaltyOrchestrationResult{}, err
+	}
 	if err := reservation.ActivateDeathPenaltyWork(); err != nil {
 		// Definitive pre-publication failure in the SAME
 		// owner turn: the job was NOT published and Store
@@ -691,14 +717,21 @@ const (
 // penalty epoch with life == `DeathPenaltyPersisting`,
 // a private attempt present, and `persistenceActive ==
 // true`) defensively validates the stored frozen capture
-// before any live mutation, then applies EXACTLY the
-// stored capture: vitals, deep-frozen durable,
-// `pendingDeath = nil`, private attempt cleared, life ->
-// `Alive` — preserving position, CharacterID/EntityID,
+// before any live mutation, then applies it in frozen
+// v0.3.57 order: install the exact stored post-penalty
+// Vitals, install the exact deep-frozen Durable state,
+// run the existing owner-local `reconcileHealth` at the
+// current tick (so a MaxHP loss can arm/cancel/persist
+// the health deadline per the frozen NewHealth rule
+// while mana/rest slots stay bit-identical), then clear
+// pending/the private attempt and move life to `Alive`
+// — preserving position, CharacterID/EntityID,
 // death/portal epochs, `lastDeathSeconds`, runtime
-// inputs, runtime deadline slots, and history. It emits
-// NO `PlayerVitalsObserver` event (T5c4/future
-// presentation owns client transport effects).
+// inputs, mana/rest slots, stomach anchor, movement
+// state, and history. It performs no RNG, no
+// `commitVitals`, and emits NO `PlayerVitalsObserver`
+// event (T5c4/future presentation owns client
+// transport effects).
 //
 // Duplicate completion (same exact token with life ==
 // `Alive`, no private attempt, no pending death, and the
@@ -757,6 +790,17 @@ func (e *Engine) PlayerAcceptDeathPenaltyCompletion(completion DeathPenaltyCompl
 		}
 		ent.vitals = stored.Vitals
 		ent.durable = func() *PlayerDurableState { frozen := freezePlayerDurableState(stored.Durable); return &frozen }()
+		// Frozen v0.3.57 health semantics (source
+		// `GainBaseMaxHealth -> GainMaxHealth -> NewHealth`,
+		// Voxilian `PlayerAdjustMaxHP -> reconcileHealth`):
+		// the stored post-penalty Vitals are installed
+		// exactly, then the existing owner-local
+		// `reconcileHealth` runs at the current tick so a
+		// MaxHP change correctly arms/cancels/persists
+		// the health deadline. Mana/rest slots stay
+		// bit-identical: no mana/rest reconciliation, no
+		// `commitVitals`, no observer event.
+		e.reconcileHealth(ent, e.tick.Load())
 		ent.pendingDeath = nil
 		ent.penaltyAttempt = nil
 		ent.lifeState = PlayerLifeAlive

@@ -31,7 +31,7 @@ import (
 // DeathPenaltyWorkReservation: it records Prepare
 // captures, activation/cancellation counts, scripted
 // Prepare/Activate failures, and optional Prepare/Activate
-// hooks (e.g. asserting life is still Alive inside
+// hooks (e.g. asserting life is already locked inside
 // Prepare).
 type fakePenaltyReservation struct {
 	prepares    []DeathPenaltyCapture
@@ -116,7 +116,8 @@ var errPenaltyReserveBoom = errors.New("test: penalty reserve boom")
 var errPenaltyActivateBoom = errors.New("test: penalty activate boom")
 
 // errPenaltyPrepareBoom is the scripted Prepare failure:
-// the owner must stay Alive with no attempt installed.
+// the owner must stay locked with the exact frozen
+// capture for exact-plan retry (never unwind to Alive).
 var errPenaltyPrepareBoom = errors.New("test: penalty prepare boom")
 
 // penaltyAbilities is the canonical d3a ability fixture:
@@ -143,6 +144,27 @@ func penaltyDurable(flags int32, spells, skills []PlayerAbilityState) PlayerDura
 func penaltyAlivePlayer(t *testing.T, e *Engine, charID CharacterID, pos world.Vec3, pending *PendingDeathRuntime, durable PlayerDurableState) EntityID {
 	t.Helper()
 	snap, err := e.AddPlayerEntityWithDurableState(charID, pos, testVitals(), testRuntimeInputs(), durable)
+	if err != nil {
+		t.Fatalf("AddPlayerEntityWithDurableState: %v", err)
+	}
+	if err := e.PlayerInstallRecoveredPendingDeath(snap.ID, pending); err != nil {
+		t.Fatalf("PlayerInstallRecoveredPendingDeath: %v", err)
+	}
+	return snap.ID
+}
+
+// penaltyHighPlayer builds an Alive full-state player with
+// HP/BaseMaxHP/MaxHP all equal to hp (hp > 20 so a lost HP roll
+// produces an actual MaxHP change; the T4a base floor is 20)
+// carrying the given pending via authoritative hydration.
+func penaltyHighPlayer(t *testing.T, e *Engine, charID CharacterID, pos world.Vec3, hp int, pending *PendingDeathRuntime, durable PlayerDurableState) EntityID {
+	t.Helper()
+	v := testVitals()
+	v.HP, v.BaseMaxHP, v.MaxHP = hp, hp, hp
+	if err := v.Validate(); err != nil {
+		t.Fatalf("high vitals: %v", err)
+	}
+	snap, err := e.AddPlayerEntityWithDurableState(charID, pos, v, testRuntimeInputs(), durable)
 	if err != nil {
 		t.Fatalf("AddPlayerEntityWithDurableState: %v", err)
 	}
@@ -714,9 +736,10 @@ func TestDeathPenaltyCorpsePortalStatusNoGate(t *testing.T) {
 	}
 }
 
-// TestUnderworldExitPenaltyAttempt proves Prepare runs while
-// life is Alive, the post-state is not yet live, and the
-// attempt install locks gameplay with persistence active.
+// TestUnderworldExitPenaltyAttempt proves Prepare runs after
+// the attempt install with life already locked, the post-state
+// is not yet live, and the attempt install locks gameplay with
+// persistence active.
 func TestUnderworldExitPenaltyAttempt(t *testing.T) {
 	spells, skills := penaltyAbilities()
 	e := newPlayerEngine(t, nil)
@@ -731,8 +754,8 @@ func TestUnderworldExitPenaltyAttempt(t *testing.T) {
 		prepareLife, prepareSeen = st, true
 	}}
 	res := beginPenalty(t, e, id, penaltyInput(), d100Rolls(90, 26, 89, 30, 50), p)
-	if !prepareSeen || prepareLife != PlayerLifeAlive {
-		t.Fatalf("prepare life seen=%v life=%d, want true/Alive", prepareSeen, uint8(prepareLife))
+	if !prepareSeen || prepareLife != PlayerLifeDeathPenaltyPersisting {
+		t.Fatalf("prepare life seen=%v life=%d, want true/PenaltyPersisting", prepareSeen, uint8(prepareLife))
 	}
 	ent := penaltyEnt(t, e, id)
 	if ent.penaltyEpoch != 1 {
@@ -766,30 +789,107 @@ func TestUnderworldExitPenaltyAttempt(t *testing.T) {
 	requirePendingEqual(t, live, PendingDeathRuntime{EffectiveCost: 90, DeathTimeSeconds: 100, CorpseID: int64ptr(500)}, "begin preserves pending")
 }
 
-// TestDeathPenaltyPrepareFailure proves a Prepare error
-// Cancels once and leaves the player Alive with no
-// attempt and no automatic retry.
-func TestDeathPenaltyPrepareFailure(t *testing.T) {
+// TestDeathPenaltyPrepareFailureLocks proves an initial Prepare
+// error after the private attempt was installed Cancels once with
+// zero Activates AND retains the gameplay lock: life stays
+// `PlayerLifeDeathPenaltyPersisting`, the penalty epoch is
+// consumed exactly once, the private attempt is present with
+// `persistenceActive == false`, pending is unchanged, the stored
+// capture equals the exact capture passed to Prepare, an ordinary
+// second LeaveHold does not reroll, and retry reuses the exact
+// capture with zero additional RNG.
+func TestDeathPenaltyPrepareFailureLocks(t *testing.T) {
 	spells, skills := penaltyAbilities()
 	e := newPlayerEngine(t, nil)
 	id := penaltyAlivePlayer(t, e, testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1},
 		pendingFixture(90, 100, int64ptr(500), false), penaltyDurable(0x800, spells, skills))
-	p := &fakePenaltyProvider{prepareErr: errPenaltyPrepareBoom}
-	rng := d100Rolls(90, 26, 89, 30, 50)
-	if _, err := e.PlayerOrchestrateDeathPenalties(id, penaltyInput(), rng, p); !errors.Is(err, errPenaltyPrepareBoom) {
+	events := []string{}
+	p := &fakePenaltyProvider{
+		prepareErr: errPenaltyPrepareBoom,
+		onPrepare:  func(DeathPenaltyCapture) { events = append(events, "prepare") },
+		onActivate: func() { events = append(events, "activate") },
+	}
+	dec := &orderPenaltyProvider{inner: p, events: &events}
+	rng := &orderRNG{script: d100Rolls(90, 26, 89, 30, 50), events: &events}
+	if _, err := e.PlayerOrchestrateDeathPenalties(id, penaltyInput(), rng, dec); !errors.Is(err, errPenaltyPrepareBoom) {
 		t.Fatalf("err = %v, want prepare boom", err)
+	}
+	// Reserve succeeded before RNG: exactly one plan's RNG draws.
+	if len(events) < 7 || events[0] != "reserve" {
+		t.Fatalf("events = %v, want reserve-first", events)
+	}
+	for _, ev := range events[1:6] {
+		if ev != "rng" {
+			t.Fatalf("events = %v, want 5 rng draws between reserve and prepare", events)
+		}
+	}
+	if events[6] != "prepare" {
+		t.Fatalf("events = %v, want prepare after rng", events)
+	}
+	for _, ev := range events {
+		if ev == "activate" {
+			t.Fatalf("events = %v, want zero activates", events)
+		}
 	}
 	r := p.last()
 	if r.cancels != 1 || r.activates != 0 {
 		t.Fatalf("reservation cancels=%d activates=%d, want 1/0", r.cancels, r.activates)
 	}
-	if st, _ := lifeOf(t, e, id); st != PlayerLifeAlive {
-		t.Fatalf("life = %d, want Alive", uint8(st))
+	if len(r.prepares) != 1 {
+		t.Fatalf("prepares = %d, want exactly 1", len(r.prepares))
+	}
+	ent := penaltyEnt(t, e, id)
+	if st, _ := lifeOf(t, e, id); st != PlayerLifeDeathPenaltyPersisting {
+		t.Fatalf("life = %d, want PenaltyPersisting", uint8(st))
+	}
+	if ent.penaltyEpoch != 1 {
+		t.Fatalf("epoch = %d, want consumed exactly once", ent.penaltyEpoch)
+	}
+	if ent.penaltyAttempt == nil {
+		t.Fatalf("private attempt missing after prepare failure")
+	}
+	if ent.penaltyAttempt.persistenceActive {
+		t.Fatalf("persistence wrongly active after prepare failure")
+	}
+	if !reflect.DeepEqual(ent.penaltyAttempt.capture, r.prepares[0]) {
+		t.Fatalf("stored capture != exact capture passed to Prepare")
+	}
+	if ent.penaltyAttempt.capture.Token.Epoch != 1 {
+		t.Fatalf("capture epoch = %d, want 1", ent.penaltyAttempt.capture.Token.Epoch)
 	}
 	live, _ := pendingOf(t, e, id)
 	requirePendingEqual(t, live, PendingDeathRuntime{EffectiveCost: 90, DeathTimeSeconds: 100, CorpseID: int64ptr(500)}, "prepare failure preserves pending")
-	if ent := penaltyEnt(t, e, id); ent.penaltyEpoch != 0 || ent.penaltyAttempt != nil {
-		t.Fatalf("epoch/attempt mutated on prepare failure")
+	// An ordinary second LeaveHold MUST NOT reroll: it rejects
+	// with the attempt already active and consumes zero RNG.
+	rerollRNG := d100Rolls(1, 2, 3, 4, 5)
+	if _, err := e.PlayerOrchestrateDeathPenalties(id, penaltyInput(), rerollRNG, &fakePenaltyProvider{}); !errors.Is(err, ErrDeathPenaltyPersistenceActive) {
+		t.Fatalf("second LeaveHold = %v, want ErrDeathPenaltyPersistenceActive", err)
+	}
+	if rerollRNG.at != 0 {
+		t.Fatalf("second LeaveHold rng draws = %d, want 0", rerollRNG.at)
+	}
+	if ent2 := penaltyEnt(t, e, id); ent2.penaltyEpoch != 1 || ent2.penaltyAttempt == nil {
+		t.Fatalf("second LeaveHold disturbed the retained attempt")
+	}
+	// Retry reuses the exact stored capture with zero new RNG.
+	storedBefore := ent.penaltyAttempt.capture
+	fresh := &fakePenaltyProvider{}
+	retryRNG := rng.script
+	tok, err := e.PlayerRetryDeathPenaltyPersistence(id, fresh)
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if tok != storedBefore.Token {
+		t.Fatalf("retry token = %+v, want %+v", tok, storedBefore.Token)
+	}
+	if retryRNG.at != 5 {
+		t.Fatalf("rng draws after retry = %d, want still 5 (zero new RNG)", retryRNG.at)
+	}
+	if fr := fresh.last(); !reflect.DeepEqual(fr.prepares[0], storedBefore) {
+		t.Fatalf("retry prepared a different capture")
+	}
+	if ent3 := penaltyEnt(t, e, id); ent3.penaltyEpoch != 1 || !ent3.penaltyAttempt.persistenceActive {
+		t.Fatalf("retry did not keep epoch 1 with active persistence")
 	}
 }
 
@@ -1052,12 +1152,15 @@ func TestDeathPenaltyRuntimeQuiesce(t *testing.T) {
 
 // TestPenaltyPersistenceCompletion proves the first valid
 // token installs exactly the stored capture with full
-// preservation and no observer replay.
+// preservation and no observer replay. The stored plan
+// lowers MaxHP by one while HP stays put, so the frozen
+// v0.3.57 `reconcileHealth` arms the previously absent
+// health slot; mana/rest slots stay bit-identical.
 func TestPenaltyPersistenceCompletion(t *testing.T) {
 	spells, skills := penaltyAbilities()
 	rec := &vitalsRecorder{}
 	e := newPlayerEngine(t, rec)
-	id := penaltyAlivePlayer(t, e, testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1},
+	id := penaltyHighPlayer(t, e, testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, 30,
 		pendingFixture(90, 100, int64ptr(500), false), penaltyDurable(0x800, spells, skills))
 	ent := penaltyEnt(t, e, id)
 	ent.deathEpoch = 3
@@ -1067,9 +1170,12 @@ func TestPenaltyPersistenceCompletion(t *testing.T) {
 	res := beginPenalty(t, e, id, penaltyInput(), d100Rolls(90, 26, 89, 30, 50), p)
 	wantVitals := p.last().prepares[0].Vitals
 	wantDurable := p.last().prepares[0].Durable
+	if wantVitals.HP != 30 || wantVitals.MaxHP != 29 {
+		t.Fatalf("fixture plan vitals = %+v, want HP 30 MaxHP 29 (MaxHP lowered, HP put)", wantVitals)
+	}
 	prePos := ent.position
 	preInputs := ent.runtimeInputs
-	preSlots := []any{ent.healthArmed, ent.healthDue, ent.manaArmed, ent.manaDue, ent.restArmed, ent.restDue, ent.actedSinceEntry, ent.stomachAnchorTick}
+	preManaRest := []any{ent.manaArmed, ent.manaDue, ent.restArmed, ent.restDue, ent.actedSinceEntry, ent.stomachAnchorTick}
 	preHistory, err := e.History(id)
 	if err != nil {
 		t.Fatal(err)
@@ -1097,8 +1203,13 @@ func TestPenaltyPersistenceCompletion(t *testing.T) {
 	if ent.position != prePos || ent.runtimeInputs != preInputs {
 		t.Fatalf("position/runtime inputs not preserved")
 	}
-	if post := []any{ent.healthArmed, ent.healthDue, ent.manaArmed, ent.manaDue, ent.restArmed, ent.restDue, ent.actedSinceEntry, ent.stomachAnchorTick}; !reflect.DeepEqual(post, preSlots) {
-		t.Fatalf("runtime slots not preserved")
+	// Health reconciled per NewHealth: HP != MaxHP with HP > 0
+	// arms the previously absent slot from the current tick.
+	if !ent.healthArmed {
+		t.Fatalf("healthArmed = false, want armed after MaxHP loss with HP > MaxHP")
+	}
+	if post := []any{ent.manaArmed, ent.manaDue, ent.restArmed, ent.restDue, ent.actedSinceEntry, ent.stomachAnchorTick}; !reflect.DeepEqual(post, preManaRest) {
+		t.Fatalf("mana/rest slots not preserved")
 	}
 	if ent.deathEpoch != 3 || ent.penaltyEpoch != 1 || ent.portalEpoch != 2 || ent.lastDeathSeconds != 42 {
 		t.Fatalf("epochs/lastDeath not preserved: death=%d penalty=%d portal=%d last=%d",
@@ -1114,6 +1225,201 @@ func TestPenaltyPersistenceCompletion(t *testing.T) {
 	if rec.count() != 0 {
 		t.Fatalf("observer events = %d, want 0", rec.count())
 	}
+}
+
+// TestDeathPenaltyCompletionHealthAbsentArmed proves the frozen
+// v0.3.57 completion health semantics for the arm edge: before the
+// penalty HP == MaxHP with the health slot absent, the HP penalty
+// lowers MaxHP by one while HP stays put, and the first successful
+// completion arms the health slot per the existing `reconcileHealth`
+// rule. No observer event fires; mana/rest slots stay bit-identical.
+func TestDeathPenaltyCompletionHealthAbsentArmed(t *testing.T) {
+	spells, skills := penaltyAbilities()
+	rec := &vitalsRecorder{}
+	e := newPlayerEngine(t, rec)
+	id := penaltyHighPlayer(t, e, testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, 30,
+		pendingFixture(90, 100, int64ptr(500), false), penaltyDurable(0x800, spells, skills))
+	ent := penaltyEnt(t, e, id)
+	if ent.healthArmed {
+		t.Fatalf("healthArmed = true before penalty, want absent with HP == MaxHP")
+	}
+	if ent.vitals.HP != ent.vitals.MaxHP {
+		t.Fatalf("HP = %d MaxHP = %d, want equal before penalty", ent.vitals.HP, ent.vitals.MaxHP)
+	}
+	p := &fakePenaltyProvider{}
+	res := beginPenalty(t, e, id, penaltyInput(), d100Rolls(90, 26, 89, 30, 50), p)
+	stored := p.last().prepares[0].Vitals
+	if stored.HP != 30 || stored.MaxHP != 29 {
+		t.Fatalf("stored vitals = %+v, want HP 30 MaxHP 29 (MaxHP lowered, HP put)", stored)
+	}
+	preManaRest := []any{ent.manaArmed, ent.manaDue, ent.restArmed, ent.restDue, ent.actedSinceEntry, ent.stomachAnchorTick}
+	rec.events = nil
+	disp, err := e.PlayerAcceptDeathPenaltyCompletion(DeathPenaltyCompletion{Token: res.Token})
+	if err != nil || disp != DeathPenaltyCompletionApplied {
+		t.Fatalf("completion = %d,%v; want Applied,nil", disp, err)
+	}
+	ent = penaltyEnt(t, e, id)
+	if ent.vitals.HP != 30 || ent.vitals.MaxHP != 29 {
+		t.Fatalf("live vitals = %+v, want exact stored HP 30 MaxHP 29", ent.vitals)
+	}
+	if !ent.healthArmed {
+		t.Fatalf("healthArmed = false, want armed (HP > new MaxHP per reconcileHealth)")
+	}
+	if post := []any{ent.manaArmed, ent.manaDue, ent.restArmed, ent.restDue, ent.actedSinceEntry, ent.stomachAnchorTick}; !reflect.DeepEqual(post, preManaRest) {
+		t.Fatalf("mana/rest slots changed across completion")
+	}
+	if rec.count() != 0 {
+		t.Fatalf("observer events = %d, want 0", rec.count())
+	}
+}
+
+// TestDeathPenaltyCompletionHealthArmedCancelled proves the cancel
+// edge: before the penalty HP == MaxHP - 1 with the health slot
+// armed, the MaxHP penalty makes HP == new MaxHP, and completion
+// cancels the slot. Mana/rest slots stay bit-identical.
+func TestDeathPenaltyCompletionHealthArmedCancelled(t *testing.T) {
+	spells, skills := penaltyAbilities()
+	rec := &vitalsRecorder{}
+	e := newPlayerEngine(t, rec)
+	id := penaltyHighPlayer(t, e, testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, 30,
+		pendingFixture(90, 100, int64ptr(500), false), penaltyDurable(0x800, spells, skills))
+	if _, _, err := e.PlayerLoseHealth(id, 1, false); err != nil {
+		t.Fatalf("PlayerLoseHealth: %v", err)
+	}
+	ent := penaltyEnt(t, e, id)
+	if ent.vitals.HP != 29 || ent.vitals.MaxHP != 30 {
+		t.Fatalf("setup vitals = %+v, want HP 29 MaxHP 30", ent.vitals)
+	}
+	if !ent.healthArmed {
+		t.Fatalf("healthArmed = false after damage, want armed")
+	}
+	p := &fakePenaltyProvider{}
+	res := beginPenalty(t, e, id, penaltyInput(), d100Rolls(90, 26, 89, 30, 50), p)
+	stored := p.last().prepares[0].Vitals
+	if stored.HP != 29 || stored.MaxHP != 29 {
+		t.Fatalf("stored vitals = %+v, want HP 29 MaxHP 29", stored)
+	}
+	preManaRest := []any{ent.manaArmed, ent.manaDue, ent.restArmed, ent.restDue, ent.actedSinceEntry, ent.stomachAnchorTick}
+	rec.events = nil
+	disp, err := e.PlayerAcceptDeathPenaltyCompletion(DeathPenaltyCompletion{Token: res.Token})
+	if err != nil || disp != DeathPenaltyCompletionApplied {
+		t.Fatalf("completion = %d,%v; want Applied,nil", disp, err)
+	}
+	ent = penaltyEnt(t, e, id)
+	if ent.healthArmed {
+		t.Fatalf("healthArmed = true, want cancelled (HP == new MaxHP)")
+	}
+	if post := []any{ent.manaArmed, ent.manaDue, ent.restArmed, ent.restDue, ent.actedSinceEntry, ent.stomachAnchorTick}; !reflect.DeepEqual(post, preManaRest) {
+		t.Fatalf("mana/rest slots changed across completion")
+	}
+	if rec.count() != 0 {
+		t.Fatalf("observer events = %d, want 0", rec.count())
+	}
+}
+
+// TestDeathPenaltyCompletionHealthArmedKeptDue proves the keep edge:
+// an armed health timer whose post-penalty HP still differs from the
+// new MaxHP keeps its EXACT existing due across completion.
+func TestDeathPenaltyCompletionHealthArmedKeptDue(t *testing.T) {
+	spells, skills := penaltyAbilities()
+	rec := &vitalsRecorder{}
+	e := newPlayerEngine(t, rec)
+	id := penaltyHighPlayer(t, e, testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, 30,
+		pendingFixture(90, 100, int64ptr(500), false), penaltyDurable(0x800, spells, skills))
+	if _, _, err := e.PlayerLoseHealth(id, 2, false); err != nil {
+		t.Fatalf("PlayerLoseHealth: %v", err)
+	}
+	ent := penaltyEnt(t, e, id)
+	if ent.vitals.HP != 28 || ent.vitals.MaxHP != 30 {
+		t.Fatalf("setup vitals = %+v, want HP 28 MaxHP 30", ent.vitals)
+	}
+	if !ent.healthArmed {
+		t.Fatalf("healthArmed = false after damage, want armed")
+	}
+	preDue := ent.healthDue
+	p := &fakePenaltyProvider{}
+	res := beginPenalty(t, e, id, penaltyInput(), d100Rolls(90, 26, 89, 30, 50), p)
+	stored := p.last().prepares[0].Vitals
+	if stored.HP != 28 || stored.MaxHP != 29 {
+		t.Fatalf("stored vitals = %+v, want HP 28 MaxHP 29", stored)
+	}
+	rec.events = nil
+	disp, err := e.PlayerAcceptDeathPenaltyCompletion(DeathPenaltyCompletion{Token: res.Token})
+	if err != nil || disp != DeathPenaltyCompletionApplied {
+		t.Fatalf("completion = %d,%v; want Applied,nil", disp, err)
+	}
+	ent = penaltyEnt(t, e, id)
+	if !ent.healthArmed {
+		t.Fatalf("healthArmed = false, want still armed (HP != new MaxHP)")
+	}
+	if ent.healthDue != preDue {
+		t.Fatalf("healthDue = %d, want exact pre-penalty due %d", ent.healthDue, preDue)
+	}
+	if rec.count() != 0 {
+		t.Fatalf("observer events = %d, want 0", rec.count())
+	}
+}
+
+// TestDeathPenaltyCompletionHealthNoMaxHPChange proves a plan that
+// does not change MaxHP never spuriously restarts the health
+// deadline: an absent slot stays absent, an armed slot keeps its
+// exact due. Frenzy carries no HP/ability penalty at all.
+func TestDeathPenaltyCompletionHealthNoMaxHPChange(t *testing.T) {
+	spells, skills := penaltyAbilities()
+	frenzy := UnderworldExitResolvedInput{DefaultDeathCost: 100, FrenzyActive: true}
+	t.Run("absent stays absent", func(t *testing.T) {
+		rec := &vitalsRecorder{}
+		e := newPlayerEngine(t, rec)
+		id := penaltyHighPlayer(t, e, testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, 30,
+			pendingFixture(90, 100, int64ptr(500), false), penaltyDurable(0x800, spells, skills))
+		ent := penaltyEnt(t, e, id)
+		if ent.healthArmed {
+			t.Fatalf("healthArmed = true before penalty, want absent")
+		}
+		preVitals := ent.vitals
+		p := &fakePenaltyProvider{}
+		res := beginPenalty(t, e, id, frenzy, d100Rolls(1), p)
+		if got := p.last().prepares[0].Vitals; got != preVitals {
+			t.Fatalf("frenzy stored vitals = %+v, want unchanged %+v", got, preVitals)
+		}
+		rec.events = nil
+		if _, err := e.PlayerAcceptDeathPenaltyCompletion(DeathPenaltyCompletion{Token: res.Token}); err != nil {
+			t.Fatalf("completion: %v", err)
+		}
+		if ent2 := penaltyEnt(t, e, id); ent2.healthArmed {
+			t.Fatalf("healthArmed = true after no-MaxHP-change completion, want absent")
+		}
+		if rec.count() != 0 {
+			t.Fatalf("observer events = %d, want 0", rec.count())
+		}
+	})
+	t.Run("armed keeps exact due", func(t *testing.T) {
+		rec := &vitalsRecorder{}
+		e := newPlayerEngine(t, rec)
+		id := penaltyHighPlayer(t, e, testCharacterID(), world.Vec3{X: 1, Y: 0, Z: 1}, 30,
+			pendingFixture(90, 100, int64ptr(500), false), penaltyDurable(0x800, spells, skills))
+		if _, _, err := e.PlayerLoseHealth(id, 1, false); err != nil {
+			t.Fatalf("PlayerLoseHealth: %v", err)
+		}
+		ent := penaltyEnt(t, e, id)
+		if !ent.healthArmed {
+			t.Fatalf("healthArmed = false after damage, want armed")
+		}
+		preDue := ent.healthDue
+		p := &fakePenaltyProvider{}
+		res := beginPenalty(t, e, id, frenzy, d100Rolls(1), p)
+		rec.events = nil
+		if _, err := e.PlayerAcceptDeathPenaltyCompletion(DeathPenaltyCompletion{Token: res.Token}); err != nil {
+			t.Fatalf("completion: %v", err)
+		}
+		ent2 := penaltyEnt(t, e, id)
+		if !ent2.healthArmed || ent2.healthDue != preDue {
+			t.Fatalf("health slot = armed=%v due=%d, want armed=true due=%d", ent2.healthArmed, ent2.healthDue, preDue)
+		}
+		if rec.count() != 0 {
+			t.Fatalf("observer events = %d, want 0", rec.count())
+		}
+	})
 }
 
 // TestDeathPenaltyCompletionDuplicate proves the same token
