@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.53 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.54 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -4521,8 +4521,14 @@ the cause plus `ErrSaverReconcileRequired` discoverable; NOTHING
 before callback invocation blanket-blocks). The primitive is
 Store-agnostic, performs NO PG I/O itself, adds NO new metric,
 and contains NO death-specific, gateway, proto, or
-recovery-query logic. Full semantics are normative in §9.5.1a;
-this section records only the Saver ownership placement.
+ recovery-query logic. Full semantics are normative in §9.5.1a;
+ this section records only the Saver ownership placement.
+ v0.3.54 note: T5c3d2b1 adds a reserved variant of this
+ coordination (existing per-key gates + critical generations
+ reserved non-blockingly at Reserve time, executed later
+ with execution-time expected revisions); its full contract
+ is frozen in §9.5.1k and it changes no `WriteCriticalSet`
+ behavior.
 
 ## 9. Gameplay services (what sim MUST enforce; numbers in `meridian59.md`)
 
@@ -7965,7 +7971,7 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
 
 #### 9.5.1 Ownership split and the two-phase lifecycle
 
- M5-T5 is TWENTY-ONE tasks (this section is their shared boundary;
+ M5-T5 is TWENTY-TWO tasks (this section is their shared boundary;
  the former single T5c is split into T5c1–T5c4, frozen v0.3.39 in
  §9.5.1a, T5c2 is further split into T5c2a+T5c2b, frozen
  v0.3.40 in §9.5.1b, T5c3 is further split into
@@ -7977,9 +7983,10 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
  T5c3c3c is further split into T5c3c3c1+T5c3c3c2, frozen
  v0.3.50 in §9.5.1i, the c3c3c2 gameplay contract is
  frozen v0.3.51 in §9.5.1j, T5c3d is further split into
- T5c3d1+T5c3d2+T5c3d3, frozen v0.3.52 in §9.5.1k, and
+ T5c3d1+T5c3d2+T5c3d3, frozen v0.3.52 in §9.5.1k,
  T5c3d2 is further split into T5c3d2a+T5c3d2b, frozen
- v0.3.53 in §9.5.1k):
+ v0.3.53 in §9.5.1k, and T5c3d2b is further split into
+ T5c3d2b1+T5c3d2b2, frozen v0.3.54 in §9.5.1k):
 
 - **T5a — pure/source-faithful death mechanics and immutable plans**
   (§9.5.4–§9.5.14 pure surface; §9.5.17 non-scope).
@@ -8204,22 +8211,34 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
     `MIGRATING` keeps `ErrCellHandoffRequired`); an
     `Alive` player stays `Alive` with ordinary gameplay
     accepted while Portal persistence is in flight.
-  - **T5c3d2b — bounded off-owner Portal persistence +
-    in-critical-callback lost-ack proof** (§9.5.1k,
-    future): the Store-domain Portal mapper, the bounded
-    Portal executor/reservation implementation, off-owner
-    `CommitPortalOfLife`, the exact callback expected
-    revision, the lost-ack materialized proof, normal +
-    proven-lost-ack owner completion, definite-no-
-    execution owner abort, and bounded owner ingress
-    redelivery. Depends on T5c3d2a + T5b2a + T5c2a +
-    T5c2b. No Underworld-exit penalties. Future d2b MUST
-    use the frozen in-critical-callback recovery rule
-    below: after a PROVEN Portal lost-ack it MUST NOT
-    call `ReconcileSaver` / `ResolveReconciled` (that
-    would discard newer character snapshots captured
-    while the Portal Store operation was in flight for a
-    still gameplay-active character).
+  - **T5c3d2b1 — reserved Saver critical slot /
+    generation seam for active-player Portal persistence**
+    (§9.5.1k, frozen v0.3.54): ONE generic Store-independent
+    `internal/sim` Saver reservation primitive (no Store, no
+    persist, no PG, no Portal executor, no recovery). It
+    reserves the EXISTING per-key Saver gate(s) plus one
+    already-allocated critical dirty generation per
+    participant at Reserve time, executes later with
+    execution-time expected revisions, and keeps normal
+    CriticalSet success/error semantics with newer-pending
+    retention. Depends on T5c1 + T5c3d2a. No d2a Portal
+    owner behavior change.
+  - **T5c3d2b2 — bounded off-owner Portal executor +
+    Store mapping + in-critical-callback lost-ack proof**
+    (§9.5.1k, future): the Store-domain Portal mapper, the
+    bounded Portal executor/reservation implementation,
+    off-owner `CommitPortalOfLife`, the exact callback
+    expected revision, the lost-ack materialized proof,
+    normal + proven-lost-ack owner completion, the
+    definite-no-execution owner abort, and bounded owner
+    ingress redelivery. Depends on T5c3d2a + T5c3d2b1 +
+    T5b2a + T5c2a + T5c2b. No Underworld-exit penalties.
+    Future d2b2 MUST use the frozen in-critical-callback
+    recovery rule below: after a PROVEN Portal lost-ack it
+    MUST NOT call `ReconcileSaver` / `ResolveReconciled`
+    (that would discard newer character snapshots
+    captured while the Portal Store operation was in
+    flight for a still gameplay-active character).
   - **T5c3d3 — authoritative Underworld-exit penalty
     transition + exactly-once pending consumption**
     (§9.5.1k, future): the actual authoritative
@@ -8230,7 +8249,7 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
     `CommitDeathPenalties`, stale/ambiguous recovery,
     the exactly-once pending deletion proof, and the
     owner-only final apply + pending clear. Depends on
-    T5c3d1 + T5c3d2a + T5c3d2b + T5a + T5b2b + T5c2a +
+    T5c3d1 + T5c3d2a + T5c3d2b1 + T5c3d2b2 + T5a + T5b2b + T5c2a +
     T5c2b. T5c3d3 Underworld `LeaveHold` MUST NOT consume
     pending penalties while a Portal attempt against that
     pending death remains in flight (exact d3 API
@@ -8240,14 +8259,14 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
    owns opcode 120 transport/state routing while T5c3d3
    owns the gameplay event "player actually leaves the
    Underworld".
-  - **T5c4 — gateway death wire/state integration + reconnect E2E**:
-    gateway/state-machine routing, rate-gated C→S 120 handling, critical
-    S→C 214 / 215 delivery, session/Presence/NetEntityID composition,
-    reconnect/end-to-end proof reusing the existing 120/214/215 codecs
-    (no second protocol). Depends on T5c3a + T5c3b + T5c3c1 + T5c3c2 +
-    T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b + T5c3d3 + the existing M4 gateway/presence/fanout foundation.
+   - **T5c4 — gateway death wire/state integration + reconnect E2E**:
+     gateway/state-machine routing, rate-gated C→S 120 handling, critical
+     S→C 214 / 215 delivery, session/Presence/NetEntityID composition,
+     reconnect/end-to-end proof reusing the existing 120/214/215 codecs
+     (no second protocol). Depends on T5c3a + T5c3b + T5c3c1 + T5c3c2 +
+     T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b1 + T5c3d2b2 + T5c3d3 + the existing M4 gateway/presence/fanout foundation.
 
-  M5-T5-complete is `T5a + T5b1a + T5b1b + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b + T5c3d3 + T5c4` (TWENTY-ONE tasks).
+   M5-T5-complete is `T5a + T5b1a + T5b1b + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b1 + T5c3d2b2 + T5c3d3 + T5c4` (TWENTY-TWO tasks).
 
 Ledger contract (binding on T5b2a/T5b2b): Portal-of-Life writes ZERO
 ledger rows. Underworld-exit death penalties write ZERO ledger rows.
@@ -10743,21 +10762,24 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
    migration, generated code, gateway/proto/session,
    `PlayerLoseHealth` automatic dispatch.
 
-   #### 9.5.1k M5 pending-death owner lifecycle split (T5c3d1+T5c3d2a+T5c3d2b+T5c3d3, frozen v0.3.52/v0.3.53)
+    #### 9.5.1k M5 pending-death owner lifecycle split (T5c3d1+T5c3d2a+T5c3d2b1+T5c3d2b2+T5c3d3, frozen v0.3.52/v0.3.53/v0.3.54)
 
-   The former single T5c3d combined three separate
-   correctness boundaries — authoritative pending-death
-   state reaching the sim owner, the Portal-of-Life async
-   mutation, and the actual Underworld `LeaveHold` /
-   penalty planning plus exactly-once async pending
-   consumption — so it is split into T5c3d1+T5c3d2+T5c3d3
-   (this section supersedes the T5c3d paragraph of §9.5.1
-   for the task split only; §9.5.1d stays otherwise
-   frozen), and the former monolithic T5c3d2 is further
-   split into T5c3d2a+T5c3d2b (v0.3.53; this paragraph
-   supersedes the T5c3d2 paragraph of §9.5.1 for the
-   split only). `meridian59.md` is untouched: this task
-   changes no Meridian mechanics.
+    The former single T5c3d combined three separate
+    correctness boundaries — authoritative pending-death
+    state reaching the sim owner, the Portal-of-Life async
+    mutation, and the actual Underworld `LeaveHold` /
+    penalty planning plus exactly-once async pending
+    consumption — so it is split into T5c3d1+T5c3d2+T5c3d3
+    (this section supersedes the T5c3d paragraph of §9.5.1
+    for the task split only; §9.5.1d stays otherwise
+    frozen), the former monolithic T5c3d2 is further
+    split into T5c3d2a+T5c3d2b (v0.3.53; this paragraph
+    supersedes the T5c3d2 paragraph of §9.5.1 for the
+    split only), and T5c3d2b is further split into
+    T5c3d2b1+T5c3d2b2 (v0.3.54; this section supersedes
+    the T5c3d2b paragraph of §9.5.1 for the split only).
+    `meridian59.md` is untouched: this task
+    changes no Meridian mechanics.
 
    A more important existing gap makes d1 a prerequisite:
    `store.CommitDeathEntry` generates the CorpseID inside
@@ -11033,50 +11055,149 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
    owner operation only after upstream gameplay has
    resolved the valid target/cast facts.
 
-   T5c3d2b (depends on T5c3d2a + T5b2a + T5c2a +
-   T5c2b; future) owns the bounded off-owner Portal
-   persistence: the Store-domain Portal mapper, the
-   bounded Portal executor/reservation implementation,
-   off-owner `CommitPortalOfLife`, the exact callback
-   expected revision, the lost-ack materialized proof,
-   normal + proven-lost-ack owner completion, the
-   definite-no-execution owner abort, and bounded
-   owner ingress redelivery. No Underworld-exit
-   penalties.
+    T5c3d2b1 (depends on T5c1 + T5c3d2a;
+    `internal/sim` only) owns ONE generic Store-independent
+    Saver reservation primitive for active-player Portal
+    persistence. A successful reservation represents the
+    exact immutable participant key set in canonical key
+    order, exclusive ownership of each EXISTING Saver
+    per-key gate, and one already-allocated critical dirty
+    generation per participant. It carries NO Store value,
+    Portal value, PG handle, pre-gate revision guess,
+    SnapshotWrite, or gameplay payload. `ReserveCriticalSet`
+    is non-blocking: it try-acquires every existing gate
+    in canonical order and on ANY unavailable gate
+    releases all already-acquired gates and returns the
+    stable busy error (`ErrCriticalSetReservationBusy`,
+    matched with `errors.Is`) with zero generation
+    allocation and zero reservation metadata. The
+    generation is allocated at Reserve time (`entry.seq++`
+    remembered as the reserved generation; no second
+    allocation at Execute); any later `MarkDirty`
+    receives a newer generation. On valid Execute success
+    only pending snapshots with `gen <= reservedGeneration`
+    may be superseded while every newer pending snapshot
+    MUST survive. The reservation holds the SAME existing
+    Saver gates from successful Reserve until exactly one
+    of Execute completion, Cancel, or pre-callback Execute
+    failure, so no later `WriteThrough`, ordinary
+    `WriteCriticalSet`, `ResolveReconciled`, or another
+    reserved critical set can overtake the captured Portal
+    state, while `MarkDirty` (which needs no gate) keeps
+    working. `Untrack` MUST reject a reserved key with the
+    existing `ErrSaverUntrackDirty` domain. Cancel while
+    Reserved clears metadata, releases every held gate
+    exactly once, leaves revision/pending unchanged, and
+    never rolls `seq` backwards (repeated Cancel is a
+    no-op; Cancel after Execute began is a no-op). Execute
+    captures CURRENT known revisions under `s.mu` before
+    the callback (execution-time expected revisions, never
+    a stale pre-gate sample), transitions entries
+    reserved -> inflight with no `seq++`, and on callback
+    error or malformed success preserves the exact
+    existing `WriteCriticalSet` conservative semantics
+    (block participants, clear no pending, preserve cause
+    plus `ErrSaverReconcileRequired` /
+    `ErrSaverRevisionInvariant`). Existing
+    `WriteCriticalSet` behavior stays byte-for-byte
+    compatible (no earlier generation reservation). No
+    Store, no persist, no Portal executor, no PG, no
+    recovery, no d2a owner behavior change, no gameplay
+    gating on `portalInFlight`.
 
-   Future d2b recovery rule (binding, frozen v0.3.53):
-   for Portal, DO NOT copy the c3c3b post-error
-   `WriteCriticalSet` returns reconcile-required, then
-   `ReconcileSaver`, then `ResolveReconciled` pattern
-   for a proven lost acknowledgement. Reason: the
-   Portal target may remain gameplay-active while PG
-   I/O runs, `ResolveReconciled` discards ALL pending
-   Saver snapshots, and a newer Player snapshot may
-   have arrived during the Portal attempt. Future d2b
-   MUST instead use this pattern: `Saver.WriteCriticalSet`
-   owns the character gate; the callback receives the
-   exact expected revision E; `Store.CommitPortalOfLife`
-   runs; on Store success the callback succeeds
-   normally; on an ambiguous/error Store result, while
-   still INSIDE the `CriticalSet` callback, perform a
-   read-only `DeathCharacterRecovery` into worker-local
-   values; if the materialized state PROVES this Portal
-   committed, the callback returns normal success
-   revision E+1, so the existing `WriteCriticalSet`
-   success bookkeeping accepts E+1, clears pending
-   snapshots `<=` this critical generation, and
-   PRESERVES newer pending snapshots `>` this
-   generation; otherwise the callback returns error,
-   the Saver remains reconcile-blocked, with NO Store
-   replay and NO Portal owner success completion.
-   Future d2b MUST NOT call `ReconcileSaver` /
-   `ResolveReconciled` after a PROVEN Portal lost-ack.
-   This rule is frozen here because it materially
-   affects the d2a attempt lifecycle; it is NOT
-   implemented in d2a.
+    Readiness correction (binding, frozen v0.3.54):
+    generation reservation alone is INSUFFICIENT for
+    active-player Portal persistence. The Portal capture
+    is produced on the sim owner BEFORE the off-owner
+    worker reaches the critical write, so a newer
+    complete Character snapshot `C1` marked dirty after
+    the `C0` capture would receive a generation AFTER a
+    late-allocated critical generation and could be
+    incorrectly superseded on success; worse, another
+    Character write could persist newer `C1` before the
+    Portal worker obtains the Saver gate, letting the
+    Portal later persist OLD `C0` at the newer revision.
+    Therefore future Portal persistence requires BOTH
+    (A) reserving the critical generation at owner
+    Prepare time AND (B) reserving/holding the existing
+    Character Saver gate at owner Prepare time until
+    Portal execution or cancellation. The reservation
+    MUST be non-blocking: if the gate is currently owned,
+    Portal Prepare fails, the owner attempt never starts,
+    and the caller may retry later.
 
-   T5c3d3 (depends on T5c3d1 + T5c3d2a + T5c3d2b +
-   T5a + T5b2b + T5c2a + T5c2b; future) owns the actual
+    T5c3d2b2 (depends on T5c3d2a + T5c3d2b1 + T5b2a +
+    T5c2a + T5c2b; future) owns the bounded off-owner
+    Portal persistence: the Store-domain Portal mapper,
+    the bounded Portal executor/reservation
+    implementation, off-owner `CommitPortalOfLife`, the
+    exact callback expected revision, the lost-ack
+    materialized proof, normal + proven-lost-ack owner
+    completion, the definite-no-execution owner abort,
+    and bounded owner ingress redelivery. No
+    Underworld-exit penalties.
+
+    Future d2b2 binding rule (binding, frozen v0.3.54):
+    the concrete Portal reservation's successful
+    `PreparePortalOfLifeWork(capture)` MUST own, before
+    returning success: (1) one bounded Portal executor
+    queue permit, (2) the frozen/mapped Portal work, (3)
+    one reserved Character Saver critical slot from
+    d2b1. The Saver reservation MUST already hold the
+    Character's EXISTING per-key Saver gate plus the
+    generation corresponding to the owner capture before
+    d2a performs `portalEpoch++`, `portalInFlight =
+    true`, and `ActivatePortalOfLifeWork()`. Therefore
+    after Prepare success no later `WriteThrough`, no
+    later `WriteCriticalSet`, and no later
+    `ResolveReconciled` can overtake the prepared Portal
+    operation on that Character. Meanwhile
+    `Saver.MarkDirty(...)` MUST remain non-blocking and
+    allowed: every `MarkDirty` after reservation receives
+    `generation > reservedGeneration` and MUST survive
+    Portal success. This ordering applies equally to
+    normal `CommitPortalOfLife` success and proven
+    lost-ack success.
+
+    Future d2b recovery rule (binding, frozen v0.3.53,
+    refined v0.3.54): for Portal, DO NOT copy the c3c3b
+    post-error `WriteCriticalSet` returns
+    reconcile-required, then `ReconcileSaver`, then
+    `ResolveReconciled` pattern for a proven lost
+    acknowledgement. Reason: the Portal target may remain
+    gameplay-active while PG I/O runs,
+    `ResolveReconciled` discards ALL pending Saver
+    snapshots, and a newer Player snapshot may have
+    arrived during the Portal attempt. Future d2b2 MUST
+    instead use this pattern: the reserved critical
+    slot's execution operation owns the already-held
+    Character gate; the callback receives the exact
+    execution-time expected revision E;
+    `Store.CommitPortalOfLife` runs exactly once; on
+    Store success the callback succeeds normally by
+    returning revision E+1; on an ambiguous/error Store
+    result, while still INSIDE the already-reserved
+    critical callback and while the Character Saver gate
+    remains held, perform a read-only
+    `LoadDeathCharacterRecovery` into worker-local
+    values; if the materialized state PROVES this Portal
+    committed, the callback returns normal success
+    revision E+1, so the d2b1 success bookkeeping
+    advances known to E+1, clears ONLY pending snapshots
+    with `gen <= reservedGeneration`, and PRESERVES every
+    newer pending snapshot `> reservedGeneration`;
+    otherwise the callback returns error, the Saver
+    remains reconcile-blocked with no success completion
+    and NO Store replay. Future d2b2 MUST NOT call
+    `ReconcileSaver` / `ResolveReconciled` after a
+    PROVEN Portal lost-ack. Exact operational recovery
+    beyond a failed proof remains fail-closed and is not
+    part of d2b1. This rule is frozen here because it
+    materially affects the d2a attempt lifecycle; it is
+    NOT implemented in d2a.
+
+    T5c3d3 (depends on T5c3d1 + T5c3d2a + T5c3d2b1 +
+    T5c3d2b2 + T5a + T5b2b + T5c2a + T5c2b; future) owns the actual
    authoritative Underworld `LeaveHold` event, the
    current pending cost snapshot, resolved penalty
    inputs, `PlanDeathPenalties` with deterministic
@@ -11092,21 +11213,21 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
    remains in flight. No penalties are implemented
    here.
 
-   Downstream graph (binding): T5c3d3 now depends on
-   T5c3d1 + T5c3d2a + T5c3d2b + T5a + T5b2b + T5c2a +
-   T5c2b; T5c4 now depends on
-   T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b +
-   T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b +
-   T5c3d3 + the
-   existing M4 gateway/presence/fanout foundation;
-   M5-T5-complete is the TWENTY-ONE-task set T5a + T5b1a +
-   T5b1b + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a +
-   T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b +
-   T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b +
-   T5c3d3 + T5c4
-   (M5-T7 wording/task index updated accordingly).
-   After this task T5c3d1, T5c3d2a, T5c3d2b, T5c3d3, T5c4, T6, T7,
-   and the M5 exit stay `[ ]`.
+    Downstream graph (binding): T5c3d3 now depends on
+    T5c3d1 + T5c3d2a + T5c3d2b1 + T5c3d2b2 + T5a + T5b2b + T5c2a +
+    T5c2b; T5c4 now depends on
+    T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b +
+    T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b1 +
+    T5c3d2b2 + T5c3d3 + the
+    existing M4 gateway/presence/fanout foundation;
+    M5-T5-complete is the TWENTY-TWO-task set T5a + T5b1a +
+    T5b1b + T5b2a + T5b2b + T5c1 + T5c2a + T5c2b + T5c3a +
+    T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b +
+    T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b1 +
+    T5c3d2b2 + T5c3d3 + T5c4
+    (M5-T7 wording/task index updated accordingly).
+    After this task T5c3d1, T5c3d2a, T5c3d2b1, T5c3d2b2, T5c3d3, T5c4, T6, T7,
+    and the M5 exit stay `[ ]`.
 
   #### 9.5.2 Death disposition: avoided vs cheap vs normal (frozen)
 
