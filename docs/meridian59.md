@@ -787,13 +787,24 @@ PENALTY); `newCost = cost − (spellPower − timeAdj)`; final
 death-dependent; the portal is the Underworld EXIT route that triggers
 `LeaveHold` → penalties.
 
-**Justice side effects:** outlaw + haunted cleared only at full cost;
+**Justice side effects:** Outlaw is cleared on the full-cost branch.
+Haunted is cleared on Frenzy/Chaos before the early return, or on the
+full-cost branch (cheap non-frenzy deaths clear neither).
 `EvaluatePKStatus` re-runs (murderer flag recompute, may SET
 `PFLAG_TUTORIAL`/`PFLAG_PKILL_ENABLE`); guild auto-quit below 30 base HP;
 guardian-angel mail is newbie-only (see vitals above — the "half mana"
 gift rides the same still-newbie/non-murderer gate, mana-only, no mail
 system in MVP). `SYS.UserKilled` (kill broadcast/news/webhooks) is
 presentation only.
+
+Verified durable flag values (pinned source
+`Meridian59/Meridian59@095c07b69e957fb5c49593e6ad488b4c64ba088d`,
+`kod/include/blakston.khd`): `PFLAG_MURDERER = 0x000002`,
+`PFLAG_OUTLAW = 0x000008`, `PFLAG_HAUNTED = 0x000100`,
+`PFLAG_PKILL_ENABLE = 0x000400`, `PFLAG_TUTORIAL = 0x000800`.
+There is NO separate durable `PFLAG_REVENANT`: the source comment
+"revenants" in `ApplyDeathPenalties` refers to clearing
+`PFLAG_HAUNTED`.
 
 - Unsafe logoff leaves ghost 10 min (`LogoffPenaltyGhostTime=600 s`); return
   in time = no penalty, else escalating (mail → best stack → best item →

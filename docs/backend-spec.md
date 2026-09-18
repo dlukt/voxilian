@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.56 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.57 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -7989,7 +7989,8 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
   T5c3d2b1+T5c3d2b2, frozen v0.3.54 in §9.5.1k, and the
    d2b2 Portal persistence execution contract is frozen
    v0.3.55 in §9.5.1k, and T5c3d3 is further split into
-   T5c3d3a+T5c3d3b, frozen v0.3.56 in §9.5.1k):
+   T5c3d3a+T5c3d3b, frozen v0.3.56 in §9.5.1k, and the d3a
+   retry/health correction is frozen v0.3.57 in §9.5.1k):
 
 - **T5a — pure/source-faithful death mechanics and immutable plans**
   (§9.5.4–§9.5.14 pure surface; §9.5.17 non-scope).
@@ -8296,15 +8297,18 @@ Source basis: `player.kod` `Killed`/`ApplyDeathPenalties`/`GetDeathCost`/
     `DeathPenaltyWorkProvider` / `DeathPenaltyWorkReservation`
     interfaces with Reserve-before-RNG ordering
     (infrastructure capacity failure consumes zero
-    RNG and mutates nothing), Prepare-while-Alive
-    then epoch++/attempt-install/life-lock then
-    Activate in the same owner turn, lock-on-activation-failure
+    RNG and mutates nothing), epoch++/attempt-install/
+    life-lock BEFORE Prepare then Activate in the same
+    owner turn (frozen v0.3.57; supersedes
+    Prepare-while-Alive), lock-on-Prepare/Activate-failure
     (no unlock, no reroll), exact-plan retry without
     consuming RNG again, the definitive pre-Store
     retryable owner notification (`Applied` vs
     idempotent `Duplicate`), the typed same-mailbox
     completion/retryable ingress, and the owner-only
-    final apply + pending clear. `internal/sim` only:
+    final apply (exact Vitals+Durable install plus
+    owner-local `reconcileHealth`, then pending clear;
+    frozen v0.3.57). `internal/sim` only:
     no Store, no PG, no Saver implementation, no queue/worker,
     no `CommitDeathPenalties`, no recovery, no
     lost-ack proof, no gateway/proto/session. Depends
@@ -10846,7 +10850,7 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
    migration, generated code, gateway/proto/session,
    `PlayerLoseHealth` automatic dispatch.
 
-    #### 9.5.1k M5 pending-death owner lifecycle split (T5c3d1+T5c3d2a+T5c3d2b1+T5c3d2b2+T5c3d3a+T5c3d3b, frozen v0.3.52/v0.3.53/v0.3.54/v0.3.55/v0.3.56)
+    #### 9.5.1k M5 pending-death owner lifecycle split (T5c3d1+T5c3d2a+T5c3d2b1+T5c3d2b2+T5c3d3a+T5c3d3b, frozen v0.3.52/v0.3.53/v0.3.54/v0.3.55/v0.3.56/v0.3.57)
 
     The former single T5c3d combined three separate
     correctness boundaries — authoritative pending-death
@@ -10868,9 +10872,16 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
     execution contract only), and T5c3d3 is further
     split into T5c3d3a+T5c3d3b (v0.3.56; this paragraph
     supersedes the T5c3d3 paragraph of §9.5.1 for the
-    split only; no task is split again).
-    `meridian59.md` is untouched: this task
-    changes no Meridian mechanics.
+    split only; no task is split again; that split
+    changed no Meridian mechanics and left
+    `meridian59.md` untouched). v0.3.57 corrects
+    the d3a first-attempt order and completion health
+    semantics below (this paragraph supersedes the d3a
+    order/completion sentences of §9.5.1k for the
+    correction only; no split, still TWENTY-THREE
+    tasks; the companion `meridian59.md` Justice-summary
+    correction documents already-frozen source behavior
+    and changes no mechanics).
 
    A more important existing gap makes d1 a prerequisite:
    `store.CommitDeathEntry` generates the CorpseID inside
@@ -11496,29 +11507,47 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
     (`Prepare`/`Activate`/`Cancel`, no
     Store/persist/revision/result-channel types)
     interfaces, the canonical first-attempt order
-    (structural validation with zero mutation and
-    zero RNG; provider Reserve in the same owner
-    turn with reservation failure consuming zero RNG
-    and mutating nothing; exactly one
-    `PlanDeathPenalties`; deep-frozen
+    (frozen v0.3.57; the v0.3.56 Prepare-while-Alive
+    order is superseded because it lets a post-RNG
+    Prepare failure return to `Alive` for a reroll,
+    violating the no-reroll invariant frozen below):
+    1. structural validation with zero mutation and
+    zero RNG; 2. provider Reserve in the same owner
+    turn, synchronously/non-blockingly owning the
+    queue permit + Saver critical slot, with
+    reservation failure consuming zero RNG and
+    mutating nothing (life stays `Alive`, pending
+    unchanged, no epoch consumed); 3. exactly one
+    `PlanDeathPenalties` using the owner RNG; 4.
+    build/deep-freeze the complete exact
     `DeathPenaltyCapture` with complete POST-penalty
     vitals/durable, PRE-consumption `PendingBefore`,
     position, token, and plan — future Store mapping
     MUST use `PendingBefore.EffectiveCost` as
     `ExpectedPendingCost`, NEVER `Plan.ScaledCost`;
-    `PrepareDeathPenaltyWork` while life is still
-    `Alive`; ONLY then `penaltyEpoch++`, private
-    attempt install, life lock, and
-    `ActivateDeathPenaltyWork` in the same owner
-    turn), lock-on-activation-failure (definitive
-    pre-publication Activate error KEEPS life locked,
-    the exact frozen capture, and the consumed epoch
-    with `persistenceActive == false` — no unlock, no
-    reroll; deliberately different from Portal),
-    Prepare-failure-Alive return (capacity admission
-    already happened in Reserve, so a Prepare failure
-    is a contract/invariant problem: Cancel, no owner
-    mutation, no automatic retry/reroll), exact-plan
+    5. consume `penaltyEpoch`, install the private
+    frozen attempt, and transition life to
+    `PlayerLifeDeathPenaltyPersisting` BEFORE any
+    remaining fallible Prepare/Activate operation;
+    6. `PrepareDeathPenaltyWork` with the exact frozen
+    capture; 7. `ActivateDeathPenaltyWork` in the
+    same owner turn. Prepare is no longer "Prepare
+    while Alive". Once the first death-penalty RNG
+    draw has occurred for an accepted LeaveHold
+    event, NO subsequent fallible persistence
+    preparation or publication failure may return
+    the player to an ordinary Alive state from which
+    the event can be replanned/rerolled.), lock-on-
+    Prepare/Activate-failure (a Prepare or Activate
+    error after the attempt was installed
+    Cancels/releases whatever reservation ownership
+    is still appropriate, with NO Store call when
+    pre-publication, and KEEPS life locked
+    (`PlayerLifeDeathPenaltyPersisting`), the exact
+    frozen capture/plan, the consumed epoch, pending
+    unchanged, and `persistenceActive == false` — no
+    unlock, no reroll; deliberately different from
+    Portal), exact-plan
     retry without RNG (`PlayerRetryDeathPenaltyPersistence`
     reuses the exact frozen capture, never calls the
     planner, never reads RNG, never increments the
@@ -11531,13 +11560,29 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
     (existing 256-command mailbox, no second mailbox,
     no closures, result channels buffered capacity
     1), and the token-only success completion
-    (`PlayerAcceptDeathPenaltyCompletion` installs
-    EXACTLY the stored capture — vitals, durable,
-    `pendingDeath = nil`, attempt cleared, life ->
+    (`PlayerAcceptDeathPenaltyCompletion`, frozen
+    v0.3.57: install the exact stored post-penalty
+    Vitals, install the exact stored post-penalty
+    Durable state, run the existing owner-local
+    `reconcileHealth` at the current tick, then clear
+    pending/the private attempt and return life to
     `Alive` — preserving position, identities,
-    epochs, `lastDeathSeconds`, runtime
-    inputs/deadline slots, and history, with no RNG
-    and no `PlayerVitalsObserver` replay;
+    epochs, `lastDeathSeconds`, runtime inputs,
+    mana/rest deadline slots bit-identically, and
+    history, with no RNG, no `commitVitals`, no
+    `PlayerVitalsObserver` event, no mana
+    reconciliation, no rest reconciliation, no
+    runtime-input replacement, no stomach re-anchor,
+    and no movement reset. The frozen
+    `reconcileHealth` rule is binding (health slot
+    absent: `HP != MaxHP && HP > 0` arms from the
+    current tick, otherwise stays absent; health slot
+    present: `HP == MaxHP` cancels, otherwise KEEPS
+    the exact existing due), so a MaxHP loss can
+    legitimately arm/cancel/persist the health slot
+    while mana/rest stay bit-identical; a plan with
+    no MaxHP change MUST NOT spuriously restart an
+    existing health deadline;
     post-success same-token is a zero-mutation
     `Duplicate` unless a NEW pending death exists;
     mismatch/ABA follow the existing
@@ -12636,6 +12681,40 @@ impossible plans).
    survives it.
 
 ## 14. Version history
+
+- v0.3.57: correct M5-T5c3d3a death-penalty retry and health semantics
+  (docs only; no schema/query/code change). Freeze the anti-reroll
+  rule in §9.5.1k: once the first death-penalty RNG draw has occurred
+  for an accepted LeaveHold event, NO subsequent fallible persistence
+  preparation or publication failure may return the player to an
+  ordinary Alive state from which the event can be replanned/rerolled.
+  Correct the canonical first-attempt order to structural validation,
+  Reserve (synchronously/non-blockingly owning the queue permit +
+  Saver critical slot; failure means zero RNG, Alive, pending
+  unchanged, no epoch consumed), exactly one `PlanDeathPenalties`,
+  build/deep-freeze the exact capture, consume `penaltyEpoch` +
+  install the private attempt + lock to
+  `PlayerLifeDeathPenaltyPersisting` BEFORE any remaining fallible
+  Prepare/Activate, then Prepare, then Activate (superseding the
+  v0.3.56 Prepare-while-Alive / Prepare-failure-Alive order); a
+  Prepare or Activate failure after install keeps the lock, epoch,
+  exact capture/plan, and pending with `persistenceActive == false`,
+  and `PlayerRetryDeathPenaltyPersistence` reuses that exact
+  capture/token/plan with zero RNG. Freeze completion health
+  semantics: install the exact stored Vitals + Durable, run the
+  existing owner-local `reconcileHealth` at the current tick, then
+  clear pending/attempt and return Alive (no `commitVitals`, no
+  observer event, no mana/rest reconciliation; mana/rest slots stay
+  bit-identical; a MaxHP loss may arm/cancel/persist the health slot
+  per the frozen `reconcileHealth` rule). Correct `meridian59.md`
+  Justice wording identically (Outlaw cleared on the full-cost
+  branch; Haunted on Frenzy/Chaos or the full-cost branch) with the
+  frozen flag values. No split, still TWENTY-THREE tasks; the d3b
+  recovery contract is unchanged. Checkbox state unchanged:
+  T5a/T5b1a/T5b1b/T5b2a/T5b2b/T5c1/T5c2a/T5c2b/T5c3a/T5c3b/
+  T5c3c1/T5c3c2/T5c3c3a/T5c3c3b/T5c3c3c1/T5c3c3c2/T5c3d1/
+  T5c3d2a/T5c3d2b1/T5c3d2b2/T5c3d3a `[x]`,
+  T5c3d3b/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v0.3.49: freeze M5 proven death persistence recovery
   (docs only; no schema/query/code change). Freeze the c3c3b

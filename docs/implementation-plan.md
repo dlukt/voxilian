@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.40)
+# Voxilian Backend — Implementation Plan (v1.41)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.56).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.57).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -528,13 +528,16 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   life state, frozen retryable `DeathPenaltyCapture`
   (post-penalty state + pre-consumption
   `PendingBefore`), penalty attempt token/epoch,
-  Store-independent provider/reservation interfaces
-  with Reserve-before-RNG ordering, Prepare-while-Alive
-  then epoch++/attempt/life-lock then Activate,
-  lock-on-activation-failure, exact-plan retry without
-  RNG, definitive pre-Store retryable notification,
-  typed same-mailbox completion/retryable ingress,
-  owner-only final apply + pending clear, Portal /
+   Store-independent provider/reservation interfaces
+   with Reserve-before-RNG ordering, epoch++/attempt/
+   life-lock BEFORE Prepare then Activate (corrected
+   v1.41; supersedes Prepare-while-Alive),
+   lock-on-Prepare/Activate-failure, exact-plan retry without
+   RNG, definitive pre-Store retryable notification,
+   typed same-mailbox completion/retryable ingress,
+   owner-only final apply (exact Vitals+Durable install
+   plus owner-local `reconcileHealth`, then pending clear;
+   corrected v1.41), Portal /
   hydration / respawn-release serialization, `Step`
   quiesce. No Store, no PG, no Saver implementation,
   no queue/worker, no `CommitDeathPenalties`, no
@@ -739,6 +742,37 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.41: correct M5-T5c3d3a penalty retry and health semantics (docs
+  only, spec v0.3.56 -> v0.3.57 extends §9.5.1k; no split, M5-T5 stays
+  TWENTY-THREE tasks): freeze the anti-reroll rule (no post-RNG
+  fallible preparation/publication failure returns the player to an
+  ordinary Alive state for replanning/reroll), correct the canonical
+  first-attempt order to validate / Reserve (queue permit + Saver
+  critical slot before RNG) / exactly one `PlanDeathPenalties` /
+  freeze the exact capture / consume epoch + install the private
+  attempt + lock to `PlayerLifeDeathPenaltyPersisting` BEFORE
+  Prepare / Activate (superseding Prepare-while-Alive;
+  Prepare-failure-Alive removed), Prepare/Activate failure after
+  install keeps the lock/epoch/exact capture/plan/pending with
+  `persistenceActive == false`, retry reuses the exact
+  capture/token/plan with zero RNG, and freeze completion health
+  semantics (install exact stored Vitals + Durable, run the existing
+  owner-local `reconcileHealth` at the current tick, then clear
+  pending/attempt to Alive; no `commitVitals`, no observer event, no
+  mana/rest reconciliation; mana/rest slots bit-identical). Correct
+  `meridian59.md` Justice summary + frozen flag values
+  (`PFLAG_MURDERER 0x000002`, `PFLAG_OUTLAW 0x000008`,
+  `PFLAG_HAUNTED 0x000100`, `PFLAG_PKILL_ENABLE 0x000400`,
+  `PFLAG_TUTORIAL 0x000800`; no durable `PFLAG_REVENANT`;
+  "revenants" = clearing `PFLAG_HAUNTED`; Outlaw cleared on the
+  full-cost branch, Haunted on Frenzy/Chaos or the full-cost
+  branch). d3b recovery contract unchanged; T5c4 ownership unchanged.
+  Checkbox state unchanged: T5a/T5b1a/T5b1b/T5b2a/T5b2b/
+  T5c1/T5c2a/T5c2b/T5c3a/T5c3b/T5c3c1/T5c3c2/T5c3c3a/
+  T5c3c3b/T5c3c3c1/T5c3c3c2/T5c3d1/T5c3d2a/T5c3d2b1/
+  T5c3d2b2/T5c3d3a `[x]`,
+  T5c3d3b/T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v1.40: split M5-T5c3d3 into owner-first T5c3d3a +
   persistence-later T5c3d3b (docs only, spec
