@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.58 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.59 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -11985,6 +11985,159 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
     Store transaction change, no death-persistence
     rewrite, no new protocol, no `meridian59.md` change.
 
+    #### 9.5.1m M5-T5c4 reconnect bootstrap completeness correction (frozen v0.3.59)
+
+    This section corrects the v0.3.58 T5c4 reconnect
+    materialization found defective on independent review:
+    the frozen v0.3.58 adapter mapped character/spells/
+    skills/pending but installed `Durable.Items == nil`
+    for characters that own inventory in PostgreSQL (with
+    no later hydration step before entity exposure), and
+    reconstructed `PlayerVitalsRuntimeInputs` from
+    hard-coded `EffectiveStamina = 10` /
+    `EffectiveMysticism = 10` instead of the character's
+    actual durable base stats. Both behaviors violate the
+    L10 authoritative-state contract: a reconnect followed
+    by an immediate-death capture would silently change
+    death/drop behavior and persistence content. This
+    section supersedes the L10/L11 materialization
+    sentences only; every transport sentence of §9.5.1l
+    (L1–L9, L12–L16), every §9.5.1–§9.5.1k Store
+    transaction/Saver/sim-lifecycle sentence, and the
+    sixteen-boundary enumeration stay frozen. No task is
+    split, M5-T5 stays TWENTY-THREE tasks.
+
+    C1. Complete reconnect bootstrap (binding). A
+    successful reconnect bootstrap installs a COMPLETE
+    authoritative `CharacterID`, authoritative persisted
+    position, `PlayerVitals`,
+    `PlayerVitalsRuntimeInputs`, `PlayerDurableState`,
+    and the authoritative `PendingDeathRuntime` when
+    present. For `PlayerDurableState`, COMPLETE means all
+    fields required by the §9.5.1g live/death-capture
+    contract, including the exact authoritative inventory
+    item set per C2. It is forbidden for a reconnect
+    loader to translate "durable inventory exists in PG"
+    into `Durable.Items == nil` / empty merely because
+    item aggregates use separate Store roots. The atomic
+    L12 rule is unchanged: vitals, runtime inputs,
+    complete durable shadow, and pending install together
+    in one owner turn with no observable add-player-then-
+    hydrate-inventory window.
+
+    C2. Inventory membership (binding). `Durable.Items`
+    is exactly the directly character-owned carried
+    inventory: every `item_locations` row with `kind = 0`
+    AND `character_id` equal to the reconnect character,
+    in ascending `item_instances.id` order. Each element
+    maps the exact authoritative root content plus its
+    location slot: `ID` (item id), `ProtoID` (immutable
+    item root proto), `Qty`, `Hits`, `Enchants`,
+    `Slot` (location slot label). Excluded: `kind = 1`
+    ground, `kind = 2` corpse, `kind = 3` vault, and
+    `kind = 4` container-contained items. Those locations
+    are unrepresentable in the frozen
+    `PlayerInventoryItemState` shape (no
+    `ContainerItemID` / `CorpseID` / vault / position
+    fields) and they are not carried inventory: the
+    accepted death capture/drop code resolves carried
+    items by capture index against `Durable.Items` in its
+    exact authoritative order. The ascending-`ItemID`
+    enumeration order mirrors the §9.5.1b deterministic
+    recovery order; downstream code MUST NOT re-sort —
+    caller-owned order is authoritative.
+
+    C3. Bootstrap recovery read (binding). The v0.3.58
+    `LoadDeathCharacterRecovery` snapshot (character
+    root, spells, skills, optional pending death) cannot
+    by itself produce a complete `PlayerDurableState`
+    and is NOT widened: it stays the frozen
+    death-reconciliation shape. T5c4 instead freezes one
+    dedicated read-only Store loader, conceptually
+    `LoadPlayerBootstrapRecovery(...)`, returning a
+    T5c4-specific Store-domain recovery value containing
+    only what the bootstrap requires: the character root
+    fields the adapter maps (position, vitals, karma,
+    advancement, flags, durable base `stamina` and
+    `mysticism`), spells, skills, the optional
+    `pending_deaths` row, and exactly the C2 inventory
+    item roots + locations. The complete read observes
+    one coherent materialized PG snapshot: ONE
+    `REPEATABLE READ` / `READ ONLY` transaction covering
+    all of the above (the existing recovery-transaction
+    shape). No writes. No Saver operation. No gameplay.
+    No RNG. No Portal or penalty calculation. A
+    soft-deleted character is rejected (never
+    resurrected). Every error returns the zero value: a
+    fresh entity is never built from partial recovery.
+
+    C4. Query audit and authorization (binding). The
+    audit found no existing sqlc query that enumerates
+    the C2 inventory shape: `items_corpses_banks.sql`
+    carries only per-ID reads (`GetItemInstanceByID`,
+    `GetItemLocationByItemID`), inserts, and the
+    location upsert. This section therefore authorizes
+    exactly one minimal read-only sqlc query,
+    conceptually `ListCharacterInventoryItems`, returning
+    `(id, proto, qty, hits, enchants, slot)` for the
+    `kind = 0` rows of one character in ascending item-id
+    order (join of `item_instances` to `item_locations`).
+    No migration is necessary (existing primary key plus
+    `item_locations_character_corpse_idx` cover the
+    read). No write query. No generic item-query API
+    beyond the reconnect requirement. This supersedes
+    the L11 "no query, no generated-code change" sentence
+    for exactly this one read-only query; the "no
+    migration" sentence stands.
+
+    C5. Runtime-input recovery (binding). Fresh reconnect
+    resolves `PlayerVitalsRuntimeInputs` from the
+    character's actual durable base stats under the
+    frozen §9.4b.14a composition
+    `effective = bound(base + mod, 1, 70)`. The
+    repository audit found no implemented stat-modifier,
+    song, or content resolution system feeding this
+    seam, so the currently implemented modifier is
+    exactly neutral (`mod = 0`): `EffectiveStamina =
+    bound(durable base stamina, 1, 70)` and
+    `EffectiveMysticism = bound(durable base mysticism,
+    1, 70)`. Durable base stats validate `1..50` at
+    creation, hence already inside the `1..70`
+    effective domain; the bound is still applied, never
+    a fixed value. Hard-coded `10` / `10` (or any
+    equivalent magic constant) is forbidden: a neutral
+    modifier MUST NOT replace the character's actual
+    base stat. All four power seams (`RestoratePower`,
+    `RejuvenatePower`, `ManaFocusPower`,
+    `InvigoratePower`) resolve to `0` (absent: no
+    active-buff system exists, and none is invented)
+    and `RestRecoveryMultiplier` resolves to `1`
+    (ordinary: no room policy is invented). A later
+    content-owning task supersedes this neutral
+    composition without changing the seam shape.
+
+    C6. Preserved transport rules (binding). No redesign
+    of the 214 boundary, the 215 boundary, 214/215
+    critical FIFO, recipient-local `NetEntityID`
+    handling, post-death AOI relocation, 120 correlation,
+    `120 != LeaveHold`, typed respawn-release ingress,
+    fresh-reconnect-life `Alive`, old token/ack state not
+    recovered, or `TryCritical` fail-closed semantics.
+    Phase B is a narrow reconnect-materialization
+    correction only.
+
+    T5c4 corrected production scope (binding):
+    `backend/voxilian/internal/store` (the one C4
+    read-only query + the C3 loader, no migration, no
+    writes) + `backend/voxilian/internal/persist` (the
+    L11 adapter remapped onto the C3 snapshot with C2
+    items and C5 runtime inputs) + tests proving the
+    `PG inventory -> reconnect -> live
+    PlayerDurableState.Items -> subsequent death
+    capture` chain lossless. No Portal recalculation, no
+    penalty RNG/replanning, no new protocol, no
+    `meridian59.md` change.
+
   #### 9.5.2 Death disposition: avoided vs cheap vs normal (frozen)
 
 Three dispositions, semantically distinct:
@@ -12997,6 +13150,33 @@ impossible plans).
    survives it.
 
 ## 14. Version history
+
+- v0.3.59: correct M5-T5c4 reconnect bootstrap completeness
+  (docs only; no schema/query/code change). New §9.5.1m
+  supersedes the v0.3.58 L10/L11 materialization
+  sentences after independent review found two blocking
+  defects: reconnect installed `Durable.Items == nil`
+  despite PG-owned inventory (no later hydration step),
+  and reconstructed runtime inputs from hard-coded
+  `10`/`10` instead of the durable base stats. Frozen
+  corrections: complete bootstrap installs
+  `CharacterID`/position/`PlayerVitals`/runtime inputs/
+  full `PlayerDurableState` incl. the exact authoritative
+  inventory item set/atomically-hydrated optional
+  pending; inventory membership is exactly directly
+  character-owned `kind = 0` rows in ascending item-id
+  order (ground/corpse/vault/contained excluded as
+  unrepresentable and not carried); dedicated read-only
+  `LoadPlayerBootstrapRecovery` in ONE `REPEATABLE READ`
+  / `READ ONLY` transaction (`LoadDeathCharacterRecovery`
+  NOT widened); exactly one minimal read-only
+  `ListCharacterInventoryItems` query authorized, no
+  migration; `effective = bound(base + 0, 1, 70)` from
+  the real durable base stats, powers `0`, multiplier
+  `1`, no magic constants. All sixteen §9.5.1l transport
+  boundaries preserved. No split, still TWENTY-THREE
+  tasks; meridian59.md untouched. Checkbox state
+  reverted: T5c4 `[ ]` (T6/T7 and M5 exit `[ ]`).
 
 - v0.3.58: freeze M5-T5c4 death wire/state integration +
   reconnect contract (docs only; no schema/query/code

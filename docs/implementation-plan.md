@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.42)
+# Voxilian Backend — Implementation Plan (v1.43)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.58).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.59).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -563,7 +563,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   fail-closed, pre-Store-only retryable notification,
   owner success completion/redelivery. No gateway.
   Spec: §9.5.1, §9.5.1k.
-- [x] **M5-T5c4** Gateway death wire/state integration + reconnect E2E
+- [ ] **M5-T5c4** Gateway death wire/state integration + reconnect E2E
   (depends on T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b1 + T5c3d2b2 + T5c3d3a + T5c3d3b + the existing M4
   gateway/presence/fanout foundation): gateway/state-machine routing, rate-gated C→S 120
   handling, critical S→C 214 / 215 delivery,
@@ -575,7 +575,19 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   typed release + atomic recovery ingress, error/disconnect/
   takeover semantics, `Alive` reconnect bootstrap with atomic
   pending hydration, narrow persist bootstrap adapter,
-  `TryCritical` fail-closed; 120 != LeaveHold; proto unchanged).
+  `TryCritical` fail-closed; 120 != LeaveHold; proto unchanged)
+  as corrected by §9.5.1m (frozen v0.3.59 reconnect bootstrap
+  completeness: COMPLETE authoritative bootstrap incl. exact
+  `Durable.Items` for directly character-owned `kind = 0`
+  inventory in ascending item-id order; dedicated read-only
+  `LoadPlayerBootstrapRecovery` in one `REPEATABLE READ` /
+  `READ ONLY` transaction; exactly one minimal read-only
+  `ListCharacterInventoryItems` query, no migration;
+  `effective = bound(base + 0, 1, 70)` from the real durable
+  base stats, powers `0`, multiplier `1`, no magic constants;
+  all transport rules preserved). Reverted to `[ ]` by v1.43:
+  T5c4 must not be marked complete while the reconnect
+  implementation violates its own authoritative-state contract.
 - [ ] **M5-T6** Personal/world-light intents: `115 rest`, `116 eat` (hunger/vigor effects), `105 use` (skill/item dispatch incl. Second Wind), `119 safety_toggle`, `117/118 → 209` chat (+channel rules, length caps, rate limits). Owner of these opcodes: this task, no other. Spec: §6.3, §9.
 - [ ] **M5-T7** Authoritative attack/cast runtime integration (depends on
   M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a,   M5-T4b1, M5-T4b2,
@@ -748,6 +760,33 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.43: correct M5-T5c4 reconnect bootstrap completeness
+  (docs only, spec v0.3.58 -> v0.3.59 new §9.5.1m; no
+  split, M5-T5 stays TWENTY-THREE tasks): the v0.3.58
+  adapter mapped character/spells/skills/pending but
+  installed `Durable.Items == nil` despite PG-owned
+  inventory (no later hydration step), and resolved
+  runtime inputs from hard-coded `10`/`10` instead of
+  the durable base stats. Frozen corrections: COMPLETE
+  authoritative bootstrap incl. the exact authoritative
+  inventory item set; inventory membership is exactly
+  directly character-owned `kind = 0` rows in ascending
+  item-id order (ground/corpse/vault/contained excluded);
+  dedicated read-only `LoadPlayerBootstrapRecovery` in
+  ONE `REPEATABLE READ` / `READ ONLY` transaction
+  (`LoadDeathCharacterRecovery` NOT widened); exactly
+  one minimal read-only `ListCharacterInventoryItems`
+  query authorized, no migration; `effective =
+  bound(base + 0, 1, 70)` from the real durable base
+  stats, powers `0`, multiplier `1`, no magic constants;
+  all sixteen §9.5.1l transport boundaries preserved.
+  T5c4 row spec pointer gains §9.5.1m; T5c4 reverted
+  `[x]` -> `[ ]`. Checkbox state otherwise unchanged:
+  T5a/T5b1a/T5b1b/T5b2a/T5b2b/T5c1/T5c2a/T5c2b/T5c3a/
+  T5c3b/T5c3c1/T5c3c2/T5c3c3a/T5c3c3b/T5c3c3c1/T5c3c3c2/
+  T5c3d1/T5c3d2a/T5c3d2b1/T5c3d2b2/T5c3d3a/T5c3d3b `[x]`,
+  T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v1.42: freeze M5-T5c4 death wire/state integration +
   reconnect contract (docs only, spec v0.3.57 -> v0.3.58
