@@ -563,7 +563,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   fail-closed, pre-Store-only retryable notification,
   owner success completion/redelivery. No gateway.
   Spec: §9.5.1, §9.5.1k.
-- [ ] **M5-T5c4** Gateway death wire/state integration + reconnect E2E
+- [x] **M5-T5c4** Gateway death wire/state integration + reconnect E2E
   (depends on T5c3a + T5c3b + T5c3c1 + T5c3c2 + T5c3c3a + T5c3c3b + T5c3c3c1 + T5c3c3c2 + T5c3d1 + T5c3d2a + T5c3d2b1 + T5c3d2b2 + T5c3d3a + T5c3d3b + the existing M4
   gateway/presence/fanout foundation): gateway/state-machine routing, rate-gated C→S 120
   handling, critical S→C 214 / 215 delivery,

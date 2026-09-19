@@ -259,6 +259,58 @@ func (q *Queries) ListBanksByCharacter(ctx context.Context, characterID int64) (
 	return items, nil
 }
 
+const listCharacterInventoryItems = `-- name: ListCharacterInventoryItems :many
+SELECT ii.id, ii.proto, ii.qty, ii.hits, ii.enchants, il.slot
+FROM item_instances AS ii
+JOIN item_locations AS il ON il.item_id = ii.id
+WHERE il.kind = 0 AND il.character_id = $1
+ORDER BY ii.id
+`
+
+type ListCharacterInventoryItemsRow struct {
+	ID       int64       `json:"id"`
+	Proto    int32       `json:"proto"`
+	Qty      int32       `json:"qty"`
+	Hits     int32       `json:"hits"`
+	Enchants []byte      `json:"enchants"`
+	Slot     pgtype.Text `json:"slot"`
+}
+
+// M5-T5c4 (spec §9.5.1m C4): the ONE minimal read-only
+// reconnect enumeration. Directly character-owned carried
+// inventory only (kind = 0 for this character); ground,
+// corpse, vault, and container-contained rows are never
+// carried inventory and are unrepresentable in the frozen
+// sim-domain shadow shape. Ascending item-id order is the
+// authoritative enumeration order (never re-sorted
+// downstream).
+func (q *Queries) ListCharacterInventoryItems(ctx context.Context, characterID pgtype.Int8) ([]ListCharacterInventoryItemsRow, error) {
+	rows, err := q.db.Query(ctx, listCharacterInventoryItems, characterID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListCharacterInventoryItemsRow
+	for rows.Next() {
+		var i ListCharacterInventoryItemsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Proto,
+			&i.Qty,
+			&i.Hits,
+			&i.Enchants,
+			&i.Slot,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listExpiredCorpses = `-- name: ListExpiredCorpses :many
 SELECT id, character_id, pos_x, pos_y, pos_z, created_at, expires_at
 FROM corpses

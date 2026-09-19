@@ -11,18 +11,19 @@ import (
 )
 
 // M5-T5c4 reconnect bootstrap adapter tests (spec
-// §9.5.1l L11): Store recovery -> sim-domain bootstrap
-// mapping over a fake loader (real PG coverage lives in
-// death_bootstrap_pg_test.go). No PG, no Store writes.
+// §9.5.1m C1/C2/C5): Store recovery -> sim-domain
+// bootstrap mapping over a fake loader (real PG coverage
+// lives in death_bootstrap_pg_test.go). No PG, no Store
+// writes.
 
 type fakeBootstrapStore struct {
-	snap store.DeathCharacterRecoverySnapshot
+	snap store.PlayerBootstrapRecoverySnapshot
 	err  error
 }
 
-func (f *fakeBootstrapStore) LoadDeathCharacterRecovery(context.Context, int64) (store.DeathCharacterRecoverySnapshot, error) {
+func (f *fakeBootstrapStore) LoadPlayerBootstrapRecovery(context.Context, int64) (store.PlayerBootstrapRecoverySnapshot, error) {
 	if f.err != nil {
-		return store.DeathCharacterRecoverySnapshot{}, f.err
+		return store.PlayerBootstrapRecoverySnapshot{}, f.err
 	}
 	return f.snap, nil
 }
@@ -44,16 +45,23 @@ func bootstrapVitalsJSON(t *testing.T) json.RawMessage {
 	return raw
 }
 
-func bootstrapRecovery() store.DeathCharacterRecoverySnapshot {
+func bootstrapRecovery() store.PlayerBootstrapRecoverySnapshot {
 	corpse := int64(77)
-	return store.DeathCharacterRecoverySnapshot{
-		Character: store.CharacterSnapshot{
-			ID: 7, ExpectedRevision: 4, Karma: 11,
-			PosX: 400500, PosY: -1000, PosZ: -300250,
-			Advancement: json.RawMessage(`{"pts":3}`),
-			Flags:       5,
-			Spells:      []store.CharacterSpellSnapshot{{SpellID: 1, Ability: 50, AtrophyFlag: true}},
-			Skills:      []store.CharacterSkillSnapshot{{SkillID: 2, Ability: 20}},
+	return store.PlayerBootstrapRecoverySnapshot{
+		CharacterID: 7, ExpectedRevision: 4,
+		// Deliberately NOT 10/10: the adapter must derive
+		// runtime inputs from the real durable base stats.
+		Stamina:   7,
+		Mysticism: 42,
+		Karma:     11,
+		PosX:      400500, PosY: -1000, PosZ: -300250,
+		Advancement: json.RawMessage(`{"pts":3}`),
+		Flags:       5,
+		Spells:      []store.CharacterSpellSnapshot{{SpellID: 1, Ability: 50, AtrophyFlag: true}},
+		Skills:      []store.CharacterSkillSnapshot{{SkillID: 2, Ability: 20}},
+		Items: []store.PlayerBootstrapItemSnapshot{
+			{ID: 101, ProtoID: 1001, Qty: 3, Hits: 250, Enchants: json.RawMessage(`{"glow":1}`), Slot: "hand"},
+			{ID: 202, ProtoID: 1002, Qty: 500, Hits: 0, Enchants: json.RawMessage(`{}`), Slot: "pack"},
 		},
 		Pending: &store.PendingDeathSnapshot{
 			CharacterID: 7, EffectiveCost: 40, DeathTimeSeconds: 1700000000,
@@ -63,9 +71,9 @@ func bootstrapRecovery() store.DeathCharacterRecoverySnapshot {
 }
 
 func TestLoadPlayerBootstrap(t *testing.T) {
-	withVitals := func(snap store.DeathCharacterRecoverySnapshot, t *testing.T) store.DeathCharacterRecoverySnapshot {
+	withVitals := func(snap store.PlayerBootstrapRecoverySnapshot, t *testing.T) store.PlayerBootstrapRecoverySnapshot {
 		t.Helper()
-		snap.Character.Vitals = bootstrapVitalsJSON(t)
+		snap.Vitals = bootstrapVitalsJSON(t)
 		return snap
 	}
 
@@ -84,6 +92,22 @@ func TestLoadPlayerBootstrap(t *testing.T) {
 		if boot.Vitals.HP != 20 || boot.Vitals.Vigor != 100 {
 			t.Fatalf("vitals = %+v", boot.Vitals)
 		}
+		// §9.5.1m C5: runtime inputs derive from the real
+		// durable base stats (7/42), never magic 10/10;
+		// powers absent, ordinary room multiplier.
+		if boot.RuntimeInputs.EffectiveStamina != 7 {
+			t.Fatalf("EffectiveStamina = %d; want 7 (durable base stamina)", boot.RuntimeInputs.EffectiveStamina)
+		}
+		if boot.RuntimeInputs.EffectiveMysticism != 42 {
+			t.Fatalf("EffectiveMysticism = %d; want 42 (durable base mysticism)", boot.RuntimeInputs.EffectiveMysticism)
+		}
+		if boot.RuntimeInputs.RestoratePower != 0 || boot.RuntimeInputs.RejuvenatePower != 0 ||
+			boot.RuntimeInputs.ManaFocusPower != 0 || boot.RuntimeInputs.InvigoratePower != 0 {
+			t.Fatalf("powers = %+v; want all absent (0)", boot.RuntimeInputs)
+		}
+		if boot.RuntimeInputs.RestRecoveryMultiplier != 1 {
+			t.Fatalf("multiplier = %d; want 1 (ordinary)", boot.RuntimeInputs.RestRecoveryMultiplier)
+		}
 		if err := boot.RuntimeInputs.Validate(); err != nil {
 			t.Fatalf("inputs: %v", err)
 		}
@@ -97,14 +121,39 @@ func TestLoadPlayerBootstrap(t *testing.T) {
 		if len(boot.Durable.Skills) != 1 || boot.Durable.Skills[0].ID != 2 {
 			t.Fatalf("skills = %+v", boot.Durable.Skills)
 		}
-		if boot.Durable.Items != nil {
-			t.Fatalf("items = %+v; want nil (item aggregates recover separately)", boot.Durable.Items)
+		// §9.5.1m C1/C2: the complete exact carried
+		// inventory set installs in enumeration order.
+		if len(boot.Durable.Items) != 2 {
+			t.Fatalf("items = %+v; want exactly 2 carried items", boot.Durable.Items)
+		}
+		want := []sim.PlayerInventoryItemState{
+			{ID: 101, ProtoID: 1001, Qty: 3, Hits: 250, Enchants: []byte(`{"glow":1}`), Slot: "hand"},
+			{ID: 202, ProtoID: 1002, Qty: 500, Hits: 0, Enchants: []byte(`{}`), Slot: "pack"},
+		}
+		for i, w := range want {
+			got := boot.Durable.Items[i]
+			if got.ID != w.ID || got.ProtoID != w.ProtoID || got.Qty != w.Qty ||
+				got.Hits != w.Hits || string(got.Enchants) != string(w.Enchants) || got.Slot != w.Slot {
+				t.Fatalf("items[%d] = %+v; want %+v", i, got, w)
+			}
 		}
 		if boot.Pending == nil || boot.Pending.EffectiveCost != 40 ||
 			boot.Pending.DeathTimeSeconds != 1700000000 ||
 			boot.Pending.CorpseID == nil || *boot.Pending.CorpseID != 77 ||
 			!boot.Pending.PortalUsed {
 			t.Fatalf("pending = %+v", boot.Pending)
+		}
+	})
+
+	t.Run("empty-inventory-stays-empty", func(t *testing.T) {
+		rec := withVitals(bootstrapRecovery(), t)
+		rec.Items = nil
+		boot, err := LoadPlayerBootstrap(context.Background(), &fakeBootstrapStore{snap: rec}, 7)
+		if err != nil {
+			t.Fatalf("LoadPlayerBootstrap: %v", err)
+		}
+		if boot.Durable.Items != nil {
+			t.Fatalf("items = %+v; want nil (character owns nothing)", boot.Durable.Items)
 		}
 	})
 
@@ -144,7 +193,7 @@ func TestLoadPlayerBootstrap(t *testing.T) {
 
 	t.Run("bad-vitals", func(t *testing.T) {
 		rec := bootstrapRecovery()
-		rec.Character.Vitals = json.RawMessage(`{"hp":-3}`)
+		rec.Vitals = json.RawMessage(`{"hp":-3}`)
 		if _, err := LoadPlayerBootstrap(context.Background(), &fakeBootstrapStore{snap: rec}, 7); err == nil {
 			t.Fatalf("corrupt vitals accepted")
 		}
@@ -166,12 +215,16 @@ func TestLoadPlayerBootstrap(t *testing.T) {
 			t.Fatal(err)
 		}
 		*rec.Pending.CorpseID = 9999
-		rec.Character.Advancement[2] = '9'
+		rec.Advancement[2] = '9'
+		rec.Items[0].Enchants[2] = '9'
 		if boot.Pending.CorpseID == nil || *boot.Pending.CorpseID != 77 {
 			t.Fatalf("pending aliased loader memory: %+v", boot.Pending)
 		}
 		if string(boot.Durable.Advancement) != `{"pts":3}` {
 			t.Fatalf("durable aliased loader memory: %s", boot.Durable.Advancement)
+		}
+		if string(boot.Durable.Items[0].Enchants) != `{"glow":1}` {
+			t.Fatalf("item enchants aliased loader memory: %s", boot.Durable.Items[0].Enchants)
 		}
 	})
 }

@@ -17,6 +17,21 @@ SELECT *
 FROM item_locations
 WHERE item_id = $1;
 
+-- M5-T5c4 (spec §9.5.1m C4): the ONE minimal read-only
+-- reconnect enumeration. Directly character-owned carried
+-- inventory only (kind = 0 for this character); ground,
+-- corpse, vault, and container-contained rows are never
+-- carried inventory and are unrepresentable in the frozen
+-- sim-domain shadow shape. Ascending item-id order is the
+-- authoritative enumeration order (never re-sorted
+-- downstream).
+-- name: ListCharacterInventoryItems :many
+SELECT ii.id, ii.proto, ii.qty, ii.hits, ii.enchants, il.slot
+FROM item_instances AS ii
+JOIN item_locations AS il ON il.item_id = ii.id
+WHERE il.kind = 0 AND il.character_id = $1
+ORDER BY ii.id;
+
 -- name: InsertItemInstance :one
 INSERT INTO item_instances (
     proto,
