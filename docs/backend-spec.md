@@ -1,4 +1,4 @@
-# Voxilian Backend SPEC (v0.3.57 — documentation only, no implementation)
+# Voxilian Backend SPEC (v0.3.58 — documentation only, no implementation)
 
 > Status: DRAFT for discussion. Normative keywords: MUST / SHOULD / MAY.
 > Companion doc: `docs/meridian59.md` (game-mechanics reference, source of all
@@ -8540,7 +8540,8 @@ runtime quiesce/reinitialization primitives over resolved
 Underworld-exit async lifecycle (same off-owner rule;
 opcode 120 transport stays T5c4).
 
-T5c4 ownership (frozen boundary only): gateway/state-machine
+T5c4 ownership (frozen boundary only; exact transport/reconnect
+contract frozen v0.3.58 in §9.5.1l): gateway/state-machine
 routing, rate-gated C→S 120 handling, critical S→C 214 / 215
 delivery, session/Presence/NetEntityID composition,
 reconnect/end-to-end proof reusing the existing 120/214/215
@@ -11676,6 +11677,314 @@ no `NetEntityID`, no opcode 120, no opcode 214, no opcode 215
     After this task T5c3d3a, T5c3d3b, T5c4, T6, T7,
     and the M5 exit stay `[ ]`.
 
+    #### 9.5.1l M5 death wire/state integration + reconnect (T5c4, frozen v0.3.58)
+
+    This section freezes the exact T5c4 transport/reconnect
+    contract found by the v0.3.58 pre-implementation audit. It
+    supersedes the T5c4 paragraph of §9.5.1 for the contract
+    only; no task is split, M5-T5 stays TWENTY-THREE tasks,
+    and every dependency, Store transaction, Saver rule, and
+    sim lifecycle sentence of §9.5.1–§9.5.1k stays frozen.
+
+    Binding semantic distinction (repeats §9.5.16 with
+    implementation force): C→S `120 respawn_ack` !=
+    Underworld `LeaveHold` != `ApplyDeathPenalties`.
+    Opcode 120 only acknowledges/releases the immediate
+    respawn transport/gameplay phase: on success the owner
+    runs `PlayerReleaseRespawn` (`AwaitingRespawn -> Alive`,
+    exact token) and NOTHING else. A 120 handler MUST NOT
+    `PlanDeathPenalties`, invoke
+    `PlayerOrchestrateDeathPenalties`, delete or mutate
+    `pendingDeath`, invoke `CommitDeathPenalties`, run
+    Portal-of-Life mechanics, or report that the player
+    leaves the Underworld. For an Underworld-bound death the
+    `PendingDeathRuntime` stays bit-identical across 120 and
+    the live player continues in ordinary Underworld
+    gameplay; delayed penalties happen only when the actual
+    gameplay `LeaveHold` event fires (T5c3d3a/T5c3d3b own
+    that event, T5c4 owns opcode 120 transport).
+
+    L1. Authoritative 214 boundary (binding). S→C 214 is
+    emitted exactly once per live death attempt at the
+    successful owner transition into `DeathPersisting`
+    (the `PlayerBeginDeathPersistence` /
+    `PlayerOrchestrateImmediateDeath` Begin turn that
+    increments `deathEpoch` and installs the
+    `DeathAttemptToken`), because that turn is the only
+    already-authoritative moment the death is real: HP
+    being zero is a precondition, not the event, and the
+    later Store commit / owner completion only confirm
+    persistence. 214 MUST NOT be emitted from HP polling,
+    from a Store transaction callback, or from a reconnect
+    observing post-death durable state. Duplicate
+    suppression is by live attempt: one live death attempt
+    yields at most one 214 per active recipient/session
+    epoch; persistence redelivery, completion `Duplicate`,
+    and proven-lost-ack recovery MUST NOT produce a second
+    214 for the same attempt. The audit found NO existing
+    death fanout sink (only `MovementSink`,
+    `MovementObserver`, `PlayerVitalsObserver` exist, and
+    death paths deliberately emit no observer event), so
+    T5c4 adds one narrow non-blocking gateway-observed
+    death-begin presentation seam (same non-blocking /
+    bounded / drop-counted discipline as the movement
+    sink; it carries only already-authoritative identity,
+    never gameplay authority). No polling, no second
+    mailbox, no gameplay in gateway.
+
+    L2. 214 recipients and NetEntityID mapping (binding).
+    214 is sent to all currently-ready viewers of the
+    victim entity, including the victim's controlling
+    session when it currently sees the victim, using EACH
+    recipient's current
+    `PresenceRegistry.VisibleHandle(recipient,
+    victimEntity)`. The wire `victim u32` is that
+    recipient-local `NetEntityID` and is different per
+    recipient when their mappings differ; `sim.EntityID`,
+    `CharacterID`, database IDs, and array indexes MUST
+    NEVER appear on the wire. Viewer IDs are copied under
+    the Presence lock in deterministic (session-ID sorted)
+    order and the lock is released before any outbound
+    call. If a viewer mapping disappeared during fanout
+    that recipient is skipped harmlessly; one failed/slow
+    recipient fails closed alone and MUST NOT corrupt,
+    block, or reorder another recipient's delivery.
+
+    L3. Authoritative 215 boundary (binding). S→C 215 is
+    sent only AFTER the immediate-death persistence
+    completion has been accepted by the sim owner
+    (`DeathCompletionApplied`, player now
+    `AwaitingRespawn`), because only the accepted owner
+    snapshot carries the authoritative post-death
+    position. 215 carries exactly that accepted position
+    through the existing `gateway.WirePosition`
+    conversion. The gateway MUST NOT recompute the spawn,
+    MUST NOT query PG, and MUST NOT use any pre-completion
+    position. `Duplicate` completions produce no second
+    215. A `Duplicate` 215 recovery case is NOT frozen:
+    missing-delivery recovery is reconnect/full baseline,
+    never a duplicate 215.
+
+    L4. 214/215 ordering (binding). For the victim session
+    the 214 for a death epoch is admitted to the critical
+    lane before the 215 for the same epoch, and the
+    existing per-session critical FIFO (never a second
+    ordering system) guarantees the client observes 214
+    before its corresponding 215. If 214 cannot be
+    queued/written because the session is already
+    dead/slow/disconnected, the authoritative death
+    lifecycle and durable persistence are NOT rolled back;
+    reconnect/full baseline is the recovery mechanism.
+
+    L5. Post-death teleport AOI reconciliation (binding).
+    The accepted owner completion relocates the entity to
+    a resolved newbie-home or Underworld position, which
+    is NOT ordinary walking movement. Immediately after
+    the accepted completion, the T5c4 composition
+    synchronizes the Presence center with the new
+    authoritative cell (`UpdateCenter`), reconciles the
+    victim's visible set, retires old-cell viewer
+    mappings, and creates new-cell viewer mappings using
+    the existing `FanoutRuntime` / `PresenceRegistry`
+    primitives (same create/remove/throttle machinery as
+    movement fanout). No synthetic movement intent, no
+    `SubmitMove`, no client-supplied position, no
+    dependence on a future movement tick, no goroutine
+    per teleport, no second viewer map. Stale queued 205
+    state for the victim is cancelled through the
+    existing `CancelState` path before the removal leg
+    (same discipline as the 206 path). Because the audit
+    found no teleport/relocation fanout control (fanout
+    knows only movement/bootstrap/remove events), T5c4
+    adds one narrow relocation control on the existing
+    fixed fanout control machinery carrying only the
+    already-accepted entity + position; its shape is
+    frozen here as control-only and carries no gameplay.
+
+    L6. 120 correlation (binding). The wire 120 payload is
+    empty, so the gateway owns one ephemeral respawn
+    correlation per live session/presence epoch,
+    established ONLY when the exact 215 for an accepted
+    death is admitted to that session's critical lane,
+    carrying `{session ID, EntityID, CharacterID,
+    DeathAttemptToken}`. Required invariants: an old
+    session can never release a replacement entity; an
+    old death can never release a newer death; no
+    `CharacterID`-only fallback; `EntityID` ABA is
+    impossible because sim `EntityID`s are never reused
+    within an engine lifetime AND the epoch must match
+    exactly; a new session epoch inherits no ack
+    correlation (takeover/fresh connection starts with
+    none). An exact duplicate 120 (same live session +
+    same admitted token) is safely idempotent via the
+    owner's `Duplicate` path.
+
+    L7. Typed respawn-release owner ingress (binding).
+    T5c4 adds the additive typed same-mailbox command,
+    conceptually `EnqueuePlayerReleaseRespawn(ctx,
+    sim.DeathAttemptToken) (EntitySnapshot,
+    RespawnReleaseDisposition, error)`, wrapping the
+    existing owner-local `PlayerReleaseRespawn`. Same
+    `Engine.ingress` mailbox, capacity-1 result, frozen
+    immutable value payload, unchanged pre-admission
+    context semantics, post-admission caller cancellation
+    does not retract, and the owner-local
+    `PlayerReleaseRespawn` remains the only mutator. No
+    direct gateway mutation, no new mailbox, no closure
+    ingress. This extends §5.2.10 by one typed command
+    kind (no other §5.2.10 sentence changes).
+
+    L8. 120 error mapping (binding). Malformed 120 payload
+    (existing `DecodeRespawnAck` failure) -> `202
+    protocol_error`; rate-gated denial stays upstream in
+    `GameplayIngressHandler` (`202 rate_limited`, death
+    handler never runs, no second intent charge);
+    temporary sim ingress saturation
+    (`ErrSimIngressFull`) -> `202 retry`; missing/diverged
+    sim entity (`ErrEntityNotFound`,
+    `ErrCellHandoffRequired`) -> internal fail-closed
+    (never `invalid_handle`, never silent success);
+    stale/wrong correlation (unknown session, epoch or
+    identity mismatch) -> `202 protocol_error`
+    fail-closed, while an exact duplicate of the live
+    token takes the idempotent `Duplicate` silent-success
+    path. The Server lifecycle table is NOT duplicated:
+    non-`IN_WORLD` 120 never reaches the handler
+    (`202 bad_state` upstream, unchanged).
+
+    L9. Disconnect before 120 (binding). The ephemeral
+    ack requirement is never durable. If the client
+    disconnects after death persistence / 215 admission
+    but before 120, the live entity (if still present)
+    stays `AwaitingRespawn`; no old-socket 120 is
+    required or accepted afterward. Old queued 214/215
+    frames are never replayed. Reconnect is always a
+    fresh connection: new WS, hello, fresh enter_world,
+    fresh full baseline (§L11).
+
+    L10. Reconnect authoritative bootstrap (binding). The
+    audited `WorldSessionRuntime.PrepareEnter` path
+    stages through generic `EnqueueAddEntity`, which is
+    death-blind: it cannot reconstruct a PLAYER entity
+    with `CharacterID`/vitals/durable/pending state.
+    T5c4 therefore replaces the world-entry staging for
+    gameplay characters with a typed player bootstrap
+    built from current authoritative materialized state:
+    `CharacterID`, authoritative persisted position,
+    `PlayerVitals`, `PlayerVitalsRuntimeInputs`,
+    `PlayerDurableState`, and the authoritative
+    `PendingDeathRuntime` when present. Forbidden on
+    reconnect: replaying old 214/215, recreating an old
+    `DeathAttemptToken`, persisting `PlayerLifeState` /
+    `deathEpoch` / `portalEpoch` / `penaltyEpoch`,
+    inventing a pending death when PG says nil,
+    discarding a pending death when PG says present. A
+    fresh entity receives fresh ephemeral lifecycle
+    state. The frozen fresh reconnect life state is
+    ordinary `Alive` gameplay at the persisted
+    authoritative location with `PendingDeathRuntime`
+    hydrated exactly when durable state contains it,
+    because `AwaitingRespawn`, portal/penalty in-flight
+    flags, attempt tokens, and the old transport ack
+    belong to the old live entity/session epoch and are
+    not durable.
+
+    L11. Recovery source / dependency direction (binding).
+    The gateway MUST NOT import `internal/store`, pgx,
+    sqlc, or implement death persistence. T5c4 freezes
+    one narrow injected seam, conceptually
+    `gateway.PlayerBootstrapLoader` returning an
+    already-resolved sim-domain bootstrap value
+    (`CharacterID`, position, vitals, runtime inputs,
+    durable, optional pending — sim types only, no
+    Store-domain snapshot leaks into gateway), with the
+    concrete adapter living OUTSIDE gateway in
+    `internal/persist` over the existing
+    `LoadDeathCharacterRecovery` read (plus the existing
+    character vitals/durable materialization the adapter
+    already understands). This explicitly widens the
+    T5c4 task scope to that one narrow persist adapter —
+    no other scope expansion is frozen here:
+    `character.Descriptor` is NOT widened, no migration,
+    no query, no generated-code change. The adapter maps
+    Store-domain recovery into the sim-domain bootstrap
+    value and performs no gameplay, no RNG, no Portal
+    calculation, no penalty planning.
+
+    L12. Pending hydration atomicity (binding). The audit
+    proved separate `AddPlayerEntityWithDurableState`
+    then `PlayerInstallRecoveredPendingDeath` can expose
+    an observable `Alive`-without-pending intermediate
+    when durable recovery says a pending death exists.
+    T5c4 therefore adds one narrow additive typed owner
+    bootstrap, conceptually
+    `EnqueueAddPlayerEntityWithRecovery` carrying only
+    already-resolved sim-domain values (no `store`
+    types, no PG, no lookup inside the owner), validated
+    before `EntityID` consumption per the existing
+    creation rules. On failure: no half-created player,
+    no lost pending state, no `CharacterID` binding
+    leak. This extends §5.2.10 by one further typed
+    command kind (no other §5.2.10 sentence changes).
+
+    L13. Portal / penalty crash states (binding).
+    Ephemeral attempt tokens and in-flight booleans do
+    not survive entity removal/restart. Reconnect derives
+    authoritative state from materialized durable state
+    only: durable Portal commit reflected in
+    `pending_deaths` reconnects with that exact pending
+    state hydrated; durable penalties commit (pending row
+    deleted) reconnects with `Pending == nil` and the
+    post-penalty vitals/durable; unproven persistence
+    (Saver blocked, commit ambiguous) is never guessed
+    from old process-local state — the fresh process
+    loads authoritative PG. `persist` remains responsible
+    for reconciling Saver metadata; the T5c4 bootstrap
+    simply loads authoritative materialized state.
+
+    L14. Takeover / session-replacement races (binding).
+    An old session's 214/215/120 MUST NEVER mutate or
+    release the replacement session's entity. Presence
+    session/entity mapping plus exact
+    `DeathAttemptToken` correlation is sufficient; no
+    `CharacterID`-only fallback exists. Takeover drops
+    the old session's respawn correlation; the
+    replacement session establishes its own only via a
+    fresh 215 admission for a live attempt it controls.
+
+    L15. Critical transport failure (binding). 214 and
+    215 are critical, non-coalescible state frames and
+    use `TryCritical` for asynchronous fanout so
+    sim/persistence workers never block on a socket: no
+    blocking socket wait, per-session critical FIFO
+    maintained, saturation closes only that recipient
+    fail-closed, and authoritative sim/death/persistence
+    state is NEVER rolled back because transport failed.
+    Reconnect/full resync is the transport recovery
+    mechanism. No goroutine per message, no
+    death-specific outbound queue.
+
+    L16. Codec compatibility (binding). The audit
+    verified the existing `DecodeRespawnAck`,
+    `proto.Death`, `proto.Respawn`, and
+    `gateway.WirePosition` are sufficient: `proto`
+    unchanged, `testdata/protocol` unchanged, no new
+    opcode, no new death wire protocol, no respawn token
+    on the wire, no message-version bump. An impossible
+    authoritative position conversion is an internal
+    fail-closed invariant, never a silent clamp.
+
+    T5c4 production scope (binding): primarily
+    `backend/voxilian/internal/sim` (L7 release ingress,
+    L12 atomic bootstrap) + `backend/voxilian/internal/gateway`
+    (death presentation/correlation runtime, 120 handler,
+    214/215 fanout, post-death relocation control,
+    player-bootstrap world entry) + the one narrow
+    `backend/voxilian/internal/persist` bootstrap adapter
+    of L11. No migration, no SQL, no sqlc query, no
+    Store transaction change, no death-persistence
+    rewrite, no new protocol, no `meridian59.md` change.
+
   #### 9.5.2 Death disposition: avoided vs cheap vs normal (frozen)
 
 Three dispositions, semantically distinct:
@@ -12481,7 +12790,14 @@ the semantic synonym for Underworld `LeaveHold` /
 `ApplyDeathPenalties` — T5c4 owns opcode 120 transport/state
 routing while T5c3d owns the gameplay event "player actually
 leaves the Underworld" (preserving the Meridian two-phase death
-source semantics).
+source semantics). The exact T5c4 transport/reconnect
+boundaries (authoritative 214/215 moments, recipient
+mapping, ordering, teleport AOI reconciliation, 120
+correlation, typed owner ingress, error mapping,
+disconnect/takeover semantics, reconnect bootstrap,
+pending atomicity, crash states, critical failure) are
+frozen v0.3.58 in §9.5.1l, which supersedes this section
+for the T5c4 contract only.
 
 #### 9.5.17 T5a pure surface and non-scope (binding)
 
@@ -12681,6 +12997,65 @@ impossible plans).
    survives it.
 
 ## 14. Version history
+
+- v0.3.58: freeze M5-T5c4 death wire/state integration +
+  reconnect contract (docs only; no schema/query/code
+  change). New §9.5.1l freezes the sixteen
+  transport/reconnect boundaries the v0.3.58 audit found
+  under-specified: authoritative 214 at the successful
+  owner `DeathPersisting` transition (new narrow
+  non-blocking death-begin presentation seam; no HP
+  polling, no Store-callback emission, no reconnect
+  emission; one 214 per live attempt per recipient/session
+  epoch); 214 to all currently-ready viewers incl. the
+  controlling session, each with its recipient-local
+  `VisibleHandle` (deterministic order, lock released
+  before outbound, per-recipient failure isolation); 215
+  only after accepted owner completion
+  (`DeathCompletionApplied`, `AwaitingRespawn`) carrying
+  the exact accepted position via `gateway.WirePosition`
+  (no recompute, no PG read, no duplicate-215 recovery —
+  reconnect is recovery); 214-before-215 via the existing
+  per-session critical FIFO with no rollback on transport
+  failure; post-death teleport AOI reconciliation through
+  the existing Presence/fanout primitives plus one narrow
+  relocation control on the existing fanout machinery
+  (with `CancelState` for stale 205; no fake movement, no
+  second viewer map); gateway-ephemeral 120 correlation
+  established only on exact 215 admission
+  (`{session, EntityID, CharacterID, DeathAttemptToken}`,
+  no wire epoch, no CharacterID-only fallback, no
+  cross-epoch inheritance, exact duplicate idempotent);
+  additive same-mailbox `EnqueuePlayerReleaseRespawn`
+  (§5.2.10 +1 kind); 120 error mapping
+  (malformed→protocol_error, rate→upstream, saturation→
+  retry, missing/diverged→internal fail-closed,
+  stale→protocol_error, exact duplicate→silent Duplicate);
+  disconnect-before-120 keeps `AwaitingRespawn` with no
+  durable ack debt and fresh-baseline reconnect;
+  takeover isolation via Presence mapping + exact token;
+  reconnect player bootstrap from materialized state
+  (fresh `Alive`, pending hydrated iff durable present;
+  no old token/ack/epoch replay); one narrow
+  `gateway.PlayerBootstrapLoader` seam with the concrete
+  adapter in `internal/persist` over
+  `LoadDeathCharacterRecovery` (explicit narrow scope
+  widening; gateway still never imports store/pgx/sqlc);
+  atomic `EnqueueAddPlayerEntityWithRecovery` owner
+  bootstrap (§5.2.10 +1 kind) closing the
+  add-then-hydrate intermediate; crash-state derivation
+  from materialized PG only; `TryCritical` async fanout
+  with per-recipient fail-closed and no gameplay
+  rollback; `proto`/`testdata/protocol` unchanged.
+  Repeats the binding rule with implementation force:
+  120 != `LeaveHold` != `ApplyDeathPenalties`
+  (pending bit-identical across 120). No split, still
+  TWENTY-THREE tasks; `meridian59.md` untouched.
+  Checkbox state unchanged: T5a/T5b1a/T5b1b/T5b2a/T5b2b/
+  T5c1/T5c2a/T5c2b/T5c3a/T5c3b/T5c3c1/T5c3c2/T5c3c3a/
+  T5c3c3b/T5c3c3c1/T5c3c3c2/T5c3d1/T5c3d2a/T5c3d2b1/
+  T5c3d2b2/T5c3d3a/T5c3d3b `[x]`,
+  T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v0.3.57: correct M5-T5c3d3a death-penalty retry and health semantics
   (docs only; no schema/query/code change). Freeze the anti-reroll

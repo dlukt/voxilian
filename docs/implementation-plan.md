@@ -1,6 +1,6 @@
-# Voxilian Backend — Implementation Plan (v1.41)
+# Voxilian Backend — Implementation Plan (v1.42)
 
-> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.57).
+> Source of truth for WHAT: `docs/backend-spec.md` (v0.3.58).
 > This file is the WHAT-ORDER + WHO-DOES-IT tracker.
 > If implementation discovers the spec is wrong, change the SPEC first
 > (separate commit), then implement — never silently diverge.
@@ -569,7 +569,13 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   handling, critical S→C 214 / 215 delivery,
   session/Presence/NetEntityID composition, reconnect/end-to-end
   proof reusing the existing 120/214/215 codecs (no second
-  protocol). Spec: §9.5.1, §9.5.1a, §9.5.16.
+  protocol). Spec: §9.5.1, §9.5.1a, §9.5.1l (frozen v0.3.58 T5c4
+  contract: authoritative 214/215 boundaries, recipient-local
+  handles, ordering, teleport AOI reconcile, 120 correlation,
+  typed release + atomic recovery ingress, error/disconnect/
+  takeover semantics, `Alive` reconnect bootstrap with atomic
+  pending hydration, narrow persist bootstrap adapter,
+  `TryCritical` fail-closed; 120 != LeaveHold; proto unchanged).
 - [ ] **M5-T6** Personal/world-light intents: `115 rest`, `116 eat` (hunger/vigor effects), `105 use` (skill/item dispatch incl. Second Wind), `119 safety_toggle`, `117/118 → 209` chat (+channel rules, length caps, rate limits). Owner of these opcodes: this task, no other. Spec: §6.3, §9.
 - [ ] **M5-T7** Authoritative attack/cast runtime integration (depends on
   M5-T1, M5-T2, M5-T3a, M5-T3b, M5-T4a,   M5-T4b1, M5-T4b2,
@@ -742,6 +748,30 @@ Exit: prod compose deployable; outage/shutdown behaviors demonstrated; load gate
 | 125 ack | M3-T5b | flow control |
 
 ## Plan history
+
+- v1.42: freeze M5-T5c4 death wire/state integration +
+  reconnect contract (docs only, spec v0.3.57 -> v0.3.58
+  new §9.5.1l; no split, M5-T5 stays TWENTY-THREE tasks):
+  sixteen frozen boundaries (214 at owner `DeathPersisting`
+  via a narrow non-blocking presentation seam; 214 to
+  ready viewers with recipient-local handles; 215 only
+  after accepted owner completion via `WirePosition`;
+  critical-FIFO 214-before-215; teleport AOI reconcile via
+  existing fanout + one narrow relocation control;
+  gateway-ephemeral 120 correlation on 215 admission;
+  same-mailbox `EnqueuePlayerReleaseRespawn`; 120 error
+  mapping; disconnect/takeover isolation; `Alive`
+  reconnect bootstrap; narrow persist bootstrap adapter
+  over `LoadDeathCharacterRecovery`; atomic
+  `EnqueueAddPlayerEntityWithRecovery`; materialized-only
+  crash recovery; `TryCritical` fail-closed; proto
+  unchanged) with 120 != LeaveHold != ApplyDeathPenalties
+  binding. T5c4 row spec pointer gains §9.5.1l; T5c4
+  still `[ ]`. Checkbox state unchanged:
+  T5a/T5b1a/T5b1b/T5b2a/T5b2b/T5c1/T5c2a/T5c2b/T5c3a/
+  T5c3b/T5c3c1/T5c3c2/T5c3c3a/T5c3c3b/T5c3c3c1/T5c3c3c2/
+  T5c3d1/T5c3d2a/T5c3d2b1/T5c3d2b2/T5c3d3a/T5c3d3b `[x]`,
+  T5c4/T6/T7 and M5 exit `[ ]`.
 
 - v1.41: correct M5-T5c3d3a penalty retry and health semantics (docs
   only, spec v0.3.56 -> v0.3.57 extends §9.5.1k; no split, M5-T5 stays
