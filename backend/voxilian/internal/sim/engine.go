@@ -41,8 +41,8 @@ type EngineConfig struct {
 
 // EngineDeps carries the engine's external seams. Clock, RNG,
 // Collision, and RunGate are REQUIRED and fail fast when missing;
-// Movement, Anomaly, and Vitals MAY be nil, which selects an internal
-// no-op (output observers must never stall the sim owner).
+// Movement, Anomaly, Vitals, and Death MAY be nil, which selects an
+// internal no-op (output observers must never stall the sim owner).
 type EngineDeps struct {
 	Clock     Clock
 	RNG       RNG
@@ -54,6 +54,11 @@ type EngineDeps struct {
 	// (spec §9.4b.6): immutable before/after values, non-blocking,
 	// no persistence ownership.
 	Vitals PlayerVitalsObserver
+	// Death is the optional death-presentation sink (spec
+	// §9.5.1l L1): already-authoritative death-begin and
+	// death-completion facts for wire presentation,
+	// non-blocking, no persistence ownership.
+	Death DeathPresentationSink
 }
 
 // Engine is the M4-T1 deterministic sim skeleton (spec §5.2): one
@@ -85,6 +90,7 @@ type Engine struct {
 	movement  MovementSink
 	anomaly   MovementObserver
 	vitalsObs PlayerVitalsObserver
+	death     DeathPresentationSink
 	tick      atomic.Uint32
 	registry  *registry
 	// ingress is the bounded owner-command mailbox (spec §5.2.10):
@@ -126,6 +132,7 @@ func NewEngine(cfg EngineConfig, deps EngineDeps) (*Engine, error) {
 		movement:  deps.Movement,
 		anomaly:   deps.Anomaly,
 		vitalsObs: deps.Vitals,
+		death:     deps.Death,
 		registry:  newRegistry(HistoryHorizonSeconds * cfg.TickHz),
 		ingress:   make(chan ingressCommand, SimIngressCapacity),
 	}, nil

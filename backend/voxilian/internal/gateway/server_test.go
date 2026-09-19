@@ -2672,6 +2672,22 @@ func (f *wsSimFake) EnqueueMove(_ context.Context, id sim.EntityID, intent sim.M
 
 func (f *wsSimFake) CurrentTick() uint32 { return 777 }
 
+func (f *wsSimFake) EnqueuePlayerReleaseRespawn(_ context.Context, _ sim.DeathAttemptToken) (sim.EntitySnapshot, sim.RespawnReleaseDisposition, error) {
+	return sim.EntitySnapshot{}, sim.RespawnReleaseApplied, nil
+}
+
+func (f *wsSimFake) EnqueueAddPlayerEntityWithRecovery(_ context.Context, boot sim.PlayerRecoveryBootstrap) (sim.EntitySnapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.adds++
+	f.nextID++
+	cell, err := world.CellForPosition(boot.Position)
+	if err != nil {
+		return sim.EntitySnapshot{}, err
+	}
+	return sim.EntitySnapshot{ID: f.nextID, CharacterID: boot.CharacterID, Position: boot.Position, Cell: cell, IsPlayer: true}, nil
+}
+
 // wsFanoutFake is a no-op FanoutLifecycle for WS chains that do not
 // exercise fanout visibility.
 type wsFanoutFake struct{}

@@ -266,9 +266,11 @@ func (e *Engine) PlayerLifeStateOf(id EntityID) (PlayerLifeState, bool, error) {
 // On success, in the SAME owner turn: invoke the existing
 // PlayerQuiesceForDeath semantics (preserving every T5c3b quiesce
 // invariant), increment the death epoch exactly once, set life
-// state = DeathPersisting, and return the exact token. No
-// persistence call, no goroutine, no sink invocation, no T5a
-// planner, no wall clock.
+// state = DeathPersisting, report the authoritative begin to the
+// optional DeathPresentationSink (spec §9.5.1l L1: the one live
+// 214 moment; the sink is non-blocking and owns no gameplay
+// authority), and return the exact token. No persistence call,
+// no goroutine, no T5a planner, no wall clock.
 //
 // Owner-local: call only from the sim owner goroutine (Run/Step)
 // or in Step-driven tests.
@@ -294,11 +296,13 @@ func (e *Engine) PlayerBeginDeathPersistence(id EntityID) (DeathAttemptToken, er
 	}
 	ent.deathEpoch++
 	ent.lifeState = PlayerLifeDeathPersisting
-	return DeathAttemptToken{
+	token := DeathAttemptToken{
 		EntityID:    ent.id,
 		CharacterID: ent.characterID,
 		Epoch:       ent.deathEpoch,
-	}, nil
+	}
+	e.emitDeathBegin(DeathBeginEvent{Token: token})
+	return token, nil
 }
 
 // PlayerAcceptPostDeathState is the correlated owner-local
@@ -439,5 +443,6 @@ func (e *Engine) PlayerAcceptImmediateDeathCompletion(completion ImmediateDeathC
 	ent.durable = &frozen
 	ent.pendingDeath = frozenPending
 	ent.lifeState = PlayerLifeAwaitingRespawn
+	e.emitDeathCompleted(DeathCompletedEvent{Snapshot: snap, Token: completion.Token, Tick: e.CurrentTick()})
 	return snap, DeathCompletionApplied, nil
 }

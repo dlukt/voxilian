@@ -37,6 +37,15 @@ type recordingSim struct {
 	moveDisp  sim.MoveDisposition
 	moveErr   error
 	tick      uint32
+
+	releaseSnap sim.EntitySnapshot
+	releaseDisp sim.RespawnReleaseDisposition
+	releaseErr  error
+	releaseToks []sim.DeathAttemptToken
+
+	recoverBoots []sim.PlayerRecoveryBootstrap
+	recoverSnap  sim.EntitySnapshot
+	recoverErr   error
 }
 
 func (f *recordingSim) EnqueueAddEntity(_ context.Context, pos world.Vec3) (sim.EntitySnapshot, error) {
@@ -72,6 +81,31 @@ func (f *recordingSim) CurrentTick() uint32 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.tick
+}
+
+func (f *recordingSim) EnqueuePlayerReleaseRespawn(_ context.Context, tok sim.DeathAttemptToken) (sim.EntitySnapshot, sim.RespawnReleaseDisposition, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.releaseToks = append(f.releaseToks, tok)
+	return f.releaseSnap, f.releaseDisp, f.releaseErr
+}
+
+func (f *recordingSim) EnqueueAddPlayerEntityWithRecovery(_ context.Context, boot sim.PlayerRecoveryBootstrap) (sim.EntitySnapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recoverBoots = append(f.recoverBoots, boot)
+	if f.recoverErr != nil {
+		return sim.EntitySnapshot{}, f.recoverErr
+	}
+	if f.recoverSnap.ID != 0 {
+		return f.recoverSnap, nil
+	}
+	f.nextID++
+	cell, err := world.CellForPosition(boot.Position)
+	if err != nil {
+		return sim.EntitySnapshot{}, err
+	}
+	return sim.EntitySnapshot{ID: f.nextID, CharacterID: boot.CharacterID, Position: boot.Position, Cell: cell, IsPlayer: true}, nil
 }
 
 func (f *recordingSim) moveCount() int {

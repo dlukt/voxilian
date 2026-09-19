@@ -77,8 +77,8 @@ type pendingEntry struct {
 // seam into one staged world-presence lifecycle (spec
 // §7.3.4–§7.3.6, §7.4.6). It is safe for concurrent use; the small
 // pending-entry mutex is never held across SpawnResolver calls,
-// sim Enqueue*, downstream WorldExit calls, fanout controls, socket
-// writes, or PresenceRegistry calls.
+// bootstrap-loader calls, sim Enqueue*, downstream WorldExit calls,
+// fanout controls, socket writes, or PresenceRegistry calls.
 type WorldSessionRuntime struct {
 	sim        SimIngress
 	presence   *PresenceRegistry
@@ -87,6 +87,19 @@ type WorldSessionRuntime struct {
 	spawn      SpawnResolver
 	now        NowFunc
 	downstream WorldExit
+
+	// bootstrap is the optional T5c4 reconnect player-bootstrap
+	// loader (spec §9.5.1l L10/L11). Nil selects the legacy
+	// generic-entity staging path; non-nil stages a gameplay
+	// character as an atomic player entity from authoritative
+	// materialized state. Set before use via
+	// SetPlayerBootstrapLoader; no other mutation after wiring.
+	bootstrap PlayerBootstrapLoader
+	// respawnForget is the optional T5c4 teardown hook dropping
+	// a session's ephemeral respawn correlation (spec §9.5.1l
+	// L6/L14). Nil disables it. Set before use via
+	// SetRespawnForgetter.
+	respawnForget func(session.ID)
 
 	mu      sync.Mutex
 	pending map[session.ID]*pendingEntry
@@ -131,11 +144,37 @@ func NewWorldSessionRuntime(simIngress SimIngress, presence *PresenceRegistry, s
 	}, nil
 }
 
-// PrepareEnter reserves the pending slot, resolves the spawn, adds
-// one sim entity through the owner, and retains the returned
-// EntityID + authoritative cell. Presence does NOT exist yet and no
-// wire message is sent. A second prepare while pending is a stable
-// conflict with no second entity.
+// SetPlayerBootstrapLoader installs the optional T5c4
+// reconnect player-bootstrap loader (spec §9.5.1l
+// L10/L11). Call once before the runtime serves traffic;
+// it is not safe to swap while PrepareEnter runs.
+func (r *WorldSessionRuntime) SetPlayerBootstrapLoader(l PlayerBootstrapLoader) {
+	r.bootstrap = l
+}
+
+// SetRespawnForgetter installs the optional T5c4 teardown
+// hook dropping a session's ephemeral respawn correlation
+// on world exit (spec §9.5.1l L6/L14). Call once before
+// the runtime serves traffic.
+func (r *WorldSessionRuntime) SetRespawnForgetter(f func(session.ID)) {
+	r.respawnForget = f
+}
+
+// PrepareEnter reserves the pending slot, stages one sim
+// entity through the owner, and retains the returned
+// EntityID + authoritative cell. Presence does NOT exist
+// yet and no wire message is sent. A second prepare while
+// pending is a stable conflict with no second entity.
+//
+// With no bootstrap loader (legacy path) the spawn
+// resolver decides the position and a generic entity is
+// staged. With a T5c4 bootstrap loader the authoritative
+// materialized player state is loaded and staged
+// atomically as a real player entity (fresh Alive
+// gameplay, pending hydrated iff durable state contains
+// it, no old token/ack/epoch replay); the persisted
+// position is authoritative and the spawn resolver is not
+// consulted.
 func (r *WorldSessionRuntime) PrepareEnter(ctx context.Context, sid session.ID, accountID int64, characterID int64) error {
 	r.mu.Lock()
 	if _, dup := r.pending[sid]; dup {
@@ -144,6 +183,10 @@ func (r *WorldSessionRuntime) PrepareEnter(ctx context.Context, sid session.ID, 
 	}
 	r.pending[sid] = &pendingEntry{accountID: accountID, characterID: characterID}
 	r.mu.Unlock()
+
+	if r.bootstrap != nil {
+		return r.preparePlayerEnter(ctx, sid, characterID)
+	}
 
 	pos, err := r.spawn.ResolveSpawn(ctx, accountID, characterID)
 	if err != nil {
@@ -162,6 +205,58 @@ func (r *WorldSessionRuntime) PrepareEnter(ctx context.Context, sid session.ID, 
 			return fmt.Errorf("%w: %v: %w", ErrWorldSpawnInvalid, pos, err)
 		default:
 			return fmt.Errorf("gateway: stage entity: %w", err)
+		}
+	}
+	r.mu.Lock()
+	p, ok := r.pending[sid]
+	if !ok || p.staged {
+		r.mu.Unlock()
+		// Defensive: the reservation vanished under us (no path
+		// under the account guard does this). Remove the orphan
+		// rather than leak a sim entity.
+		_ = r.sim.EnqueueRemoveEntity(ctx, snap.ID)
+		return fmt.Errorf("gateway: staged entry vanished for session %d", uint64(sid))
+	}
+	p.entity = snap.ID
+	p.cell = snap.Cell
+	p.staged = true
+	r.mu.Unlock()
+	return nil
+}
+
+// preparePlayerEnter stages a T5c4 reconnect bootstrap:
+// load the already-resolved materialized player state and
+// install it atomically as a player entity (spec §9.5.1l
+// L10/L12). Loader failure is an operational retry; owner
+// validation failure of the trusted position fails closed
+// as invalid spawn; saturation/unavailability fails
+// closed as retry. Any other owner failure is an internal
+// trusted-data invariant. On failure the pending
+// reservation is dropped with no staged entity left
+// behind.
+func (r *WorldSessionRuntime) preparePlayerEnter(ctx context.Context, sid session.ID, characterID int64) error {
+	boot, err := r.bootstrap.LoadPlayerBootstrap(ctx, characterID)
+	if err != nil {
+		r.dropPending(sid)
+		return fmt.Errorf("%w: load player bootstrap: %w", ErrWorldEntryRetry, err)
+	}
+	if sim.CharacterID(characterID) != boot.CharacterID {
+		r.dropPending(sid)
+		return fmt.Errorf("gateway: bootstrap character %d for %d: %w",
+			int64(boot.CharacterID), characterID, ErrWorldSpawnInvalid)
+	}
+	snap, err := r.sim.EnqueueAddPlayerEntityWithRecovery(ctx, boot)
+	if err != nil {
+		r.dropPending(sid)
+		switch {
+		case errors.Is(err, sim.ErrSimIngressFull),
+			errors.Is(err, sim.ErrEngineNotRunning),
+			errors.Is(err, sim.ErrEngineStopped):
+			return fmt.Errorf("%w: stage player entity: %w", ErrWorldEntryRetry, err)
+		case errors.Is(err, sim.ErrInvalidPosition):
+			return fmt.Errorf("%w: %v: %w", ErrWorldSpawnInvalid, boot.Position, err)
+		default:
+			return fmt.Errorf("gateway: stage player entity: %w", err)
 		}
 	}
 	r.mu.Lock()
@@ -261,6 +356,9 @@ func (r *WorldSessionRuntime) ExitWorld(ctx context.Context, sid session.ID, acc
 	}
 	if _, err := r.presence.Deactivate(sid); err != nil {
 		return fmt.Errorf("gateway: exit deactivate presence: %w", err)
+	}
+	if r.respawnForget != nil {
+		r.respawnForget(sid)
 	}
 	return nil
 }

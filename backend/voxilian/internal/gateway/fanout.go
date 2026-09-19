@@ -152,6 +152,15 @@ type FanoutRuntime struct {
 	meta     sync.Mutex
 	ready    map[session.ID]bool
 	throttle map[fanoutThrottleKey]fanoutThrottle
+	// relocated records the sim tick of the last accepted
+	// post-death teleport per entity (spec §9.5.1l L5):
+	// movement events at or before that tick predate the
+	// authoritative relocation and must not resurrect
+	// retired viewers or repaint stale positions after
+	// it. Movement after the tick flows normally. Entity
+	// entries clear on fanout removal; sim EntityIDs are
+	// never reused, so no ABA arises.
+	relocated map[sim.EntityID]uint32
 }
 
 var (
@@ -177,14 +186,15 @@ func NewFanoutRuntime(presence *PresenceRegistry, sessions *session.Registry, so
 		return nil, fmt.Errorf("gateway: invalid fanout tickHz %d", tickHz)
 	}
 	r := &FanoutRuntime{
-		presence: presence,
-		sessions: sessions,
-		source:   source,
-		stride:   uint32(max(1, (tickHz+9)/10)),
-		events:   make(chan fanoutEvent, FanoutEventCapacity),
-		done:     make(chan struct{}),
-		ready:    make(map[session.ID]bool),
-		throttle: make(map[fanoutThrottleKey]fanoutThrottle),
+		presence:  presence,
+		sessions:  sessions,
+		source:    source,
+		stride:    uint32(max(1, (tickHz+9)/10)),
+		events:    make(chan fanoutEvent, FanoutEventCapacity),
+		done:      make(chan struct{}),
+		ready:     make(map[session.ID]bool),
+		throttle:  make(map[fanoutThrottleKey]fanoutThrottle),
+		relocated: make(map[sim.EntityID]uint32),
 	}
 	r.wg.Add(1)
 	go r.loop()
@@ -471,9 +481,51 @@ func (r *FanoutRuntime) failRecipient(sid session.ID, reason string, err error) 
 		"session", uint64(sid), "reason", reason, "err", err)
 }
 
+// setRelocationTick records an accepted post-death
+// teleport tick for entity under the metadata mutex.
+func (r *FanoutRuntime) setRelocationTick(entity sim.EntityID, tick uint32) {
+	r.meta.Lock()
+	defer r.meta.Unlock()
+	r.relocated[entity] = tick
+}
+
+// staleAfterRelocation reports whether a movement event
+// tick predates (or coincides with) the recorded
+// relocation tick: (rel - tick) mod 2^32 below the exact
+// half-range means tick is equal-or-before rel in serial
+// arithmetic. Movement strictly after rel yields a large
+// residue and flows normally. No record means no
+// relocation: nothing is stale.
+func (r *FanoutRuntime) staleAfterRelocation(entity sim.EntityID, tick uint32) bool {
+	r.meta.Lock()
+	defer r.meta.Unlock()
+	rel, ok := r.relocated[entity]
+	if !ok {
+		return false
+	}
+	return rel-tick < 1<<31
+}
+
+// clearRelocationTick drops the relocation record for
+// entity under the metadata mutex (fanout removal).
+func (r *FanoutRuntime) clearRelocationTick(entity sim.EntityID) {
+	r.meta.Lock()
+	defer r.meta.Unlock()
+	delete(r.relocated, entity)
+}
+
 // handleMovement fans one authoritative MovementUpdate out (spec
 // §7.4.5). Best effort per recipient; no error propagates to sim.
 func (r *FanoutRuntime) handleMovement(u sim.MovementUpdate) {
+	if r.staleAfterRelocation(u.EntityID, u.Tick) {
+		// The entity teleported after this movement
+		// was sampled (spec §9.5.1l L5): dispatching it
+		// would resurrect retired viewers, repaint a
+		// stale position, or drag the owner's center
+		// back to the pre-death cell. Drop it; the
+		// relocation presentation is authoritative.
+		return
+	}
 	cell, err := world.CellForPosition(u.Position)
 	if err != nil {
 		slog.Error("gateway: fanout invalid authoritative position",
@@ -732,6 +784,171 @@ func (r *FanoutRuntime) tryCritical(sid session.ID, opcode uint16, encode func(*
 	return p.TryCritical(sid, opcode, proto.MessageVersion1, encode)
 }
 
+// EmitDeath fans one authoritative S→C 214 death frame to every
+// currently-ready viewer of entity (spec §9.5.1l L2), each with
+// its own recipient-local VisibleHandle as the wire victim.
+// The controlling session is included exactly when it
+// currently sees the victim. Viewer IDs are already a sorted
+// copy; no Presence lock is held across outbound. A viewer
+// whose mapping vanished mid-fanout is skipped harmlessly;
+// one failed/slow recipient fails closed alone and never
+// corrupts another recipient. Best effort; no error
+// propagates to sim.
+func (r *FanoutRuntime) EmitDeath(entity sim.EntityID) {
+	for _, sid := range r.readySubset(r.presence.Viewers(entity)) {
+		h, visible, err := r.presence.VisibleHandle(sid, entity)
+		if err != nil || !visible {
+			continue
+		}
+		if err := r.tryCritical(sid, proto.OpcodeDeath,
+			func(e *proto.Encoder) error {
+				proto.Death{Victim: uint32(h)}.Encode(e)
+				return nil
+			}); err != nil {
+			r.failRecipient(sid, "death_critical", err)
+		}
+	}
+}
+
+// RelocateEntity reconciles Presence/fanout for an accepted
+// post-death teleport to the authoritative position carried
+// by snap (spec §9.5.1l L5). It is NOT ordinary movement:
+// no intent is synthesized and no movement tick is awaited.
+// It reuses the existing primitives only: the controller's
+// Presence center is synchronized with the new
+// authoritative cell, the victim's visible set is
+// reconciled, stale old-cell viewer mappings retire via
+// the existing 206 path (which cancels queued stale 205
+// first), new-cell viewers discover the victim via the
+// existing 204 path with the accepted position override,
+// retained viewers get their stale queued 205 cancelled
+// plus one forced fresh 205 at the new position (bypassing
+// the 10 Hz movement throttle: a teleport is not a walk).
+// It reports the controlling session, or false when the
+// entity has no controller (disconnect/takeover race: the
+// authoritative death stands, fresh reconnect owns
+// recovery). Best effort; no error propagates to sim.
+func (r *FanoutRuntime) RelocateEntity(snap sim.EntitySnapshot, tick uint32) (session.ID, bool) {
+	cell, err := world.CellForPosition(snap.Position)
+	if err != nil {
+		slog.Error("gateway: death relocation invalid authoritative position",
+			"entity", uint64(snap.ID), "err", err)
+		return 0, false
+	}
+	owner, controlled := r.presence.Controller(snap.ID)
+	// Record the relocation BEFORE any presentation or
+	// subscription change so a concurrently dispatched
+	// stale movement event can never resurrect pre-death
+	// visibility, repaint a stale position, or drag the
+	// owner's center back to the pre-death cell.
+	r.setRelocationTick(snap.ID, tick)
+	if controlled {
+		if osnap, serr := r.presence.Snapshot(owner); serr != nil {
+			controlled = false
+		} else if osnap.CenterCell != cell {
+			if _, uerr := r.presence.UpdateCenter(owner, cell); uerr != nil {
+				slog.Error("gateway: death relocation owner center update",
+					"session", uint64(owner), "err", uerr)
+				// The relocation did not happen: roll
+				// back the staleness record so future
+				// movement for the entity still flows.
+				r.clearRelocationTick(snap.ID)
+				return 0, false
+			}
+		}
+	}
+	dyn := &sim.MovementUpdate{
+		EntityID:              snap.ID,
+		Position:              snap.Position,
+		Yaw:                   snap.Yaw,
+		Speed:                 snap.Speed,
+		Tick:                  tick,
+		LastProcessedInputSeq: snap.LastProcessedInputSeq,
+	}
+	desired := r.readySubset(r.presence.Subscribers(cell))
+	current := r.readySubset(r.presence.Viewers(snap.ID))
+	desiredSet := toSessionSet(desired)
+	currentSet := toSessionSet(current)
+	for _, sid := range desired {
+		if !currentSet[sid] {
+			r.addViewerCreate(sid, snap.ID, dyn)
+		}
+	}
+	for _, sid := range current {
+		if !desiredSet[sid] {
+			r.removeViewerDestroy(sid, snap.ID)
+		}
+	}
+	for _, sid := range current {
+		if !desiredSet[sid] {
+			continue
+		}
+		r.refreshViewerPosition(sid, snap.ID, dyn, controlled && sid == owner)
+	}
+	if controlled && r.isReady(owner) {
+		r.reconcileVisibleSet(owner, nil)
+	}
+	return owner, controlled
+}
+
+// refreshViewerPosition cancels a retained viewer's stale
+// queued 205 for entity and emits one forced fresh 205 at
+// the accepted post-death dynamics (spec §9.5.1l L5): the
+// same CancelState-before-new-state discipline as the 206
+// path, so a stale queued 205 can never appear after the
+// teleport. Throttle state is reset for the new visibility
+// epoch first so the forced update is never suppressed.
+func (r *FanoutRuntime) refreshViewerPosition(sid session.ID, entity sim.EntityID, dyn *sim.MovementUpdate, isOwner bool) {
+	h, visible, err := r.presence.VisibleHandle(sid, entity)
+	if err != nil || !visible {
+		return
+	}
+	if p, perr := r.producerFor(sid); perr == nil {
+		_ = p.CancelState(StateKey{Kind: proto.OpcodeEntityMove, ID: uint64(h)})
+	}
+	r.deleteThrottle(fanoutThrottleKey{sid: sid, entity: entity})
+	anchor := dyn.LastProcessedInputSeq
+	if !isOwner {
+		anchor = 0
+	}
+	wire, err := WirePosition(dyn.Position)
+	if err != nil {
+		r.failRecipient(sid, "relocate_wire_position", err)
+		return
+	}
+	move := proto.EntityMove{
+		Entity:                uint32(h),
+		Pos:                   wire,
+		Angle:                 dyn.Yaw,
+		Speed:                 dyn.Speed,
+		LastProcessedInputSeq: anchor,
+	}
+	p, err := r.producerFor(sid)
+	if err != nil {
+		r.failRecipient(sid, "relocate_no_producer", err)
+		return
+	}
+	res, err := p.TryState(sid,
+		StateKey{Kind: proto.OpcodeEntityMove, ID: uint64(h)},
+		proto.OpcodeEntityMove, proto.MessageVersion1,
+		func(e *proto.Encoder) error {
+			move.Encode(e)
+			return nil
+		})
+	if err != nil {
+		r.failRecipient(sid, "relocate_state", err)
+		return
+	}
+	switch res {
+	case StateClosed:
+		r.clearReady(sid)
+	case StateDropped:
+	case StateQueued, StateCoalesced:
+		r.setThrottle(fanoutThrottleKey{sid: sid, entity: entity},
+			fanoutThrottle{sent: true, last: dyn.Tick})
+	}
+}
+
 // handleBootstrap brings one committed session to fanout-ready
 // (spec §7.4.4): deterministic EntityID-ascending 204s (own handle 1
 // included), then ready=true, then existing-viewer notification for
@@ -841,6 +1058,7 @@ func (r *FanoutRuntime) notifyExistingViewers(snap PresenceSnapshot) {
 func (r *FanoutRuntime) handleRemove(sid session.ID, entity sim.EntityID) error {
 	r.clearReady(sid)
 	r.clearThrottleFor(sid, entity)
+	r.clearRelocationTick(entity)
 	viewers := r.presence.Viewers(entity)
 	for _, v := range viewers {
 		if v == sid {

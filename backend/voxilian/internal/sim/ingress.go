@@ -33,10 +33,13 @@ var (
 )
 
 // ingressCommand is the private typed command union the owner
-// mailbox carries (spec §5.2.10 + §9.5.1h + §9.5.1k): exactly generic add,
-// player add, remove, move, immediate-death completion, the two
-// Portal-of-Life commands, and the two penalty commands. Gateway-facing code can never submit
-// arbitrary closures: there is no func(*Engine) command.
+// mailbox carries (spec §5.2.10 + §9.5.1h + §9.5.1k + §9.5.1l):
+// exactly generic add, player add, remove, move,
+// immediate-death completion, the two Portal-of-Life commands,
+// the two penalty commands, the T5c4 respawn release, and the
+// T5c4 atomic player-recovery bootstrap. Gateway-facing code can
+// never submit arbitrary closures: there is no func(*Engine)
+// command.
 type ingressCommand interface {
 	// execute runs the command on the sim owner goroutine and
 	// delivers its definitive result. It never blocks on the caller:

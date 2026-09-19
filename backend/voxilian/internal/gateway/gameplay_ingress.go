@@ -11,14 +11,16 @@ import (
 	"github.com/dlukt/voxilian/internal/world"
 )
 
-// SimIngress is the narrow gateway-to-sim seam (spec §7.3.1):
-// owner-mailbox submission plus concurrent tick observation.
-// *sim.Engine satisfies it structurally. Gateway code MUST NOT
-// expose sim registry internals.
+// SimIngress is the narrow gateway-to-sim seam (spec §7.3.1 +
+// §9.5.1l): owner-mailbox submission plus concurrent tick
+// observation. *sim.Engine satisfies it structurally.
+// Gateway code MUST NOT expose sim registry internals.
 type SimIngress interface {
 	EnqueueAddEntity(context.Context, world.Vec3) (sim.EntitySnapshot, error)
 	EnqueueRemoveEntity(context.Context, sim.EntityID) error
 	EnqueueMove(context.Context, sim.EntityID, sim.MoveIntent) (sim.MoveDisposition, error)
+	EnqueuePlayerReleaseRespawn(context.Context, sim.DeathAttemptToken) (sim.EntitySnapshot, sim.RespawnReleaseDisposition, error)
+	EnqueueAddPlayerEntityWithRecovery(context.Context, sim.PlayerRecoveryBootstrap) (sim.EntitySnapshot, error)
 	CurrentTick() uint32
 }
 

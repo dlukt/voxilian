@@ -183,6 +183,20 @@ func (r *ingressRecorder) EnqueueMove(ctx context.Context, id sim.EntityID, inte
 	return r.inner.EnqueueMove(ctx, id, intent)
 }
 
+func (r *ingressRecorder) EnqueuePlayerReleaseRespawn(ctx context.Context, tok sim.DeathAttemptToken) (sim.EntitySnapshot, sim.RespawnReleaseDisposition, error) {
+	return r.inner.EnqueuePlayerReleaseRespawn(ctx, tok)
+}
+
+func (r *ingressRecorder) EnqueueAddPlayerEntityWithRecovery(ctx context.Context, boot sim.PlayerRecoveryBootstrap) (sim.EntitySnapshot, error) {
+	snap, err := r.inner.EnqueueAddPlayerEntityWithRecovery(ctx, boot)
+	if err == nil {
+		r.source.put(EntityPresentation{
+			EntityID: snap.ID, Position: boot.Position, Kind: 2, Proto: 7, Yaw: 1,
+		})
+	}
+	return snap, err
+}
+
 func (r *ingressRecorder) CurrentTick() uint32 { return r.inner.CurrentTick() }
 
 // wsFanoutEnv is the full T5b2 composition over a real WS server.
