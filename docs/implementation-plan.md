@@ -547,7 +547,7 @@ Exit: M59 combat/vitals/death playable against stub mobs; formulas golden-tested
   `ApplyDeathPenalties` (T5c4 owns opcode 120 transport;
   T5c3d3a owns "player actually leaves the Underworld").
   Spec: §9.5.1, §9.5.1k.
-- [ ] **M5-T5c3d3b** Bounded penalty persistence executor +
+- [x] **M5-T5c3d3b** Bounded penalty persistence executor +
   Store mapping + in-critical-callback
   pending-deletion/lost-ack proof (depends on T5c3d3a
   + T5c3d2b1 + T5b2b + T5c2a + T5c2b): concrete bounded
